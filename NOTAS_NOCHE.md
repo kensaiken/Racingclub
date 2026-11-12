@@ -368,3 +368,31 @@ Herramientas:
 
 ### Pendiente
 - Los fallos gráficos siguen igual que antes de este cambio (comprobado con capturas del intérprete y de la mañana): el logo deja estela (la superficie no se borra), la escena 3D sale deformada, cielo blanco.
+
+## Recompilación: la geometría que faltaba (12/11, noche)
+
+### Qué pasaba
+Faltaba casi toda la geometría opaca (carretera, edificios, coches, cielo) y lo que sí se dibujaba dejaba estela. Eran dos fallos distintos, los dos en cómo se ejecutan los trabajos de geometría Edge en las SPU.
+
+1. **Demasiados hilos de SPU.** La cadena de trabajos del juego tiene contención máxima 3 y solo crea búferes de salida de Edge para las SPU 0-2 (`0x01061980 + 0x80·n`; el compartido de `0x01061900` está vacío). Con 4 o 6 hilos, los que hacían de SPU 3-5 no tenían dónde escribir: Edge rellenaba el hueco de órdenes sin dibujo y la geometría se perdía (la mitad con 6 hilos). Ahora son 3 hilos.
+2. **Coma flotante de la SPU.** La SPU no tiene NaN ni infinitos: el exponente 255 es un número finito enorme, los desnormalizados valen cero y los resultados saturan. Edge se apoya en ello: en el descarte de triángulos calcula `c − a·b` (`fnms`) sobre máscaras de bits, con `b = 0xFFFFFFFF`. En la SPU, `0 × 0xFFFFFFFF = 0`; con IEEE es NaN, y el resultado marcaba **todos** los triángulos como descartados. `spu_float_in` / `spu_float_out` (`spu.h`) aplican esas reglas a todas las operaciones de float, en el intérprete y en el código recompilado.
+
+### Cómo se encontró (herramientas nuevas, variables de entorno)
+- `FIFODUMP=n`: todas las órdenes RSX del cuadro n.
+- `EDGEDUMP=n`: descriptor y búferes de entrada de los trabajos Edge n..n+2.
+- `EDGEVIEW=1`: matrices local→mundo que reciben los trabajos.
+- `EDGETRACE=n`: traza instrucción a instrucción de un trabajo Edge (intérprete) a `edgetrace_m*.txt`.
+- `EDGESTAT=n`: 4000 trabajos en el intérprete con lo que devuelve la rutina de descarte (LS 0x9E68, vuelve en 0x4400 con el número de índices visibles), las órdenes MFC, las estructuras de los anillos y el bloque que el trabajo pone en su hueco. `EDGETRACEIDX=k` añade la traza de los trabajos con k índices.
+- `RINGLOG=1`: KB de salida de Edge por cuadro en cada anillo.
+- `RSXSTEP=n`: la superficie principal tras cada dibujo del cuadro n (`rsxstep.bin`, 640×360 RGB), empezando en magenta.
+- Línea `[jobs] Edge jobs with a draw …/s, draws executed by the RSX …/s`.
+- `[wait]` al salir: anillos de Edge, etiquetas RSX 0x400/0x410/0x420 y trabajos SPU aún en marcha.
+
+### Datos de Edge en este juego
+- Binario `0xbaea80`. Entradas del trabajo: 0 = plantilla de órdenes RSX (304 bytes), 9/10 = flujos de vértices, 15 = viewport (recorte u16×4, rango de profundidad, matriz vista-proyección 4×4, escala y desplazamiento del viewport, modo de muestreo), 16 = matriz local→mundo 3×4, 17 = parámetros (16 bytes; nº de vértices y de índices en +8/+10).
+- Salida: `GETLLAR` del búfer de su SPU → `PUTLLUC` → `PUT` de índices y vértices → `PUTS` del bloque de órdenes en el hueco (empieza con un salto a sí mismo que la RSX espera). Cada dibujo termina escribiendo la etiqueta de su anillo (0x400, 0x410, 0x420) con el final de sus datos; el asignador trata `[actual, etiqueta)` como libre.
+- El juego no entrega el cuadro a la RSX hasta que acaban sus trabajos, así que un cuadro que necesite más de un anillo entero (3 MB) no puede terminar. `ring_watchdog` lo detecta (trabajo > 150 ms con la RSX parada) y libera el anillo. Ocurre unas pocas veces en el título y los menús: hay cuadros de 2,9 MB por anillo. Habría que comprobar si Edge descarta aquí menos que en la consola.
+
+### Estado
+- Título, menús, selección de coche y carrera se ven bien: ciudad, cielo, coches, HUD, minimapa.
+- Pendiente: la carretera (y el suelo de la selección de coche) sale negra; el rendimiento ha bajado a ~30 fps de media al haber mucha más geometría (trabajo Edge ~40 µs, 3 hilos).

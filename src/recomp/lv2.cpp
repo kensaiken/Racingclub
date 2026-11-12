@@ -231,6 +231,7 @@ uint32_t ioAddr = 0, ioSize = 0, ctx = 0, ctrl = 0, labels = 0, cbOpd = 0;
 uint32_t flipHandler = 0, vblankHandler = 0, userHandler = 0;
 std::atomic<bool> started{false};
 std::atomic<uint64_t> flips{0};
+std::atomic<uint64_t> g_rsxBegins{0};   // draws the RSX executed (SET_BEGIN_END with a primitive)
 std::atomic<bool> flipPending{false};   // a flip command was executed; the flip itself happens at the next vblank
 const bool g_flipNow = std::getenv("FLIPNOW") != nullptr;
 const bool g_flipLate = std::getenv("FLIPLATE") != nullptr;   // old behaviour: every flip waits for the next vblank
@@ -286,6 +287,19 @@ void method(uint32_t m, uint32_t arg, uint32_t& semOff406e, uint32_t& semOff4097
                 g_vblankSynced = false;
                 while (flipPending.load()) std::this_thread::sleep_for(std::chrono::microseconds(50));   // an earlier unsynced flip
                 rsx::flip(arg); ++flips; call_guest(flipHandler, 1);
+                {   // RINGLOG=1: bytes of Edge output each SPU ring took per frame (largest of the last 2 s)
+                    static const bool ringLog = std::getenv("RINGLOG") != nullptr;
+                    if (ringLog) {
+                        static uint32_t last[3], peak[3]; static int n = 0;
+                        for (int r = 0; r < 3; ++r) {
+                            const uint32_t e = 0x01061980u + 0x80u * r, cur = rd(e + 12), size = rd(e + 8) - rd(e);
+                            const uint32_t used = size ? (cur + size - last[r]) % size : 0;
+                            if (last[r]) peak[r] = std::max(peak[r], used);
+                            last[r] = cur;
+                        }
+                        if (++n % 120 == 0) { LOG("[ring] flip %llu: peak Edge output per frame %u / %u / %u KB (ring 3072 KB)\n", (unsigned long long)flips.load(), peak[0] >> 10, peak[1] >> 10, peak[2] >> 10); peak[0] = peak[1] = peak[2] = 0; }
+                    }
+                }
                 break;
             }
             // vsync flip mode: the RSX stalls on a second flip until the first one was shown at a vblank
@@ -388,6 +402,10 @@ void fifo_thread() {
                 continue;   // do not follow it: wait (maybe the word is still being written)
             }
         }
+        {   // FIFODUMP=n: every command word header executed during frame n (address, header, first argument)
+            static const long dumpFrame = std::getenv("FIFODUMP") ? std::atol(std::getenv("FIFODUMP")) : -1;
+            if (long(flips.load()) == dumpFrame && cmd != 0) LOG("[fifo] %07x: %08x %08x %08x\n", g2, cmd, rd(io2ea(g2 + 4)), rd(io2ea(g2 + 8)));
+        }
         if ((cmd & 0xE0000003) == 0x20000000) { g2 = cmd & 0x1FFFFFFC; }                 // old jump
         else if ((cmd & 3) == 1) { g2 = cmd & 0xFFFFFFFC; }                              // jump
         else if ((cmd & 3) == 2) { callStack.push_back(g2 + 4); g2 = cmd & 0xFFFFFFFC; } // call
@@ -403,6 +421,7 @@ void fifo_thread() {
                 std::this_thread::sleep_for(std::chrono::microseconds(20));
                 continue;
             }
+            if (m0 == 0x1808 && rd(io2ea(g2 + 4))) ++g_rsxBegins;
             for (uint32_t i = 0; i < count; ++i) method(noInc ? m0 : m0 + 4 * i, rd(io2ea(g2 + 4 + 4 * i)), semA, semB);
             g2 += 4 + 4 * count;
         }
@@ -706,11 +725,12 @@ uint32_t op(PPU& c, bool isSave) {
 namespace jobs {
 constexpr uint32_t LS_STUB = 0x100, LS_CTX = 0x2c00, LS_JOB = 0x2d00, LS_BIN = 0x3000, LS_STACK = 0x3fff0;
 constexpr uint32_t EVENTFLAG_JOB = 0xbad880;   // job binary that sets a SPURS event flag (done on the host)
-const int g_workers = std::getenv("SPUS") ? std::max(1, std::atoi(std::getenv("SPUS"))) : 6;   // host threads running jobs (the console has 6 SPUs; with 8 the game hangs at boot)
+const int g_workers = std::getenv("SPUS") ? std::max(1, std::atoi(std::getenv("SPUS"))) : 3;   // host threads running jobs. The game's job chain has max contention 3 and only creates Edge output buffers for SPUs 0-2: a 4th worker finds none and its geometry is dropped
 
 uint32_t list = 0;
 std::thread th;
 std::atomic<bool> started{false};
+std::atomic<uint64_t> jobDraws{0};   // Edge jobs whose command block contains a draw
 std::atomic<uint64_t> kicks{0}, jobsRun{0}, spuSteps{0}, spuNs{0}, interpTot{0}, callsTot{0};
 struct Guard { int32_t count = 1; bool autoReset = true; std::atomic<int32_t> remaining{1}; };
 std::mutex gmx;
@@ -741,6 +761,9 @@ struct JobDesc { uint32_t jea; uint8_t d[256]; std::vector<uint8_t> in; };   // 
 static inline uint32_t jd32(const JobDesc& j, uint32_t o) { return uint32_t(j.d[o]) << 24 | uint32_t(j.d[o + 1]) << 16 | uint32_t(j.d[o + 2]) << 8 | j.d[o + 3]; }
 static inline uint16_t jd16(const JobDesc& j, uint32_t o) { return uint16_t(j.d[o] << 8 | j.d[o + 1]); }
 thread_local int t_spuNum = 0;
+Spu* g_workerSpu[16] = {};                     // per worker: its SPU and the job it is running (diagnostics)
+std::atomic<uint32_t> g_workerJob[16] = {};
+std::atomic<uint64_t> g_workerSince[16] = {};   // now_us() when that job started
 void run_job(const JobDesc& J) {
     const uint32_t jea = J.jea;
     static thread_local Spu* spu = new Spu;
@@ -781,9 +804,52 @@ void run_job(const JobDesc& J) {
     // inputs, gathered in DMA list order, each 16-byte aligned
     uint32_t off = lsIo;
     size_t inPos = 0;
+    int jobMode = -1;   // Edge culling mode of this job (job parameters, input 17)
     for (uint32_t k = 0; k < sizeDma / 8; ++k) {
         const uint32_t sz = jd32(J, 0x30 + 8 * k) & 0x7fff, ea = jd32(J, 0x34 + 8 * k);
         std::memcpy(s.ls + (off | (ea & 15)), (J.in.size() ? J.in.data() + inPos : G->mem + ea), sz);   // MFC list element: LS keeps the EA's low 4 bits
+        {   // EDGECULL=n: replace the culling mode (low 2 bits of byte 1 of the 16-byte job parameters, input 17)
+            static const int cullOverride = std::getenv("EDGECULL") ? std::atoi(std::getenv("EDGECULL")) : -1;
+            if (eaBin == 0xbaea80 && k == 17 && sz == 16) jobMode = s.ls[(off | (ea & 15)) + 1] & 3;
+            if (cullOverride >= 0 && eaBin == 0xbaea80 && k == 17 && sz == 16) {
+                uint8_t* prm = s.ls + (off | (ea & 15));
+                prm[1] = uint8_t((prm[1] & ~3) | (cullOverride & 3));
+            }
+        }
+        {   // EDGEDUMP=n: descriptor and input buffers of Edge geometry jobs n..n+2 (counted over all workers)
+            static const long first = std::getenv("EDGEDUMP") ? std::atol(std::getenv("EDGEDUMP")) : -1;
+            static std::atomic<long> seenEdge{0};
+            static thread_local long mine = -1;
+            static const bool viewLog = std::getenv("EDGEVIEW") != nullptr;   // EDGEVIEW=1: local-to-world matrices the jobs get, when they change
+            if (viewLog && eaBin == 0xbaea80 && k == 16 && sz == 48) {
+                static std::mutex vm; static uint8_t last[48]; static int shown = 0;
+                std::lock_guard<std::mutex> lk(vm);
+                const uint8_t* src = s.ls + (off | (ea & 15));
+                if (std::memcmp(last, src, 48) && shown++ < 400) {
+                    std::memcpy(last, src, 48);
+                    float m[12];
+                    for (int q = 0; q < 12; ++q) { const uint32_t u = uint32_t(src[4 * q]) << 24 | src[4 * q + 1] << 16 | src[4 * q + 2] << 8 | src[4 * q + 3]; std::memcpy(&m[q], &u, 4); }
+                    LOG("[edgeview] flip %llu from %08x: %.3f %.3f %.3f %.2f | %.3f %.3f %.3f %.2f | %.3f %.3f %.3f %.2f\n", (unsigned long long)gcm::flips.load(), ea,
+                        m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]);
+                }
+            }
+            if (first >= 0 && eaBin == 0xbaea80) {
+                if (k == 0) {
+                    mine = seenEdge++;
+                    if (mine >= first && mine < first + 3) {
+                        std::string ds; char b[16];
+                        for (uint32_t o = 0; o < 0x80 + sizeDma; o += 4) { std::snprintf(b, sizeof b, " %08x", jd32(J, o)); ds += b; }
+                        LOG("[edge] job %ld descriptor %x:%s\n", mine, jea, ds.c_str());
+                    }
+                }
+                if (mine >= first && mine < first + 3) {
+                    std::string ds; char b[16];
+                    const uint8_t* src = s.ls + (off | (ea & 15));
+                    for (uint32_t o = 0; o + 4 <= sz && o < 0xc0; o += 4) { std::snprintf(b, sizeof b, " %02x%02x%02x%02x", src[o], src[o + 1], src[o + 2], src[o + 3]); ds += b; }
+                    LOG("[edge] job %ld input %u: %u bytes from %08x -> LS %05x:%s\n", mine, k, sz, ea, off | (ea & 15), ds.c_str());
+                }
+            }
+        }
         inPos += sz;
         off += (sz + 15) & ~15u;
     }
@@ -835,7 +901,92 @@ void run_job(const JobDesc& J) {
     static const bool profOn = (spurt::g_spuProf = std::getenv("SPUPROF") != nullptr);
     (void)profOn;
     const uint64_t i0 = s.interpSteps, c0 = s.compiledCalls;
-    s.run(200000000ull);
+    g_workerSpu[t_spuNum & 15] = &s; g_workerSince[t_spuNum & 15] = now_us(); g_workerJob[t_spuNum & 15] = jea;
+    {   // EDGETRACE=n: after n jobs, trace one Edge job of each culling mode in the interpreter (edgetrace_m<mode>.txt)
+        static const long traceAfter = std::getenv("EDGETRACE") ? std::atol(std::getenv("EDGETRACE")) : -1;
+        static std::atomic<bool> traced[4];
+        if (traceAfter >= 0 && long(jobsRun.load()) > traceAfter && jobMode >= 0 && !traced[jobMode].exchange(true)) {
+            char fn[64]; std::snprintf(fn, sizeof fn, "edgetrace_m%d.txt", jobMode);
+            if (FILE* tf = std::fopen(fn, "w")) {
+                std::fprintf(tf, "job %x mode %d ctx %x desc %x io %x\n", jea, jobMode, LS_CTX, LS_JOB, lsIo);
+                s.compiled = nullptr; s.running = true;
+                for (uint64_t k = 0; k < 20000000ull; ++k) {
+                    const uint32_t pc0 = s.pc, w = s.lsw(pc0);
+                    const bool ok = s.step();
+                    const unsigned rt = (w >> 31) ? ((w >> 21) & 0x7f) : (w & 0x7f);
+                    std::fprintf(tf, "%05x %08x r%u=%08x %08x %08x %08x\n", pc0, w, rt, s.r[rt].w(0), s.r[rt].w(1), s.r[rt].w(2), s.r[rt].w(3));
+                    if (!ok) break;
+                }
+                std::fclose(tf);
+            }
+        }
+    }
+    {   // EDGESTAT=n: after n jobs, run 4000 Edge jobs in the interpreter and report what the culling routine returns
+        static const long statAfter = std::getenv("EDGESTAT") ? std::atol(std::getenv("EDGESTAT")) : -1;
+        static std::atomic<int> statLeft{4000};
+        if (statAfter >= 0 && long(jobsRun.load()) > statAfter && jobMode >= 0 && s.pc == LS_BIN + 0x10 && statLeft.fetch_sub(1) > 0) {
+            s.compiled = nullptr; s.running = true;
+            long cullRet = -1; uint32_t prm0 = 0, prm2 = 0;
+            std::string mfc;
+            static const long traceIdx = std::getenv("EDGETRACEIDX") ? std::atol(std::getenv("EDGETRACEIDX")) : -1;   // also trace jobs with this index count
+            std::string tr;
+            for (uint64_t k = 0; k < 20000000ull; ++k) {
+                if (s.pc == 0x9e68) { const uint32_t a3 = s.r[3].w(0) & 0x3fff0; prm0 = s.lsw(a3); prm2 = s.lsw(a3 + 8); }
+                if (s.pc == 0x4400) cullRet = long(s.r[3].w(0));
+                {
+                    const uint32_t w = s.lsw(s.pc);
+                    if ((w >> 21) == 0x10D && ((w >> 7) & 0x7f) == 21) {   // MFC command: opcode, size, EA
+                        char mb[40];
+                        std::snprintf(mb, sizeof mb, " %02x:%x@%08x", s.r[w & 0x7f].w(0) & 0xff, s.mfcSize, s.mfcEal);
+                        if (mfc.size() < 400) mfc += mb;
+                    }
+                }
+                const uint32_t wAt = s.lsw(s.pc);
+                const bool isMfc = (wAt >> 21) == 0x10D && ((wAt >> 7) & 0x7f) == 21;
+                const uint32_t mfcOp = isMfc ? (s.r[wAt & 0x7f].w(0) & 0xff) : 0, lsa = s.mfcLsa & 0x3ff80, mea = s.mfcEal;
+                if (isMfc && mfcOp == 0x22 && mfc.size() < 30000) {   // the command buffer hole: what is there now, what the job puts
+                    char mb[24];
+                    const uint32_t ls0 = s.mfcLsa & 0x3fffc;
+                    char gb[64];
+                    std::snprintf(gb, sizeof gb, "\n      RSX get %07x put %07x", gcm::rd(gcm::ctrl + 4), gcm::rd(gcm::ctrl)); mfc += gb;
+                    std::snprintf(mb, sizeof mb, "\n      hole@%08x was:", mea); mfc += mb;
+                    for (uint32_t o = 0; o < 0x30 && o < s.mfcSize; o += 4) { std::snprintf(mb, sizeof mb, " %08x", rd32m(mea + o)); mfc += mb; }
+                    mfc += "\n      job puts:";
+                    for (uint32_t o = 0; o < 0x800 && o < s.mfcSize; o += 4) { std::snprintf(mb, sizeof mb, " %08x", s.lsw(ls0 + o)); mfc += mb; }
+                }
+                const uint32_t pcT = s.pc;
+                const bool more = s.step();
+                if (traceIdx >= 0 && tr.size() < 200000000) {
+                    char tb[80];
+                    const unsigned rt = (wAt >> 31) ? ((wAt >> 21) & 0x7f) : (wAt & 0x7f);
+                    tr.append(tb, size_t(std::snprintf(tb, sizeof tb, "%05x %08x r%u=%08x %08x %08x %08x\n", pcT, wAt, rt, s.r[rt].w(0), s.r[rt].w(1), s.r[rt].w(2), s.r[rt].w(3))));
+                }
+                if (isMfc && (mfcOp == 0xd0 || mfcOp == 0xb4 || mfcOp == 0xb0) && mfc.size() < 2000) {   // atomic line: what was read / written
+                    char mb[24];
+                    std::snprintf(mb, sizeof mb, "\n      %02x@%08x:", mfcOp, mea); mfc += mb;
+                    for (uint32_t o = 0; o < 0x40; o += 4) { std::snprintf(mb, sizeof mb, " %08x", s.lsw(lsa + o)); mfc += mb; }
+                }
+                if (!more) break;
+            }
+            if (traceIdx >= 0 && long(prm2 & 0xffff) == traceIdx) {
+                static std::atomic<bool> doneCulled{false}, doneVisible{false};
+                std::atomic<bool>& d = cullRet > 0 ? doneVisible : doneCulled;
+                if (!d.exchange(true))
+                    if (FILE* tf = std::fopen(cullRet > 0 ? "edgetrace_visible.txt" : "edgetrace_culled.txt", "w")) {
+                        std::fprintf(tf, "job %x params %08x %08x cull returned %ld\n", jea, prm0, prm2, cullRet);
+                        std::fwrite(tr.data(), 1, tr.size(), tf); std::fclose(tf);
+                    }
+            }
+            LOG("[edgestat] mode %d params %08x %08x cull returned %ld steps %llu mfc%s\n", jobMode, prm0, prm2, cullRet, (unsigned long long)s.steps, mfc.c_str());
+        }
+    }
+    if (s.pc == LS_BIN + 0x10) s.run(200000000ull);   // not traced above
+    g_workerJob[t_spuNum & 15] = 0;
+    if (eaBin == 0xbaea80) {   // the job's last MFC transfer is the command block it put into its hole: does it draw?
+        const uint32_t l0 = s.mfcLsa & 0x3fffc, n = std::min<uint32_t>(s.mfcSize, 0x1000);
+        for (uint32_t o = 0; o + 8 <= n; o += 4)
+            if (s.lsw(l0 + o) == 0x00041808 && s.lsw(l0 + o + 4) != 0) { ++jobDraws; break; }
+    }
     interpTot += s.interpSteps - i0; callsTot += s.compiledCalls - c0;
     {
         const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - tj).count());
@@ -867,7 +1018,10 @@ void run_job(const JobDesc& J) {
         const auto now = std::chrono::steady_clock::now();
         if (now - lastRep > std::chrono::seconds(4)) {
             const double dt = std::chrono::duration<double>(now - lastRep).count();
-            static uint64_t ip0 = 0, ca0 = 0, sl0 = 0;
+            static uint64_t ip0 = 0, ca0 = 0, sl0 = 0, jd0 = 0, rb0 = 0;
+            const uint64_t jd = jobDraws, rb = gcm::g_rsxBegins;
+            LOG("[jobs] Edge jobs with a draw %.0f/s, draws executed by the RSX %.0f/s\n", (jd - jd0) / dt, (rb - rb0) / dt);
+            jd0 = jd; rb0 = rb;
             const uint64_t sl = spurt::g_spuSlowEntries;
             LOG("[jobs] %.0f jobs/s, SPU busy %.0f%%, interpreted %.1f M instr/s, %.2f M compiled entries/s, %.0f slow-path entries/s\n", (jobsRun - j0) / dt,
                 (spuNs - ns0) / dt / 1e7 / g_workers, (interpTot - ip0) / dt / 1e6, (callsTot - ca0) / dt / 1e6, (sl - sl0) / dt);
@@ -899,8 +1053,33 @@ std::mutex qmx;
 std::condition_variable qcv, idlecv;
 std::deque<JobDesc> queue;
 int busy = 0;
+// Edge geometry writes its output into one ring per SPU and waits for the RSX (through a label) when the ring is
+// full. The game only hands a frame to the RSX once all its jobs are done, so a frame that needs more than a whole
+// ring can never finish: the job waits for the RSX and the RSX has nothing to run. The console never gets there;
+// here it can happen (e.g. the title screen camera sits at the world origin and sees far too much). When a job has
+// been running for a long time while the RSX is idle, declare that SPU's ring free: the frame overwrites some of
+// its own earliest geometry, but the game goes on.
+std::atomic<uint64_t> g_ringRescues{0};
+void ring_watchdog() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        if (!gcm::ctrl || !gcm::labels || gcm::rd(gcm::ctrl) != gcm::rd(gcm::ctrl + 4)) continue;
+        const uint64_t now = now_us();
+        for (int w = 0; w < 3; ++w) {
+            if (!g_workerJob[w].load() || now - g_workerSince[w].load() < 150000) continue;
+            const uint32_t e = 0x01061980u + 0x80u * uint32_t(w);   // that SPU's output buffer info
+            const uint32_t cur = gcm::rd(e + 12), label = gcm::rd(e + 20) & 0xff0;
+            if (!cur || !label) continue;
+            gcm::wr(gcm::labels + label, cur);
+            g_workerSince[w] = now;
+            if (g_ringRescues++ < 5 || g_ringRescues % 200 == 0) LOG("[jobs] SPU %d waited for Edge output space with the RSX idle: ring released (%llu times)\n", w, (unsigned long long)g_ringRescues.load());
+        }
+    }
+}
+
 void worker(int idx) {
     t_tid = 0x01000210 + idx;
+    if (idx == 0) std::thread(ring_watchdog).detach();
     t_spuNum = idx;
     for (;;) {
         JobDesc jd;
@@ -1696,6 +1875,16 @@ void lv2_install(Guest& g, const Lv2Config& cfg) {
 }
 
 void lv2_dump_waits() {
+    for (int n = 0; n < 4; ++n) {   // Edge geometry output buffers: shared, then one per SPU (start, offset, end, current, location, label cmd, ?)
+        const uint32_t e = 0x01061900u + 0x80u * n;
+        LOG("[wait] Edge output buffer %d: start %08x end %08x current %08x word6 %08x label word %08x\n", n, jobs::rd32m(e), jobs::rd32m(e + 8), jobs::rd32m(e + 12), jobs::rd32m(e + 24), jobs::rd32m(e + 20));
+    }
+    if (gcm::labels) LOG("[wait] RSX labels 0x400 %08x, 0x410 %08x, 0x420 %08x\n", gcm::rd(gcm::labels + 0x400), gcm::rd(gcm::labels + 0x410), gcm::rd(gcm::labels + 0x420));
+    for (int w = 0; w < 16; ++w)   // jobs still running (exact pc only with NOSPUREC=1)
+        if (const uint32_t j = jobs::g_workerJob[w].load()) {
+            const Spu& sp = *jobs::g_workerSpu[w];
+            LOG("[wait] SPU worker %d: job %x at pc 0x%x, lr %x sp %x r3 %08x r4 %08x r5 %08x\n", w, j, sp.pc, sp.r[0].w(0), sp.r[1].w(0), sp.r[3].w(0), sp.r[4].w(0), sp.r[5].w(0));
+        }
     if (std::getenv("METHODHIST"))
         for (uint32_t k = 0; k < 0x4000; ++k)
             if (gcm::g_mhist[k]) LOG("[mhist] %04x %10llu  last %08x\n", k * 4, (unsigned long long)gcm::g_mhist[k].load(), gcm::g_mlast[k].load());

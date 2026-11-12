@@ -742,6 +742,14 @@ static void clear_surface(uint32_t mask) {
     if (!bind_target()) return;
     apply_scissor();
     GLbitfield bits = 0;
+    {   // RSXSTEP=frame: the main surface starts that frame in magenta, so every draw's contribution shows
+        static const long stepFrame = std::getenv("RSXSTEP") ? std::atol(std::getenv("RSXSTEP")) : -1;
+        if (long(frameNo) == stepFrame && cur.w == 2560 && !(mask & 0xf0)) {
+            for (int k = 0; k < 4; ++k) glColorMaski(k, 1, 1, 1, 1);
+            glClearColor(1, 0, 1, 1);
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
+    }
     if (mask & 0xf0) {
         const uint32_t c = R[0x1d90 >> 2];
         glClearColor(((c >> 16) & 0xff) / 255.f, ((c >> 8) & 0xff) / 255.f, (c & 0xff) / 255.f, (c >> 24) / 255.f);
@@ -1116,6 +1124,19 @@ static void do_draw() {
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.size() * 4, idx.data(), GL_STREAM_DRAW);
     glDrawElements(gl_prim(prim), GLsizei(idx.size()), GL_UNSIGNED_INT, nullptr);
+    {   // RSXSTEP=frame: the main surface after every draw of that frame, 640x360 RGB, appended to rsxstep.bin
+        static const long stepFrame = std::getenv("RSXSTEP") ? std::atol(std::getenv("RSXSTEP")) : -1;
+        if (long(frameNo) == stepFrame && cur.w == 2560 && cur.h == 720) {
+            static FILE* sf = std::fopen("rsxstep.bin", "wb");
+            static std::vector<uint8_t> full(2560 * 720 * 4), small(640 * 360 * 3);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, cur.fbo);
+            glReadPixels(0, 0, 2560, 720, GL_RGBA, GL_UNSIGNED_BYTE, full.data());
+            for (int y = 0; y < 360; ++y)
+                for (int x = 0; x < 640; ++x)
+                    std::memcpy(&small[(y * 640 + x) * 3], &full[((y * 2) * 2560 + x * 4) * 4], 3);
+            if (sf) { const uint32_t n = uint32_t(drawsThisFrame - 1); std::fwrite(&n, 4, 1, sf); std::fwrite(small.data(), 1, small.size(), sf); std::fflush(sf); }
+        }
+    }
     static const long logFrame = std::getenv("RSXLOG") ? std::atol(std::getenv("RSXLOG")) : -1;
     if (long(frameNo) == logFrame) {
         RLOG("[draw] #%llu prog %016llx fb %u (%ux%u, color %x z %x fmt %08x ct %x) prim %u idx %zu verts %u attrs %d vp %u fp %x tex %x | blend %u depth %u/%x mask %x cull %u alpha %u | pos0 %g %g %g %g\n",

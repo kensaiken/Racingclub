@@ -22,8 +22,9 @@ inline uint8_t& BR(Q& q, int i) { return reinterpret_cast<uint8_t*>(q.w)[i]; }
 inline uint8_t br(const Q& q, int i) { return reinterpret_cast<const uint8_t*>(q.w)[i]; }
 inline uint16_t& HR(Q& q, int i) { return reinterpret_cast<uint16_t*>(q.w)[i]; }
 inline uint16_t hr(const Q& q, int i) { return reinterpret_cast<const uint16_t*>(q.w)[i]; }
-inline float f(const Q& q, int i) { float x; std::memcpy(&x, &q.w[i], 4); return x; }
-inline uint32_t fb(float x) { uint32_t u; std::memcpy(&u, &x, 4); return u; }
+// float operand / float result with the SPU's non-IEEE rules (see spu.h)
+inline float f(const Q& q, int i) { return spu_float_in(q.w[i]); }
+inline uint32_t fb(float x) { return spu_float_out(x); }
 inline double d(const Q& q, int i) { const uint64_t u = uint64_t(q.w[2 * i]) << 32 | q.w[2 * i + 1]; double x; std::memcpy(&x, &u, 8); return x; }
 inline void sd(Q& q, int i, double x) { uint64_t u; std::memcpy(&u, &x, 8); q.w[2 * i] = uint32_t(u >> 32); q.w[2 * i + 1] = uint32_t(u); }
 inline uint64_t dw(const Q& q, int i) { return uint64_t(q.w[2 * i]) << 32 | q.w[2 * i + 1]; }

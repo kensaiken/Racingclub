@@ -7,14 +7,30 @@
 
 namespace gti::recomp {
 
+// SPU single precision is not IEEE: there are no NaNs or infinities (exponent 255 is just a very large number),
+// denormals read as zero and results saturate instead of overflowing. Code relies on it (Edge geometry computes
+// c - a * b on bit masks, where 0 * 0xFFFFFFFF must be 0, not NaN). Approximation used here, in the interpreter and
+// in the recompiled code alike: operands with exponent 255 are clamped to the largest IEEE float, denormal
+// operands are zero, and a result that overflows becomes the largest SPU magnitude with its sign.
+inline float spu_float_in(uint32_t u) {
+    const uint32_t e = u & 0x7f800000u;
+    u = e == 0x7f800000u ? (u & 0x80000000u) | 0x7f7fffffu : e == 0 ? 0u : u;
+    float x; std::memcpy(&x, &u, 4); return x;
+}
+inline uint32_t spu_float_out(float x) {
+    uint32_t u; std::memcpy(&u, &x, 4);
+    const uint32_t e = u & 0x7f800000u;
+    return e == 0x7f800000u ? (u & 0x80000000u) | 0x7fffffffu : e == 0 ? 0u : u;
+}
+
 struct SpuReg {
     uint8_t b[16];   // big-endian: b[0] is the most significant byte of word 0 (the "preferred slot")
     uint32_t w(int i) const { return uint32_t(b[4 * i]) << 24 | uint32_t(b[4 * i + 1]) << 16 | uint32_t(b[4 * i + 2]) << 8 | b[4 * i + 3]; }
     void sw(int i, uint32_t v) { b[4 * i] = uint8_t(v >> 24); b[4 * i + 1] = uint8_t(v >> 16); b[4 * i + 2] = uint8_t(v >> 8); b[4 * i + 3] = uint8_t(v); }
     uint16_t h(int i) const { return uint16_t(b[2 * i] << 8 | b[2 * i + 1]); }
     void sh(int i, uint16_t v) { b[2 * i] = uint8_t(v >> 8); b[2 * i + 1] = uint8_t(v); }
-    float f(int i) const { uint32_t u = w(i); float x; std::memcpy(&x, &u, 4); return x; }
-    void sf(int i, float x) { uint32_t u; std::memcpy(&u, &x, 4); sw(i, u); }
+    float f(int i) const { return spu_float_in(w(i)); }
+    void sf(int i, float x) { sw(i, spu_float_out(x)); }
     uint64_t d(int i) const { return uint64_t(w(2 * i)) << 32 | w(2 * i + 1); }
     void sd(int i, uint64_t v) { sw(2 * i, uint32_t(v >> 32)); sw(2 * i + 1, uint32_t(v)); }
 };
