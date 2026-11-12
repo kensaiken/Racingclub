@@ -1,0 +1,90 @@
+cmake_minimum_required(VERSION 3.24)
+project(GTiPort LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
+find_package(SDL3 REQUIRED CONFIG)
+find_package(ZLIB REQUIRED)
+
+add_library(gti_formats STATIC
+  src/formats/ep3.cpp
+  src/formats/edge_indexes.cpp
+  src/formats/gcm_texture.cpp
+)
+target_include_directories(gti_formats PUBLIC src)
+target_link_libraries(gti_formats PUBLIC ZLIB::ZLIB)
+
+add_executable(gtiport WIN32
+  src/main.cpp
+  src/render/gl_loader.cpp
+  src/render/renderer.cpp
+  src/game/collision.cpp
+  src/game/vehicle.cpp
+  src/audio/vag.cpp
+  src/audio/engine_audio.cpp
+)
+target_link_libraries(gtiport PRIVATE gti_formats SDL3::SDL3-static opengl32)
+
+# SPU interpreter test bench
+add_executable(spu_test src/tools/spu_test.cpp src/recomp/spu.cpp)
+target_include_directories(spu_test PRIVATE src)
+
+# headless physics test bench
+add_executable(physlab src/tools/physlab.cpp src/game/collision.cpp src/game/vehicle.cpp)
+target_link_libraries(physlab PRIVATE gti_formats)
+
+# CLI tool to dump/validate packages (no window)
+add_executable(ep3tool src/tools/ep3tool.cpp)
+target_link_libraries(ep3tool PRIVATE gti_formats)
+
+if(MINGW)
+  # self-contained exe: no libc++/libunwind/winpthread DLL dependencies
+  foreach(t gtiport ep3tool physlab)
+    target_link_options(${t} PRIVATE -static)
+  endforeach()
+endif()
+
+# statically recompiled original PPU code (generated locally by tools/ppc2cpp.py from the user's own EBOOT)
+add_executable(recomp_test src/tools/recomp_test.cpp src/recomp/runtime.cpp src/recomp/guest.cpp src/recomp/gen/physics.cpp)
+target_link_libraries(recomp_test PRIVATE gti_formats)
+target_compile_options(recomp_test PRIVATE -Wno-unused-label -Wno-unused-variable -ffp-contract=off)
+if(MINGW)
+  target_link_options(recomp_test PRIVATE -static)
+endif()
+
+# whole game recompiled (generated locally by tools/ppc2cpp.py, SPLIT=48) — large; built only on demand
+file(GLOB RECOMP_FULL_SRC CONFIGURE_DEPENDS src/recomp/full/*.cpp)
+if(RECOMP_FULL_SRC)
+  add_library(recomp_full STATIC ${RECOMP_FULL_SRC} src/recomp/runtime.cpp src/recomp/hle.cpp)
+  target_include_directories(recomp_full PUBLIC src)
+  target_compile_options(recomp_full PRIVATE -O1 -Wno-unused-label -Wno-unused-variable -ffp-contract=off -w)
+  # the port drives with the original physics when started with --orig <snapshot>
+  target_sources(gtiport PRIVATE src/game/orig_physics.cpp src/recomp/guest.cpp)
+  target_link_libraries(gtiport PRIVATE recomp_full)
+  target_compile_definitions(gtiport PRIVATE GTI_ORIG_PHYSICS)
+  add_executable(recomp_frame src/tools/recomp_frame.cpp src/recomp/guest.cpp)
+  target_link_libraries(recomp_frame PRIVATE recomp_full gti_formats)
+  if(MINGW)
+    target_link_options(recomp_frame PRIVATE -static)
+  endif()
+endif()
+file(GLOB SPU_GEN_SRC ${CMAKE_SOURCE_DIR}/src/recomp/spu_gen/*.cpp)
+if(RECOMP_FULL_SRC)
+  # whole game booted natively from its entry point (system layer: src/recomp/lv2.cpp)
+  add_executable(recomp_boot src/tools/recomp_boot.cpp src/recomp/guest.cpp src/recomp/lv2.cpp src/recomp/spu.cpp src/recomp/rsx_gl.cpp ${SPU_GEN_SRC})
+  target_link_libraries(recomp_boot PRIVATE recomp_full gti_formats SDL3::SDL3-static opengl32)
+  if(MINGW)
+    target_link_options(recomp_boot PRIVATE -static)
+  endif()
+  add_executable(recomp_fmt src/tools/recomp_fmt.cpp src/recomp/guest.cpp)
+  target_link_libraries(recomp_fmt PRIVATE recomp_full gti_formats)
+  add_executable(recomp_probe src/tools/recomp_probe.cpp src/recomp/guest.cpp)
+  target_link_libraries(recomp_probe PRIVATE recomp_full gti_formats)
+  if(MINGW)
+    target_link_options(recomp_probe PRIVATE -static)
+  endif()
+endif()

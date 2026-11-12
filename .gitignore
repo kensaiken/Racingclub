@@ -1,0 +1,32 @@
+# --- Contenido del juego o derivado de él: NUNCA subir ---
+re/
+capture/
+reference/
+src/recomp/full/
+src/recomp/gen/
+src/recomp/spu_gen/
+*.elf
+*.self
+*.sprx
+*.snap
+*.ep3
+*.rap
+*.edat
+*.mp4
+
+# --- Compilación y salidas locales ---
+build/
+build-*/
+rsxdump/
+*.exe
+*.dll
+*.obj
+*.o
+*.a
+*.lib
+*.pdb
+*.bmp
+*.log
+sim_log.txt
+__pycache__/
+*.pyc
