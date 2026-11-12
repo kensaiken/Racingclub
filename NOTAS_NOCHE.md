@@ -396,3 +396,8 @@ Faltaba casi toda la geometría opaca (carretera, edificios, coches, cielo) y lo
 ### Estado
 - Título, menús, selección de coche y carrera se ven bien: ciudad, cielo, coches, HUD, minimapa.
 - Pendiente: la carretera (y el suelo de la selección de coche) sale negra; el rendimiento ha bajado a ~30 fps de media al haber mucha más geometría (trabajo Edge ~40 µs, 3 hilos).
+
+### Después (12/11, noche): carretera y cuelgues de arranque
+- **Carretera negra:** la sombra proyectada sobre el asfalto usa una textura con direccionamiento `BORDER` y multiplica el fondo; faltaba `NV4097_SET_TEXTURE_BORDER_COLOR` (0x1A1C + 0x20·i), así que fuera de la sombra se leía negro. `apply_border_color` en `rsx_gl.cpp`.
+- **Cuelgue esporádico al arrancar («BAD jump»):** el manejador de flip avisa al hilo de render, que empieza a reescribir el búfer de órdenes de ese cuadro; pero tras el flip aún quedan órdenes del cuadro (contadores y el salto al otro búfer). Si el hilo de la FIFO se retrasaba (compilando un shader, por ejemplo), leía órdenes del cuadro siguiente. Ahora el manejador se llama cuando la FIFO ejecuta su siguiente salto o se queda sin órdenes (`deliver_flip`). 5 arranques de 5 correctos.
+- La carrera se ve ya como el original: asfalto, marcas, coche, edificios, túnel, cielo, HUD y minimapa. Entre 30 y 60 fps; las SPU van al 27 %, así que el límite está en el hilo de la RSX o en la PPU.

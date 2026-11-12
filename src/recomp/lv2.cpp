@@ -239,6 +239,14 @@ const bool g_flipLate = std::getenv("FLIPLATE") != nullptr;   // old behaviour: 
 // and the command stream waits for that 2 right before the flip. Such a flip is already aligned to a vblank and
 // is shown at once; delaying it to the next vblank would halve the frame rate.
 bool g_vblankSynced = false;
+// The flip handler tells the render thread that the frame was shown, and the render thread then starts rewriting
+// that frame's command buffer. A few commands of the frame still follow the flip (counters, the jump into the other
+// buffer): the handler runs only after the FIFO has executed them (at its next jump or when it runs dry), or a late
+// FIFO thread would read commands of the next frame. The console's RSX is never late; a host thread can be.
+bool g_flipDue = false;
+uint64_t g_flipDueSince = 0;
+void call_guest(uint32_t opd, uint64_t arg);
+void deliver_flip() { if (g_flipDue) { g_flipDue = false; call_guest(flipHandler, 1); } }
 std::atomic<uint64_t> g_lbl400{0};   // RSX writes of label 0x400 (Edge output ring position)
 std::mutex callMx;   // guest handler calls from the RSX threads
 
@@ -286,7 +294,7 @@ void method(uint32_t m, uint32_t arg, uint32_t& semOff406e, uint32_t& semOff4097
             if (g_flipNow || (g_vblankSynced && !g_flipLate)) {
                 g_vblankSynced = false;
                 while (flipPending.load()) std::this_thread::sleep_for(std::chrono::microseconds(50));   // an earlier unsynced flip
-                rsx::flip(arg); ++flips; call_guest(flipHandler, 1);
+                rsx::flip(arg); ++flips; g_flipDue = true; g_flipDueSince = now_us();
                 {   // RINGLOG=1: bytes of Edge output each SPU ring took per frame (largest of the last 2 s)
                     static const bool ringLog = std::getenv("RINGLOG") != nullptr;
                     if (ringLog) {
@@ -346,6 +354,7 @@ void fifo_thread() {
         static uint32_t lastPut = 0xFFFFFFFFu;
         static int putLogs = 0;
         if (put != lastPut && putLogs < 600) { ++putLogs; LOG("[rsx] put %x (get %x, cmd@get %08x %08x, @put-8 %08x %08x, @put %08x)\n", put, get, rd(io2ea(get)), rd(io2ea(get) + 4), rd(io2ea(put) - 8), rd(io2ea(put) - 4), rd(io2ea(put))); lastPut = put; }
+        if (g_flipDue && (get == put || now_us() - g_flipDueSince > 20000)) deliver_flip();
         if (get == put) { if (++idle > 100) std::this_thread::sleep_for(std::chrono::microseconds(50)); continue; }
         idle = 0;
         uint32_t g2 = get;
@@ -406,8 +415,8 @@ void fifo_thread() {
             static const long dumpFrame = std::getenv("FIFODUMP") ? std::atol(std::getenv("FIFODUMP")) : -1;
             if (long(flips.load()) == dumpFrame && cmd != 0) LOG("[fifo] %07x: %08x %08x %08x\n", g2, cmd, rd(io2ea(g2 + 4)), rd(io2ea(g2 + 8)));
         }
-        if ((cmd & 0xE0000003) == 0x20000000) { g2 = cmd & 0x1FFFFFFC; }                 // old jump
-        else if ((cmd & 3) == 1) { g2 = cmd & 0xFFFFFFFC; }                              // jump
+        if ((cmd & 0xE0000003) == 0x20000000) { g2 = cmd & 0x1FFFFFFC; wr(ctrl + 4, g2); deliver_flip(); }   // old jump
+        else if ((cmd & 3) == 1) { g2 = cmd & 0xFFFFFFFC; wr(ctrl + 4, g2); deliver_flip(); }                // jump
         else if ((cmd & 3) == 2) { callStack.push_back(g2 + 4); g2 = cmd & 0xFFFFFFFC; } // call
         else if (cmd == 0x00020000) { g2 = callStack.empty() ? g2 + 4 : callStack.back(); if (!callStack.empty()) callStack.pop_back(); }   // return
         else if (cmd == 0) { g2 += 4; }                                                  // nop

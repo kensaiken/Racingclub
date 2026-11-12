@@ -818,6 +818,14 @@ static uint32_t texDimsOf(int i) {
     return 0;
 }
 
+// NV4097_SET_TEXTURE_BORDER_COLOR (A8R8G8B8): what CLAMP_TO_BORDER samples outside the texture, e.g. the white
+// around a projected shadow that multiplies the road
+static void apply_border_color(GLenum target, uint32_t base) {
+    const uint32_t bc = R[(base + 0x1c) >> 2];
+    const float c[4] = {((bc >> 16) & 0xff) / 255.f, ((bc >> 8) & 0xff) / 255.f, (bc & 0xff) / 255.f, (bc >> 24) / 255.f};
+    glTexParameterfv(target, GL_TEXTURE_BORDER_COLOR, c);
+}
+
 static void bind_texture(int i, float* tsc) {
     const uint32_t base = i < 8 ? 0x1a00 + 0x20 * i : 0x1b00 + 0x20 * (i - 8);
     const uint32_t off = R[base >> 2], fmtReg = R[(base + 4) >> 2], addr = R[(base + 8) >> 2], ctl0 = R[(base + 0xc) >> 2];
@@ -844,6 +852,7 @@ static void bind_texture(int i, float* tsc) {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mag == 1 ? GL_NEAREST : GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap_of(addr & 0xf));
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap_of((addr >> 8) & 0xf));
+            apply_border_color(GL_TEXTURE_2D, base);
             return;
         }
     }
@@ -938,6 +947,7 @@ static void bind_texture(int i, float* tsc) {
     glTexParameteri(target, GL_TEXTURE_WRAP_S, wrap_of(addr & 0xf));
     glTexParameteri(target, GL_TEXTURE_WRAP_T, wrap_of((addr >> 8) & 0xf));
     glTexParameteri(target, GL_TEXTURE_WRAP_R, wrap_of((addr >> 16) & 0xf));
+    apply_border_color(target, base);
     glTexParameterf(target, GL_TEXTURE_MIN_LOD, ((ctl0 >> 19) & 0xfff) / 256.f);
     glTexParameterf(target, GL_TEXTURE_MAX_LOD, ((ctl0 >> 7) & 0xfff) / 256.f);
     glTexParameterf(target, GL_TEXTURE_MAX_ANISOTROPY, float(1u << std::min<uint32_t>(4, (ctl0 >> 4) & 7)));
