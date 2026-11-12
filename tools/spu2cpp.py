@@ -1,12 +1,18 @@
-"""Static recompiler: SPU job binaries (embedded in the EBOOT) -> C++ (src/recomp/spu_gen/spu_<ea>.cpp).
+"""Static recompiler: SPU job binaries (embedded in the EBOOT) -> C++ (src/recomp/spu_gen/spu_<ea>*.cpp).
 
-Every instruction gets a label; direct branches become gotos, indirect branches go through a switch over all
-instruction addresses. Anything the generator does not handle (stop, halt, unknown words, targets outside the
-program) leaves the function with s.pc set, and the interpreter in spu.cpp continues from there.
-Semantics mirror spu.cpp; helpers are in src/recomp/spu_rt.h.
+The program is cut into 1 KB chunks, one C++ function each, in two variants:
+  fast  only real entry points (branch targets, return addresses...) are labels, so the compiler can optimize
+        across instructions; direct branches inside the chunk are gotos.
+  slow  every instruction is an entry point and every branch returns to the trampoline. Used when an indirect
+        branch lands on an address the fast variant did not foresee, and by src/tools/spu_diff.cpp to run one
+        instruction at a time against the interpreter.
+Anything the generator does not handle (stop, halt, unknown words, targets outside the program) leaves the
+function with s.pc set, and the interpreter in spu.cpp continues from there.
+Semantics mirror spu.cpp; helpers are in src/recomp/spu_ops.h.
 
 usage: python tools/spu2cpp.py re/EBOOT.elf src/recomp/spu_gen  ea:size[:lsbase] ...
 """
+import math
 import os
 import struct
 import sys
@@ -40,8 +46,43 @@ def sx(v, bits):
     return v - (1 << bits) if v >> (bits - 1) else v
 
 
-def gen(read, ea, size, base):
-    code = read(ea, size)
+def leaders_of(code, base, size):
+    """Addresses that can be entered other than by falling through: chunk starts, direct branch targets,
+    return addresses of calls, the instruction after anything that leaves to the interpreter, and code addresses
+    loaded with ila. Indirect branches to anything else take the slow variant."""
+    n = size // 4
+    end = base + size
+    L = set(range(base, end, CH))
+    L.add(base + 0x10)
+
+    def add(t):
+        t &= 0x3fffc
+        if base <= t < end:
+            L.add(t)
+    for k in range(n):
+        pc = base + 4 * k
+        w = struct.unpack('>I', code[4 * k: 4 * k + 4])[0]
+        op9, op11, op7 = w >> 23, w >> 21, w >> 25
+        s16 = sx((w >> 7) & 0xffff, 16)
+        if op9 in (0x064, 0x066, 0x042, 0x040, 0x046, 0x044):
+            add(pc + (s16 << 2))
+        if op9 in (0x060, 0x062):
+            add(s16 << 2)
+        if op9 in (0x066, 0x062) or op11 in (0x1A9, 0x000, 0x140, 0x00D, 0x10D):
+            add(pc + 4)
+        if op7 == 0x21:
+            i18 = (w >> 7) & 0x3ffff
+            if (i18 & 3) == 0:
+                add(i18)
+    return L
+
+
+CH = 1024   # bytes per chunk function (256 instructions)
+
+
+def gen_lines(code, base, size, slow, leaders):
+    """C++ statements of every instruction. slow: every instruction is an entry point, every branch returns to
+    the trampoline and `single` stops after one instruction. Otherwise only `leaders` get labels."""
     n = size // 4
     lines = []
     starts = []
@@ -51,23 +92,22 @@ def gen(read, ea, size, base):
     def tgt_ok(t):
         return base <= t < end and (t & 3) == 0
 
-    CH = 1024   # bytes per chunk function (256 instructions)
     cur = [0]
 
     def jump(t):
         t &= 0x3fffc
-        if tgt_ok(t) and (t - base) // CH == cur[0]:
+        if not slow and tgt_ok(t) and (t - base) // CH == cur[0]:
             return f'goto L_{t:x};'
         return f'return 0x{t:x}u;' if tgt_ok(t) else f'return 0x{0x80000000 | t:x}u;'
 
-    for k in range(n):
+    def emit_one(k):
         pc = base + 4 * k
         w = struct.unpack('>I', code[4 * k: 4 * k + 4])[0]
         npc = (pc + 4) & 0x3ffff
         rt, ra, rb = w & 0x7f, (w >> 7) & 0x7f, (w >> 14) & 0x7f
         cur[0] = (pc - base) // CH
-        starts.append(len(lines))
-        E(f'L_{pc:x}:')
+        if slow or pc in leaders:
+            E(f'L_{pc:x}:')
         exit_here = f'return 0x{0x80000000 | pc:x}u;'
         s = None
         if w >> 31:   # RRR
@@ -89,34 +129,34 @@ def gen(read, ea, size, base):
             else:
                 s = exit_here
             E('  ' + s)
-            continue
+            return
         op7 = w >> 25
         if op7 == 0x21:
             i18 = (w >> 7) & 0x3ffff
             E(f'  r[{rt}] = splat(0x{i18:x}u);')
-            continue
+            return
         if op7 in (0x08, 0x09):
-            continue
+            return
         op9 = w >> 23
         i16 = (w >> 7) & 0xffff
         s16 = sx(i16, 16)
         T = f'r[{rt}]'
-        if op9 == 0x064: E('  ' + jump(pc + (s16 << 2))); continue
-        if op9 == 0x060: E('  ' + jump(s16 << 2)); continue
-        if op9 == 0x066: E(f'  {T} = pref(0x{npc:x}u); ' + jump(pc + (s16 << 2))); continue
-        if op9 == 0x062: E(f'  {T} = pref(0x{npc:x}u); ' + jump(s16 << 2)); continue
-        if op9 == 0x042: E(f'  if ({T}.w[0] != 0) ' + jump(pc + (s16 << 2))); continue
-        if op9 == 0x040: E(f'  if ({T}.w[0] == 0) ' + jump(pc + (s16 << 2))); continue
-        if op9 == 0x046: E(f'  if (({T}.w[0] & 0xffff) != 0) ' + jump(pc + (s16 << 2))); continue
-        if op9 == 0x044: E(f'  if (({T}.w[0] & 0xffff) == 0) ' + jump(pc + (s16 << 2))); continue
-        if op9 == 0x061: E(f'  {T} = ldq(ls, 0x{(s16 << 2) & 0x3fff0:x});'); continue
-        if op9 == 0x067: E(f'  {T} = ldq(ls, 0x{(pc + (s16 << 2)) & 0x3fff0:x});'); continue
-        if op9 == 0x041: E(f'  stq(ls, 0x{(s16 << 2) & 0x3fff0:x}, {T});'); continue
-        if op9 == 0x047: E(f'  stq(ls, 0x{(pc + (s16 << 2)) & 0x3fff0:x}, {T});'); continue
-        if op9 == 0x081: E(f'  {T} = splat(0x{s16 & 0xffffffff:x}u);'); continue
-        if op9 == 0x083: E(f'  {T} = splat(0x{(i16 << 16) | i16:x}u);'); continue
-        if op9 == 0x082: E(f'  {T} = splat(0x{i16 << 16:x}u);'); continue
-        if op9 == 0x0C1: E(f'  for (int i = 0; i < 4; ++i) {T}.w[i] |= 0x{i16:x}u;'); continue
+        if op9 == 0x064: E('  ' + jump(pc + (s16 << 2))); return
+        if op9 == 0x060: E('  ' + jump(s16 << 2)); return
+        if op9 == 0x066: E(f'  {T} = pref(0x{npc:x}u); ' + jump(pc + (s16 << 2))); return
+        if op9 == 0x062: E(f'  {T} = pref(0x{npc:x}u); ' + jump(s16 << 2)); return
+        if op9 == 0x042: E(f'  if ({T}.w[0] != 0) ' + jump(pc + (s16 << 2))); return
+        if op9 == 0x040: E(f'  if ({T}.w[0] == 0) ' + jump(pc + (s16 << 2))); return
+        if op9 == 0x046: E(f'  if (({T}.w[0] & 0xffff) != 0) ' + jump(pc + (s16 << 2))); return
+        if op9 == 0x044: E(f'  if (({T}.w[0] & 0xffff) == 0) ' + jump(pc + (s16 << 2))); return
+        if op9 == 0x061: E(f'  {T} = ldq(ls, 0x{(s16 << 2) & 0x3fff0:x});'); return
+        if op9 == 0x067: E(f'  {T} = ldq(ls, 0x{(pc + (s16 << 2)) & 0x3fff0:x});'); return
+        if op9 == 0x041: E(f'  stq(ls, 0x{(s16 << 2) & 0x3fff0:x}, {T});'); return
+        if op9 == 0x047: E(f'  stq(ls, 0x{(pc + (s16 << 2)) & 0x3fff0:x}, {T});'); return
+        if op9 == 0x081: E(f'  {T} = splat(0x{s16 & 0xffffffff:x}u);'); return
+        if op9 == 0x083: E(f'  {T} = splat(0x{(i16 << 16) | i16:x}u);'); return
+        if op9 == 0x082: E(f'  {T} = splat(0x{i16 << 16:x}u);'); return
+        if op9 == 0x0C1: E(f'  for (int i = 0; i < 4; ++i) {T}.w[i] |= 0x{i16:x}u;'); return
         if op9 == 0x065:
             ws = []
             for wi in range(4):
@@ -126,7 +166,7 @@ def gen(read, ea, size, base):
                         v |= 0xff << (8 * (3 - bi))
                 ws.append(v)
             E(f'  {T} = Q{{{{0x{ws[0]:x}u, 0x{ws[1]:x}u, 0x{ws[2]:x}u, 0x{ws[3]:x}u}}}};')
-            continue
+            return
         op8 = w >> 24
         i10 = sx((w >> 14) & 0x3ff, 10)
         A = f'r[{ra}]'
@@ -136,10 +176,10 @@ def gen(read, ea, size, base):
             return f'{{ const Q a = {A}; Q o; for (int i = 0; i < 4; ++i) o.w[i] = {expr}; {T} = o; }}'
 
         def Hh(expr):
-            return f'{{ const Q a = {A}; Q o; for (int i = 0; i < 8; ++i) H(o, i) = uint16_t({expr}); {T} = o; }}'
+            return f'{{ const Q a = {A}; Q o; for (int i = 0; i < 8; ++i) HR(o, i) = uint16_t({expr.replace('h(', 'hr(')}); {T} = o; }}'
 
         def Bb(expr):
-            return f'{{ const Q a = {A}; Q o; for (int i = 0; i < 16; ++i) B(o, i) = uint8_t({expr}); {T} = o; }}'
+            return f'{{ const Q a = {A}; Q o; for (int i = 0; i < 16; ++i) BR(o, i) = uint8_t({expr.replace('b(a, i)', 'br(a, i)').replace('b(bb, i)', 'br(bb, i)')}); {T} = o; }}'
         ri10 = {
             0x34: f'{T} = ldq(ls, {A}.w[0] + 0x{(i10 << 4) & 0xffffffff:x}u);',
             0x24: f'stq(ls, {A}.w[0] + 0x{(i10 << 4) & 0xffffffff:x}u, {T});',
@@ -170,19 +210,19 @@ def gen(read, ea, size, base):
         }
         if op8 in ri10:
             E('  ' + ri10[op8])
-            continue
+            return
         if op8 in (0x7F, 0x4F, 0x5F):   # halts: leave to the interpreter when taken
             cond = {0x7F: f'{A}.w[0] == 0x{u10:x}u', 0x4F: f'int32_t({A}.w[0]) > ({i10})', 0x5F: f'{A}.w[0] > 0x{u10:x}u'}[op8]
             E(f'  if ({cond}) ' + exit_here)
-            continue
+            return
         op10 = w >> 22
         if 0x1D8 <= op10 <= 0x1DB:
             i8 = (w >> 14) & 0xff
-            ex = {0x1D8: f'cflts(f(a, i), {i8})', 0x1D9: f'cfltu(f(a, i), {i8})',
-                  0x1DA: f'fb(float(std::ldexp(double(int32_t(a.w[i])), -({155 - i8}))))',
-                  0x1DB: f'fb(float(std::ldexp(double(a.w[i]), -({155 - i8}))))'}[op10]
+            up, down = float.hex(math.ldexp(1.0, 173 - i8)), float.hex(math.ldexp(1.0, -(155 - i8)))
+            ex = {0x1D8: f'cflts(f(a, i), {up})', 0x1D9: f'cfltu(f(a, i), {up})',
+                  0x1DA: f'csflt(a.w[i], {down})', 0x1DB: f'cuflt(a.w[i], {down})'}[op10]
             E('  ' + W(ex))
-            continue
+            return
         op11 = w >> 21
         i7 = sx((w >> 14) & 0x7f, 7)
         Bq = f'r[{rb}]'
@@ -194,10 +234,10 @@ def gen(read, ea, size, base):
             return f'{{ const Q a = {A}, bb = {Bq}, tt = {T}; Q o; for (int i = 0; i < 4; ++i) o.w[i] = {expr}; {T} = o; }}'
 
         def H2(expr):
-            return f'{{ const Q a = {A}, bb = {Bq}; Q o; for (int i = 0; i < 8; ++i) H(o, i) = uint16_t({expr}); {T} = o; }}'
+            return f'{{ const Q a = {A}, bb = {Bq}; Q o; for (int i = 0; i < 8; ++i) HR(o, i) = uint16_t({expr.replace('h(', 'hr(')}); {T} = o; }}'
 
         def B2(expr):
-            return f'{{ const Q a = {A}, bb = {Bq}; Q o; for (int i = 0; i < 16; ++i) B(o, i) = uint8_t({expr}); {T} = o; }}'
+            return f'{{ const Q a = {A}, bb = {Bq}; Q o; for (int i = 0; i < 16; ++i) BR(o, i) = uint8_t({expr.replace('b(a, i)', 'br(a, i)').replace('b(bb, i)', 'br(bb, i)')}); {T} = o; }}'
 
         def F2(expr):
             return f'{{ const Q a = {A}, bb = {Bq}; Q o; for (int i = 0; i < 4; ++i) o.w[i] = fb({expr}); {T} = o; }}'
@@ -331,51 +371,81 @@ def gen(read, ea, size, base):
             else:
                 cond = {0x3D8: f'{A}.w[0] == {Bq}.w[0]', 0x258: f'int32_t({A}.w[0]) > int32_t({Bq}.w[0])', 0x2D8: f'{A}.w[0] > {Bq}.w[0]'}[op11]
                 E(f'  if ({cond}) ' + exit_here)
-            continue
+            return
         if op11 in rr:
             if rr[op11]:
                 E('  ' + rr[op11])
-            continue
+            return
         E('  ' + exit_here)   # unknown word (often data): the interpreter reports it if it is ever executed
+    for k in range(n):
+        starts.append(len(lines))
+        emit_one(k)
+        if slow:
+            E(f'  if (single) return 0x{(base + 4 * k + 4) & 0x3ffff:x}u;')
+    starts.append(len(lines))
+    return lines, starts
+
+
+def gen(read, ea, size, base):
+    code = read(ea, size)
+    n = size // 4
+    end = base + size
+    leaders = leaders_of(code, base, size)
     fn = f'spu_{ea:x}'
     nch = (size + CH - 1) // CH
-    starts.append(len(lines))
     files = []
     per_file = 8
-    for f0 in range(0, nch, per_file):
-        out = [f'// Generated by tools/spu2cpp.py from the SPU program at EA 0x{ea:x}. Do not edit.',
-               '#include "recomp/spu_rt.h"', '#include <algorithm>', '', 'namespace gti::recomp::spurt {', '']
-        for c in range(f0, min(nch, f0 + per_file)):
-            k0, k1 = c * CH // 4, min(n, (c + 1) * CH // 4)
-            out.append(f'uint32_t {fn}_c{c}(Q* __restrict r, Spu& s, uint32_t pc) {{')
-            out.append('    uint8_t* const ls = s.ls; (void)ls;')
-            out.append('    switch (pc) {')
-            for k in range(k0, k1):
-                out.append(f'    case 0x{base + 4 * k:x}: goto L_{base + 4 * k:x};')
-            out.append(f'    default: return 0x{0x80000000:x}u | pc;')
-            out.append('    }')
-            out += lines[starts[k0]:starts[k1]]
-            out.append(f'    return 0x{base + 4 * k1:x}u;')
-            out.append('}')
-            out.append('')
-        out += ['} // namespace gti::recomp::spurt', '']
-        files.append((f'{fn}_{f0 // per_file}.cpp', '\n'.join(out)))
-    main = [f'// Generated by tools/spu2cpp.py from the SPU program at EA 0x{ea:x} ({size} bytes, LS base 0x{base:x}). Do not edit.',
+    for slow in (False, True):
+        lines, starts = gen_lines(code, base, size, slow, leaders)
+        tag = 's' if slow else 'c'
+        for f0 in range(0, nch, per_file):
+            out = [f'// Generated by tools/spu2cpp.py from the SPU program at EA 0x{ea:x}'
+                   f' ({"slow variant: every instruction is an entry point" if slow else "fast variant"}). Do not edit.',
+                   '#include "recomp/spu_ops.h"', '#include <algorithm>', '', 'namespace gti::recomp::spurt {', '']
+            for c in range(f0, min(nch, f0 + per_file)):
+                k0, k1 = c * CH // 4, min(n, (c + 1) * CH // 4)
+                if slow:
+                    out.append(f'uint32_t {fn}_s{c}(Q* __restrict r, Spu& s, uint32_t pc, bool single) {{')
+                else:
+                    out.append(f'uint32_t {fn}_c{c}(Q* __restrict r, Spu& s, uint32_t pc) {{')
+                out.append('    uint8_t* const ls = s.ls; (void)ls;')
+                out.append('    switch (pc) {')
+                for k in range(k0, k1):
+                    if slow or (base + 4 * k) in leaders:
+                        out.append(f'    case 0x{base + 4 * k:x}: goto L_{base + 4 * k:x};')
+                out.append(f'    default: return 0x{0x80000000 if slow else 0x40000000:x}u | pc;')
+                out.append('    }')
+                out += lines[starts[k0]:starts[k1]]
+                out.append(f'    return 0x{base + 4 * k1:x}u;')
+                out.append('}')
+                out.append('')
+            out += ['} // namespace gti::recomp::spurt', '']
+            files.append((f'{fn}_{tag}{f0 // per_file}.cpp', '\n'.join(out)))
+    main = [f'// Generated by tools/spu2cpp.py from the SPU program at EA 0x{ea:x} ({size} bytes, LS base 0x{base:x},'
+            f' {len(leaders)} entry points in {n} instructions). Do not edit.',
             '#include "recomp/spu_rt.h"', '', 'namespace gti::recomp::spurt {', '']
     for c in range(nch):
         main.append(f'uint32_t {fn}_c{c}(Q* __restrict r, Spu& s, uint32_t pc);')
-    main.append(f'static uint32_t (*const k_{fn}[])(Q* __restrict, Spu&, uint32_t) = {{')
+        main.append(f'uint32_t {fn}_s{c}(Q* __restrict r, Spu& s, uint32_t pc, bool single);')
+    main.append(f'static const FastChunk k_{fn}_fast[] = {{')
     main += [f'    {fn}_c{c},' for c in range(nch)]
+    main += ['};', f'extern const SlowChunk k_{fn}_slow[];', f'const SlowChunk k_{fn}_slow[] = {{']
+    main += [f'    {fn}_s{c},' for c in range(nch)]
     main += ['};', '',
              f'void {fn}(Spu& s) {{',
-             '    Q r[128];',
+             '    alignas(16) Q r[128];',
              '    for (int i = 0; i < 128; ++i) for (int k = 0; k < 4; ++k) r[i].w[k] = s.r[i].w(k);',
              '    uint32_t pc = s.pc;',
              '    uint64_t n = 0;',
              f'    while (pc >= 0x{base:x}u && pc < 0x{end:x}u) {{',
              '        ++n;',
-             f'        if (g_spuProf) ++g_spuProfCnt[(0x{ea:x}u >> 4) % 64][((pc - 0x{base:x}u) >> 10) & 255];',
-             f'        pc = k_{fn}[(pc - 0x{base:x}u) >> 10](r, s, pc);',
+             f'        const uint32_t c = (pc - 0x{base:x}u) >> 10;',
+             f'        if (g_spuProf) ++g_spuProfCnt[(0x{ea:x}u >> 4) % 64][c & 255];',
+             f'        pc = k_{fn}_fast[c](r, s, pc);',
+             '        if (pc & 0x40000000u) {   // not an entry point of the fast chunk',
+             '            ++g_spuSlowEntries;',
+             f'            pc = k_{fn}_slow[c](r, s, pc & 0x3fffffffu, false);',
+             '        }',
              '        if (pc & 0x80000000u) { pc &= 0x7fffffffu; break; }',
              '    }',
              '    s.pc = pc;',
@@ -390,6 +460,9 @@ def main():
     elf, outdir = sys.argv[1], sys.argv[2]
     read = load_elf(elf)
     os.makedirs(outdir, exist_ok=True)
+    for old in os.listdir(outdir):   # chunk files of a previous run
+        if old.startswith('spu_') and old.endswith('.cpp'):
+            os.remove(os.path.join(outdir, old))
     table = []
     for spec in sys.argv[3:]:
         parts = spec.split(':')
@@ -404,14 +477,18 @@ def main():
          'namespace gti::recomp::spurt {', '']
     for (ea, base, size, fn) in table:
         t.append(f'void {fn}(Spu& s);')
-    t += ['', 'bool g_spuProf = false;', 'uint64_t g_spuProfCnt[64][256];']
+        t.append(f'extern const SlowChunk k_{fn}_slow[];')
+    t += ['', 'bool g_spuProf = false;', 'uint64_t g_spuProfCnt[64][256];', 'uint64_t g_spuSlowEntries = 0;']
     t += ['', 'static const Compiled k_table[] = {']
     for (ea, base, size, fn) in table:
-        t.append(f'    {{0x{ea:x}, 0x{base:x}, 0x{size:x}, {fn}}},')
+        t.append(f'    {{0x{ea:x}, 0x{base:x}, 0x{size:x}, {fn}, k_{fn}_slow}},')
     t += ['};', '',
           'const Compiled* find_compiled(uint32_t eaBin) {',
           '    for (const Compiled& c : k_table) if (c.eaBin == eaBin) return &c;',
           '    return nullptr;',
+          '}', '',
+          'const Compiled* compiled_at(int index) {',
+          '    return index >= 0 && index < int(sizeof k_table / sizeof k_table[0]) ? &k_table[index] : nullptr;',
           '}', '', '} // namespace gti::recomp::spurt', '']
     open(os.path.join(outdir, 'spu_table.cpp'), 'w').write('\n'.join(t))
 

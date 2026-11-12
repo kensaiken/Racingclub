@@ -338,3 +338,33 @@ Herramientas:
   - el cielo sale negro o blanco;
   - los cubemaps generados por render (reflejos) se leen de memoria y no de la superficie;
   - el minimapa sale vacío.
+
+## Recompilación: 60 fps (12/11, tarde)
+
+### Qué ha cambiado
+- **Recompilador de SPU (`tools/spu2cpp.py`) reescrito:**
+  - Cada trozo de 1 KB se genera en dos variantes. La **rápida** solo tiene como puntos de entrada los destinos de salto reales (1085 de 21248 instrucciones en Edge), así el compilador optimiza entre instrucciones. La **lenta** tiene una entrada por instrucción y se usa cuando un salto indirecto cae en una dirección no prevista.
+  - Las operaciones calientes usan SIMD (`src/recomp/spu_ops.h`): `shufb`, cargas y guardados, desplazamientos por bytes, máscaras de inserción y conversiones float↔entero sin `ldexp`.
+  - Los ficheros generados se compilan con `-mavx2 -fno-strict-aliasing -ffp-contract=off`.
+- **Prueba diferencial (`build-test/spu_diff.exe re/EBOOT.elf [pruebas]`):** ejecuta cada instrucción de los dos binarios en el intérprete y en el código generado con registros aleatorios y compara registros, memoria local y pc. Resultado: 366 776 ejecuciones, 0 diferencias. Dos NaN con distinta carga cuentan como iguales.
+- **Flips:** el juego se sincroniza él mismo con el vblank (etiqueta 0x81: el hilo de render escribe 1, el manejador de vblank la pasa a 2 y la lista de órdenes espera ese 2 antes del flip). Retrasar además el flip al vblank siguiente dejaba el juego en 30 fps. Ahora un flip precedido de esa espera se muestra al momento; los demás siguen esperando al vblank. El juego usa el modo de flip 1 (hsync).
+- **Hilos de trabajos:** 6 por defecto. Con 8 el juego se cuelga en el arranque (sin investigar; Edge tiene un anillo de salida por SPU).
+
+### Medidas (escena del título)
+| | Antes | Ahora |
+|---|---|---|
+| Trabajo de geometría Edge | 170 µs | 24 µs |
+| Despachador | 4,9 µs | 2,4 µs |
+| Ocupación de las SPU | 90 % (4 hilos) | 20 % (6 hilos) |
+| Cuadros por segundo | 25-30 | 60 |
+
+- 4 arranques seguidos de 22 s: todos llegan al título a 60 fps.
+- Sin medir todavía en carrera.
+- Quedan unas 200 000 entradas por segundo a la variante lenta (unas 4 por trabajo): saltos indirectos cuyos destinos convendría añadir como puntos de entrada.
+
+### Variables nuevas
+- `FLIPLATE=1`: comportamiento anterior, todos los flips esperan al vblank siguiente.
+- `NOSPUREC=1`: intérprete SPU en vez del código recompilado.
+
+### Pendiente
+- Los fallos gráficos siguen igual que antes de este cambio (comprobado con capturas del intérprete y de la mañana): el logo deja estela (la superficie no se borra), la escena 3D sale deformada, cielo blanco.

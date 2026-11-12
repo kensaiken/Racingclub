@@ -233,6 +233,11 @@ std::atomic<bool> started{false};
 std::atomic<uint64_t> flips{0};
 std::atomic<bool> flipPending{false};   // a flip command was executed; the flip itself happens at the next vblank
 const bool g_flipNow = std::getenv("FLIPNOW") != nullptr;
+const bool g_flipLate = std::getenv("FLIPLATE") != nullptr;   // old behaviour: every flip waits for the next vblank
+// The game paces its frames itself: the render thread writes label 0x81 = 1, the vblank handler turns it into 2
+// and the command stream waits for that 2 right before the flip. Such a flip is already aligned to a vblank and
+// is shown at once; delaying it to the next vblank would halve the frame rate.
+bool g_vblankSynced = false;
 std::atomic<uint64_t> g_lbl400{0};   // RSX writes of label 0x400 (Edge output ring position)
 std::mutex callMx;   // guest handler calls from the RSX threads
 
@@ -269,6 +274,7 @@ void method(uint32_t m, uint32_t arg, uint32_t& semOff406e, uint32_t& semOff4097
         case 0x0064: semOff406e = arg; break;                        // NV406E_SEMAPHORE_OFFSET
         case 0x0068: {                                               // NV406E_SEMAPHORE_ACQUIRE: wait for the label
             for (int k = 0; k < 200000 && rd(labels + semOff406e) != arg; ++k) std::this_thread::sleep_for(std::chrono::microseconds(10));
+            if (semOff406e == 0x810) g_vblankSynced = true;
             break;
         }
         case 0x006c: wr(labels + semOff406e, arg); break;            // NV406E_SEMAPHORE_RELEASE
@@ -276,7 +282,12 @@ void method(uint32_t m, uint32_t arg, uint32_t& semOff406e, uint32_t& semOff4097
         case 0x1d70: if (semOff4097 == 0x400) ++g_lbl400; wr(labels + semOff4097, (arg & 0xff00ff00u) | ((arg & 0xff) << 16) | ((arg >> 16) & 0xff)); break;   // BACK_END_WRITE_SEMAPHORE_RELEASE
         case 0x1d74: if (semOff4097 == 0x400) ++g_lbl400; wr(labels + semOff4097, arg); break;            // TEXTURE_READ_SEMAPHORE_RELEASE
         case 0xFEAC:                                                 // flip (written by _cellGcmSetFlipCommand)
-            if (g_flipNow) { rsx::flip(arg); ++flips; call_guest(flipHandler, 1); break; }
+            if (g_flipNow || (g_vblankSynced && !g_flipLate)) {
+                g_vblankSynced = false;
+                while (flipPending.load()) std::this_thread::sleep_for(std::chrono::microseconds(50));   // an earlier unsynced flip
+                rsx::flip(arg); ++flips; call_guest(flipHandler, 1);
+                break;
+            }
             // vsync flip mode: the RSX stalls on a second flip until the first one was shown at a vblank
             rsx::flip(arg);
             while (flipPending.load()) std::this_thread::sleep_for(std::chrono::microseconds(50));
@@ -507,6 +518,7 @@ bool import(PPU& c, const std::string& n) {
         c.wr32(cx + 8, cur + 8);
         ret(c, CELL_OK); return true;
     }
+    if (n == "cellGcmSetFlipMode") LOG("[gcm] flip mode %u (1 = hsync, 2 = vsync)\n", a32(c, 0));
     if (n == "cellGcmSetDisplayBuffer" || n == "cellGcmSetFlipMode" || n == "cellGcmSetTile" || n == "cellGcmBindTile" || n == "cellGcmBindZcull" ||
         n == "cellGcmSetTileInfo" || n == "_cellGcmFunc15") { ret(c, CELL_OK); return true; }
     return false;
@@ -694,7 +706,7 @@ uint32_t op(PPU& c, bool isSave) {
 namespace jobs {
 constexpr uint32_t LS_STUB = 0x100, LS_CTX = 0x2c00, LS_JOB = 0x2d00, LS_BIN = 0x3000, LS_STACK = 0x3fff0;
 constexpr uint32_t EVENTFLAG_JOB = 0xbad880;   // job binary that sets a SPURS event flag (done on the host)
-const int g_workers = std::getenv("SPUS") ? std::max(1, std::atoi(std::getenv("SPUS"))) : 4;   // host threads running jobs
+const int g_workers = std::getenv("SPUS") ? std::max(1, std::atoi(std::getenv("SPUS"))) : 6;   // host threads running jobs (the console has 6 SPUs; with 8 the game hangs at boot)
 
 uint32_t list = 0;
 std::thread th;
@@ -855,10 +867,11 @@ void run_job(const JobDesc& J) {
         const auto now = std::chrono::steady_clock::now();
         if (now - lastRep > std::chrono::seconds(4)) {
             const double dt = std::chrono::duration<double>(now - lastRep).count();
-            static uint64_t ip0 = 0, ca0 = 0;
-            LOG("[jobs] %.0f jobs/s, SPU busy %.0f%%, interpreted %.1f M instr/s, %.2f M compiled entries/s\n", (jobsRun - j0) / dt,
-                (spuNs - ns0) / dt / 1e7 / g_workers, (interpTot - ip0) / dt / 1e6, (callsTot - ca0) / dt / 1e6);
-            lastRep = now; j0 = jobsRun; st0 = spuSteps; ns0 = spuNs; ip0 = interpTot; ca0 = callsTot;
+            static uint64_t ip0 = 0, ca0 = 0, sl0 = 0;
+            const uint64_t sl = spurt::g_spuSlowEntries;
+            LOG("[jobs] %.0f jobs/s, SPU busy %.0f%%, interpreted %.1f M instr/s, %.2f M compiled entries/s, %.0f slow-path entries/s\n", (jobsRun - j0) / dt,
+                (spuNs - ns0) / dt / 1e7 / g_workers, (interpTot - ip0) / dt / 1e6, (callsTot - ca0) / dt / 1e6, (sl - sl0) / dt);
+            lastRep = now; j0 = jobsRun; st0 = spuSteps; ns0 = spuNs; ip0 = interpTot; ca0 = callsTot; sl0 = sl;
         }
     }
     if (std::getenv("HOLETRACE")) {   // descriptor words pointing into the command rings (holes) and what they hold now
