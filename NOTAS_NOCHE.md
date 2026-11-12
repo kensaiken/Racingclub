@@ -401,3 +401,10 @@ Faltaba casi toda la geometría opaca (carretera, edificios, coches, cielo) y lo
 - **Carretera negra:** la sombra proyectada sobre el asfalto usa una textura con direccionamiento `BORDER` y multiplica el fondo; faltaba `NV4097_SET_TEXTURE_BORDER_COLOR` (0x1A1C + 0x20·i), así que fuera de la sombra se leía negro. `apply_border_color` en `rsx_gl.cpp`.
 - **Cuelgue esporádico al arrancar («BAD jump»):** el manejador de flip avisa al hilo de render, que empieza a reescribir el búfer de órdenes de ese cuadro; pero tras el flip aún quedan órdenes del cuadro (contadores y el salto al otro búfer). Si el hilo de la FIFO se retrasaba (compilando un shader, por ejemplo), leía órdenes del cuadro siguiente. Ahora el manejador se llama cuando la FIFO ejecuta su siguiente salto o se queda sin órdenes (`deliver_flip`). 5 arranques de 5 correctos.
 - La carrera se ve ya como el original: asfalto, marcas, coche, edificios, túnel, cielo, HUD y minimapa. Entre 30 y 60 fps; las SPU van al 27 %, así que el límite está en el hilo de la RSX o en la PPU.
+
+### Rendimiento del renderer (13/11)
+- `FIFOPROF=1` y `RSXPROF=1`: reparto del tiempo del hilo de la FIFO y de las fases de `do_draw`.
+- El hilo de la RSX estaba saturado por la conversión de vértices: se convertía todo el rango entre el índice mínimo y el máximo (29 M de vértices/s para 3,4 M de índices). Ahora, si el rango es disperso, solo se convierten los vértices referenciados.
+- La firma del contenido de cada textura se calcula una vez por cuadro, no en cada dibujo.
+- Resultado: carrera a 60 fps estables; título ~45 fps; menús 30-60.
+- Pendiente: la conversión de vértices sigue siendo la fase más cara (130-230 ms/s).

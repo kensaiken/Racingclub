@@ -768,7 +768,7 @@ static void clear_surface(uint32_t mask) {
 }
 
 // ------------------------------------------------------------------ textures
-struct Tex { GLuint id = 0; uint64_t sig = 0; uint64_t lastUse = 0; GLenum target = GL_TEXTURE_2D; };
+struct Tex { GLuint id = 0; uint64_t sig = 0; uint64_t lastUse = 0; GLenum target = GL_TEXTURE_2D; uint64_t regSig = 0, checked = ~0ull; };
 static std::unordered_map<uint64_t, Tex> texCache;
 
 static uint32_t swizzle_index(uint32_t x, uint32_t y, uint32_t lw, uint32_t lh) {   // Morton order, x in the low bit
@@ -876,15 +876,18 @@ static void bind_texture(int i, float* tsc) {
     const uint32_t faceStride = cube ? (faceBytes + 127) & ~127u : faceBytes;
     const uint32_t total = faceStride * faces;
     if (uint64_t(ea) + total > 0x100000000ull) return;
-    // signature: format registers + sampled content
-    uint64_t sig = fnv(&fmtReg, 4) ^ (uint64_t(rect) << 20) ^ (uint64_t(pitch) << 3) ^ remap * 0x100000001b3ull;
-    {
+    // signature: format registers + sampled content (the content is sampled once per frame and texture)
+    const uint64_t key = (uint64_t(loc) << 32 | off) ^ (uint64_t(cube) << 63);
+    Tex& tx = texCache[key];
+    const uint64_t regSig = fnv(&fmtReg, 4) ^ (uint64_t(rect) << 20) ^ (uint64_t(pitch) << 3) ^ remap * 0x100000001b3ull;
+    uint64_t sig = tx.sig;
+    if (!tx.id || tx.checked != frameNo || tx.regSig != regSig) {
+        sig = regSig;
         const uint32_t step = std::max<uint32_t>(64, total / 512);
         for (uint32_t k = 0; k + 8 <= total; k += step) sig = fnv(C.mem + ea + k, 8, sig);
         sig = fnv(C.mem + ea + total - std::min<uint32_t>(total, 8), std::min<uint32_t>(total, 8), sig);
+        tx.checked = frameNo; tx.regSig = regSig;
     }
-    const uint64_t key = (uint64_t(loc) << 32 | off) ^ (uint64_t(cube) << 63);
-    Tex& tx = texCache[key];
     const GLenum target = cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
     if (!tx.id || tx.sig != sig || tx.target != target) {
         if (tx.id && tx.target != target) { glDeleteTextures(1, &tx.id); tx.id = 0; }
@@ -1017,8 +1020,15 @@ static void apply_state() {
     glPolygonOffset(rf(0xa78), rf(0xa7c));
 }
 
+// RSXPROF=1: time inside do_draw by stage (ms per second) and totals per second
+static uint64_t pfT[6], pfDraws, pfVerts, pfIdx, pfLast;
+static const char* const pfName[6] = {"target+program", "state+uniforms", "textures", "indices", "vertex conversion", "upload+draw"};
 static void do_draw() {
     if (ranges.empty() || !glOk) return;
+    static const bool prof = std::getenv("RSXPROF") != nullptr;
+    uint64_t pt = prof ? SDL_GetPerformanceCounter() : 0;
+    int stage = 0;
+    auto mark = [&] { if (prof) { const uint64_t n = SDL_GetPerformanceCounter(); pfT[stage++] += n - pt; pt = n; } };
     ++drawsThisFrame;
     {   // RSXSKIP=a-b: skip draws a..b of every frame (debug bisection)
         static long s0 = -1, s1 = -1;
@@ -1035,6 +1045,7 @@ static void do_draw() {
     for (int i = 0; i < 16; ++i) texDims |= texDimsOf(i) << (2 * i);
     Program* p = get_program(R[0x1ea0 >> 2] & 511, fpEa, texDims, R[0x1d60 >> 2]);
     if (!p || p->bad) return;
+    mark();
     glUseProgram(p->prog);
     apply_state();
     // vertex program constants
@@ -1056,9 +1067,11 @@ static void do_draw() {
     }
     const float wp[4] = {1.f / cur.aaX, 1.f / cur.aaY, 0, 0};
     glUniform4fv(p->uWpos, 1, wp);
+    mark();
     float tsc[16 * 4];
     for (int i = 0; i < 16; ++i) { tsc[4 * i] = tsc[4 * i + 1] = tsc[4 * i + 2] = tsc[4 * i + 3] = 1.f; if (p->texUsed & (1u << i)) bind_texture(i, tsc + 4 * i); }
     if (p->uTsc >= 0) glUniform4fv(p->uTsc, 16, tsc);
+    mark();
     // vertices
     uint32_t vmin = 0xffffffffu, vmax = 0;
     idx.clear();
@@ -1091,7 +1104,18 @@ static void do_draw() {
         const long f0 = long(R[0x1740 >> 2] & 0xffff);
         if (cur.w == 2560 && ((sf >= 0 && f0 == sf) || (of >= 0 && f0 != of))) return;
     }
-    const uint32_t nv = vmax - vmin + 1;
+    mark();
+    // A draw often uses a few vertices spread over a large buffer: convert only the referenced ones then.
+    static std::vector<uint32_t> uniq, vmap;
+    const uint32_t span = vmax - vmin + 1;
+    const bool sparse = rangesIndexed && span > 64 && span > idx.size() * 2;
+    if (sparse) {
+        uniq.clear();
+        for (uint32_t v : idx) if (v != 0xffffffffu) uniq.push_back(v);
+        std::sort(uniq.begin(), uniq.end());
+        uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+    }
+    const uint32_t nv = sparse ? uint32_t(uniq.size()) : span;
     if (nv > 4000000) { RLOG("[rsx] draw with %u vertices skipped\n", nv); return; }
     int attrs[16], na = 0;
     for (int a = 0; a < 16; ++a) {
@@ -1108,7 +1132,14 @@ static void do_draw() {
         const uint32_t fmt = R[(0x1740 + 4 * attrs[k]) >> 2];
         const uint32_t stride = (fmt >> 8) & 0xff;
         if (stride == 0) { convert_attr(attrs[k], 0, 1, vtx.data() + size_t(k) * nv * 4); for (uint32_t v = 1; v < nv; ++v) std::memcpy(&vtx[(size_t(k) * nv + v) * 4], &vtx[size_t(k) * nv * 4], 16); }
-        else convert_attr(attrs[k], vmin, nv, vtx.data() + size_t(k) * nv * 4);
+        else if (!sparse) convert_attr(attrs[k], vmin, nv, vtx.data() + size_t(k) * nv * 4);
+        else
+            for (uint32_t i = 0; i < nv;) {   // runs of consecutive vertices
+                uint32_t j = i + 1;
+                while (j < nv && uniq[j] == uniq[j - 1] + 1) ++j;
+                convert_attr(attrs[k], uniq[i], j - i, vtx.data() + (size_t(k) * nv + i) * 4);
+                i = j;
+            }
     }
     static const bool vstat = std::getenv("RSXVSTAT") != nullptr;
     if (vstat && na) {   // sanity of positions (attribute 0): NaN / huge values, by memory location
@@ -1123,6 +1154,7 @@ static void do_draw() {
         if (bad && badDraws[m] < 20) RLOG("[vstat] %s draw: %u of %u position values bad (attr0 fmt %08x off %08x, max ok %g, idx range %u-%u)\n", m ? "main" : "local", bad, nv * 3, R[0x1740 >> 2], fo, mx, vmin, vmax);
         if (frameNo % 100 == 0 && drawsThisFrame == 1) RLOG("[vstat] local: %llu/%llu draws bad; main: %llu/%llu draws bad\n", (unsigned long long)badDraws[0], (unsigned long long)draws[0], (unsigned long long)badDraws[1], (unsigned long long)draws[1]);
     }
+    mark();
     glBindVertexArray(vao);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
     glBufferData(GL_ARRAY_BUFFER, vtx.size() * 4, vtx.data(), GL_STREAM_DRAW);
@@ -1130,10 +1162,27 @@ static void do_draw() {
         glEnableVertexAttribArray(attrs[k]);
         glVertexAttribPointer(attrs[k], 4, GL_FLOAT, 0, 16, reinterpret_cast<const void*>(size_t(k) * nv * 16));
     }
-    for (uint32_t& v : idx) if (v != 0xffffffffu) v -= vmin;
+    if (sparse) {
+        if (vmap.size() < span) vmap.resize(span);
+        for (uint32_t i = 0; i < nv; ++i) vmap[uniq[i] - vmin] = i;
+        for (uint32_t& v : idx) if (v != 0xffffffffu) v = vmap[v - vmin];
+    } else
+        for (uint32_t& v : idx) if (v != 0xffffffffu) v -= vmin;
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.size() * 4, idx.data(), GL_STREAM_DRAW);
     glDrawElements(gl_prim(prim), GLsizei(idx.size()), GL_UNSIGNED_INT, nullptr);
+    mark();
+    if (prof) {
+        ++pfDraws; pfVerts += nv; pfIdx += idx.size();
+        const uint64_t now = SDL_GetTicks();
+        if (now - pfLast >= 4000) {
+            const double k = 1000.0 / double(SDL_GetPerformanceFrequency()) / ((now - pfLast) / 1000.0);
+            std::string o; char b[64];
+            for (int q = 0; q < 6; ++q) { std::snprintf(b, sizeof b, " %s %.0f,", pfName[q], pfT[q] * k); o += b; pfT[q] = 0; }
+            if (pfLast) RLOG("[rsxprof] ms/s:%s | per second: %.0f draws, %.0f k vertices, %.0f k indices\n", o.c_str(), pfDraws * 1000.0 / (now - pfLast), pfVerts / double(now - pfLast), pfIdx / double(now - pfLast));
+            pfDraws = pfVerts = pfIdx = 0; pfLast = now;
+        }
+    }
     {   // RSXSTEP=frame: the main surface after every draw of that frame, 640x360 RGB, appended to rsxstep.bin
         static const long stepFrame = std::getenv("RSXSTEP") ? std::atol(std::getenv("RSXSTEP")) : -1;
         if (long(frameNo) == stepFrame && cur.w == 2560 && cur.h == 720) {

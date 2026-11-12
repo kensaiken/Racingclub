@@ -344,8 +344,11 @@ bool plausible_stream(uint32_t o, uint32_t put, int steps) {
     return true;
 }
 
+// FIFOPROF=1: where the FIFO thread spends its time (ms per second): idle, waiting at holes, executing methods
+uint64_t g_profIdle = 0, g_profHole = 0, g_profExec = 0, g_profLast = 0;
 void fifo_thread() {
     t_tid = 0x01000200;
+    static const bool prof = std::getenv("FIFOPROF") != nullptr;
     uint32_t semA = 0, semB = 0;
     std::vector<uint32_t> callStack;
     uint64_t idle = 0;
@@ -355,7 +358,12 @@ void fifo_thread() {
         static int putLogs = 0;
         if (put != lastPut && putLogs < 600) { ++putLogs; LOG("[rsx] put %x (get %x, cmd@get %08x %08x, @put-8 %08x %08x, @put %08x)\n", put, get, rd(io2ea(get)), rd(io2ea(get) + 4), rd(io2ea(put) - 8), rd(io2ea(put) - 4), rd(io2ea(put))); lastPut = put; }
         if (g_flipDue && (get == put || now_us() - g_flipDueSince > 20000)) deliver_flip();
-        if (get == put) { if (++idle > 100) std::this_thread::sleep_for(std::chrono::microseconds(50)); continue; }
+        if (prof && now_us() - g_profLast > 4000000) {
+            const double k = 1.0 / (4.0 * 1000.0);
+            if (g_profLast) LOG("[fifoprof] per second: idle %.0f ms, hole wait %.0f ms, executing %.0f ms\n", g_profIdle * k, g_profHole * k, g_profExec * k);
+            g_profIdle = g_profHole = g_profExec = 0; g_profLast = now_us();
+        }
+        if (get == put) { const uint64_t t0 = prof ? now_us() : 0; if (++idle > 100) std::this_thread::sleep_for(std::chrono::microseconds(50)); if (prof) g_profIdle += now_us() - t0; continue; }
         idle = 0;
         uint32_t g2 = get;
         const uint32_t cmd = rd(io2ea(g2));
@@ -366,7 +374,7 @@ void fifo_thread() {
             static uint32_t holeAt = 0xFFFFFFFFu;
             static auto since = std::chrono::steady_clock::now();
             if (holeAt != g2) { holeAt = g2; since = std::chrono::steady_clock::now(); continue; }
-            if (std::chrono::steady_clock::now() - since < std::chrono::microseconds(g_holeWaitUs)) { std::this_thread::sleep_for(std::chrono::microseconds(20)); continue; }
+            if (std::chrono::steady_clock::now() - since < std::chrono::microseconds(g_holeWaitUs)) { const uint64_t t0 = prof ? now_us() : 0; std::this_thread::sleep_for(std::chrono::microseconds(20)); if (prof) g_profHole += now_us() - t0; continue; }
             static int holes = 0;
             if (holes++ < 8) {
                 std::string s;
@@ -431,7 +439,9 @@ void fifo_thread() {
                 continue;
             }
             if (m0 == 0x1808 && rd(io2ea(g2 + 4))) ++g_rsxBegins;
+            const uint64_t tx = prof ? now_us() : 0;
             for (uint32_t i = 0; i < count; ++i) method(noInc ? m0 : m0 + 4 * i, rd(io2ea(g2 + 4 + 4 * i)), semA, semB);
+            if (prof) g_profExec += now_us() - tx;
             g2 += 4 + 4 * count;
         }
         wr(ctrl + 4, g2);
