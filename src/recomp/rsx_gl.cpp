@@ -1124,7 +1124,7 @@ static void bind_texture_impl(int i, float* tsc) {
     tx.lastUse = frameNo;
     g_lastId = tx.id; g_lastTarget = target;
     {   // the sampler state lives in the GL texture object: set it only when the registers changed
-        const uint32_t sreg[6] = {addr, ctl0, filt, remap, R[(base + 0x1c) >> 2], mips};
+        const uint32_t sreg[7] = {addr, ctl0, filt, remap, R[(base + 0x1c) >> 2], mips, uint32_t(settings().aniso)};
         const uint64_t sk = fnv(sreg, sizeof sreg);
         if (tx.sampler == sk) return;
         tx.sampler = sk;
@@ -1155,7 +1155,12 @@ static void bind_texture_impl(int i, float* tsc) {
     apply_border_color(target, base);
     glTexParameterf(target, GL_TEXTURE_MIN_LOD, ((ctl0 >> 19) & 0xfff) / 256.f);
     glTexParameterf(target, GL_TEXTURE_MAX_LOD, ((ctl0 >> 7) & 0xfff) / 256.f);
-    glTexParameterf(target, GL_TEXTURE_MAX_ANISOTROPY, float(1u << std::min<uint32_t>(4, (ctl0 >> 4) & 7)));
+    // the game's own anisotropy, raised to the option's (mipmapped textures only: the road and walls seen at a
+    // grazing angle stay sharp in the distance instead of blurring)
+    const uint32_t gameAniso = std::min<uint32_t>(4, (ctl0 >> 4) & 7);
+    const uint32_t an = mips > 1 ? std::max<uint32_t>(gameAniso, uint32_t(std::clamp(settings().aniso, 0, 4))) : gameAniso;
+    glTexParameterf(target, GL_TEXTURE_MAX_ANISOTROPY, float(1u << an));
+    if (std::getenv("ANISOLOG")) { static int n = 0; if (n++ < 12) RLOG("[aniso] texture %ux%u, %u levels, filter %08x, game %ux -> %ux%c", w, h, mips, filt, 1u << gameAniso, 1u << an, 10); }
 }
 
 // ------------------------------------------------------------------ vertex data and draws
@@ -1581,7 +1586,7 @@ static void set_display_mode(int mode) {
 // ------------------------------------------------------------------ options menu (F1)
 static bool menuOpen = std::getenv("MENUTEST") != nullptr, menuDirty = true;   // MENUTEST=1 (debug): open from the start
 static int menuSel = 1;
-static const int kMenuLines = 11, kMenuFirst = 1, kMenuLast = 8;   // title, 8 options, 2 notes
+static const int kMenuLines = 12, kMenuFirst = 1, kMenuLast = 9;   // title, 9 options, 2 notes
 static void menu_change(int dir) {
     Settings& s = settings();
     switch (menuSel) {
@@ -1593,12 +1598,13 @@ static void menu_change(int dir) {
         case 6: s.showFps ^= 1; if (!s.showFps) SDL_SetWindowTitle(win, "GTI Club"); break;
         case 7: s.vsync ^= 1; SDL_GL_SetSwapInterval(s.vsync); break;
         case 8: s.sound ^= 1; break;
+        case 9: s.aniso = std::clamp(s.aniso + (dir ? dir : 1), 0, 4); ++g_texGen; break;   // the texture cache keeps sampler state: rebuild it
     }
     menuDirty = true;
 }
 static void draw_menu(int ww, int wh) {
     static GLuint tex = 0, fbo = 0;
-    const int W = 880, H = 600;
+    const int W = 880, H = 650;
     if (!tex) {
         glGenTextures(1, &tex); glGenFramebuffers(1, &fbo);
         glActiveTexture(GL_TEXTURE0 + 15); ++g_texGen;
@@ -1622,8 +1628,12 @@ static void draw_menu(int ww, int wh) {
         std::swprintf(l[6], 96, L"Contador de FPS en el título\t‹ %ls ›", s.showFps ? L"Sí" : L"No");
         std::swprintf(l[7], 96, L"V-Sync\t‹ %ls ›", s.vsync ? L"Sí" : L"No");
         std::swprintf(l[8], 96, L"Sonido *\t‹ %ls ›", s.sound ? L"Sí" : L"No");
-        std::swprintf(l[9], 96, L"* se aplica al reiniciar el juego");
-        std::swprintf(l[10], 96, L"Flechas: elegir y cambiar   ·   F1 o Esc: cerrar   ·   F11: ventana / pantalla completa");
+        {
+            static const wchar_t* const an[5] = {L"No", L"2x", L"4x", L"8x", L"16x"};
+            std::swprintf(l[9], 96, L"Filtrado anisótropo\t‹ %ls ›", an[std::clamp(s.aniso, 0, 4)]);
+        }
+        std::swprintf(l[10], 96, L"* se aplica al reiniciar el juego");
+        std::swprintf(l[11], 96, L"Flechas: elegir y cambiar   ·   F1 o Esc: cerrar   ·   F11: ventana / pantalla completa");
         const wchar_t* lines[kMenuLines];
         for (int i = 0; i < kMenuLines; ++i) lines[i] = l[i];
         static std::vector<uint32_t> px;

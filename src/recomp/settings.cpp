@@ -14,6 +14,7 @@ const Field kFields[] = {
     {"pantalla_120hz", &Settings::refresh, 0, 1},        {"idioma", &Settings::language, 1, 5},          {"contador_fps", &Settings::showFps, 0, 1},
     {"vsync", &Settings::vsync, 0, 1},
     {"sonido", &Settings::sound, 0, 1},
+    {"filtrado_anisotropo", &Settings::aniso, 0, 4},
 };
 }
 
