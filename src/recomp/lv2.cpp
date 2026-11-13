@@ -249,6 +249,7 @@ uint64_t g_profSem = 0, g_profFlip = 0, g_profClear = 0;   // FIFOPROF: label wa
 // S label wait starts, E label wait ends, F flip, D flip handler delivered
 long g_flStart = std::getenv("FRAMELOG") ? std::atol(std::getenv("FRAMELOG")) : -1;
 void fl(const char* tag, uint32_t v = 0);
+uint64_t g_frHoleUs = 0, g_frIdleUs = 0, g_frHoles = 0;   // FRAMELOG: time the FIFO waited at holes / for commands in this frame
 std::atomic<uint32_t> g_vblankTick{0};   // bumped (and waiters woken) after every vblank handler call
 bool g_flipDue = false;
 uint64_t g_flipDueSince = 0;
@@ -301,7 +302,7 @@ void method(uint32_t m, uint32_t arg, uint32_t& semOff406e, uint32_t& semOff4097
         case 0x0064: semOff406e = arg; break;                        // NV406E_SEMAPHORE_OFFSET
         case 0x0068: {                                               // NV406E_SEMAPHORE_ACQUIRE: wait for the label
             const uint64_t ts = now_us();
-            if (semOff406e == 0x810) fl("S");
+            if (semOff406e == 0x810) { fl("h", uint32_t(g_frHoleUs / 100)); fl("n", uint32_t(g_frHoles)); fl("i", uint32_t(g_frIdleUs / 100)); fl("S"); g_frHoleUs = g_frIdleUs = g_frHoles = 0; }
             if (semOff406e == 0x810) {   // waits for the vblank handler: woken by the vblank thread, not by polling
                 for (;;) {
                     const uint32_t tick = g_vblankTick.load();
@@ -396,18 +397,35 @@ void fifo_thread() {
             g_profSem = g_profFlip = 0;
             g_profIdle = g_profHole = g_profExec = 0; g_profLast = now_us();
         }
-        if (get == put) { const uint64_t t0 = prof ? now_us() : 0; if (++idle > 100) std::this_thread::sleep_for(std::chrono::microseconds(50)); if (prof) g_profIdle += now_us() - t0; continue; }
+        static uint64_t waitStart = 0; static int waitKind = 0;   // FRAMELOG accounting of waits
+        if (get == put) {   // nothing to run: the game publishes commands within microseconds, so yield first and only sleep after a while
+            const uint64_t t0 = now_us();
+            if (g_flStart >= 0 && waitKind != 2) { if (waitKind == 1) { g_frHoleUs += t0 - waitStart; ++g_frHoles; } waitStart = t0; waitKind = 2; }
+            static uint64_t idleSince = 0;
+            if (!idle++) idleSince = t0;
+            if (t0 - idleSince < 4000) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(50));
+            if (prof) g_profIdle += now_us() - t0;
+            continue;
+        }
         idle = 0;
         uint32_t g2 = get;
         const uint32_t cmd = rd(io2ea(g2));
         const bool selfJump = ((cmd & 0xE0000003) == 0x20000000 && (cmd & 0x1FFFFFFC) == g2) || ((cmd & 3) == 1 && (cmd & 0xFFFFFFFC) == g2);
+        if (g_flStart >= 0) {
+            const int kind = selfJump ? 1 : 0;
+            if (kind != waitKind) {
+                const uint64_t t = now_us();
+                if (waitKind == 1) { g_frHoleUs += t - waitStart; ++g_frHoles; } else if (waitKind == 2) g_frIdleUs += t - waitStart;
+                waitStart = t; waitKind = kind;
+            }
+        }
         if (selfJump) {
             // A jump-to-self is a hole the SPU geometry jobs fill and then turn into a jump past it. Those jobs are
             // not executed yet: when the hole stays closed for a while, the stream continues after it (zero = NOP).
             static uint32_t holeAt = 0xFFFFFFFFu;
             static auto since = std::chrono::steady_clock::now();
             if (holeAt != g2) { holeAt = g2; since = std::chrono::steady_clock::now(); continue; }
-            if (std::chrono::steady_clock::now() - since < std::chrono::microseconds(g_holeWaitUs)) { const uint64_t t0 = prof ? now_us() : 0; std::this_thread::sleep_for(std::chrono::microseconds(20)); if (prof) g_profHole += now_us() - t0; continue; }
+            if (std::chrono::steady_clock::now() - since < std::chrono::microseconds(g_holeWaitUs)) { const uint64_t t0 = prof ? now_us() : 0; if (std::chrono::steady_clock::now() - since < std::chrono::milliseconds(4)) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(50)); if (prof) g_profHole += now_us() - t0; continue; }
             static int holes = 0;
             if (holes++ < 8) {
                 std::string s;
@@ -460,7 +478,12 @@ void fifo_thread() {
         else if ((cmd & 3) == 1) { g2 = cmd & 0xFFFFFFFC; wr(ctrl + 4, g2); deliver_flip(); }                // jump
         else if ((cmd & 3) == 2) { callStack.push_back(g2 + 4); g2 = cmd & 0xFFFFFFFC; } // call
         else if (cmd == 0x00020000) { g2 = callStack.empty() ? g2 + 4 : callStack.back(); if (!callStack.empty()) callStack.pop_back(); }   // return
-        else if (cmd == 0) { g2 += 4; }                                                  // nop
+        else if (cmd == 0) {   // NOPs: Edge pads its holes with hundreds of them, skip the whole run at once
+            const uint32_t limit = (put > g2 ? put : ioSize) - 4;
+            const uint8_t* m = G->mem + ioAddr;
+            uint32_t w = 0;
+            do { g2 += 4; std::memcpy(&w, m + g2, 4); } while (w == 0 && g2 < limit);
+        }
         else {
             const uint32_t count = (cmd >> 18) & 0x7ff, m0 = cmd & 0xfffc;
             const bool noInc = (cmd & 0x40000000) != 0;
@@ -1223,7 +1246,7 @@ void manager() {
         if (sub == 1) {                                                 // GUARD: wait for cellSpursJobGuardNotify
             wait_idle();
             auto g = guard_of(uint32_t(w) & ~0x7fu);
-            while (g->remaining.load() > 0) std::this_thread::sleep_for(std::chrono::microseconds(20));
+            for (const uint64_t t0 = now_us(); g->remaining.load() > 0;) { if (now_us() - t0 < 3000) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(50)); }
             if (g->autoReset) g->remaining += g->count;
             pc += 8; continue;
         }
@@ -1231,8 +1254,8 @@ void manager() {
         if (sub == 15 || sub == 0) {                                    // END / ABORT: idle until the command is rewritten
             wait_idle();
             const uint64_t k0 = kicks.load();
-            while (rd64m(pc) == w && kicks.load() == k0) std::this_thread::sleep_for(std::chrono::microseconds(20));
-            if (rd64m(pc) == w) std::this_thread::sleep_for(std::chrono::microseconds(50));
+            for (const uint64_t t0 = now_us(); rd64m(pc) == w && kicks.load() == k0;) { if (now_us() - t0 < 3000) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(50)); }
+            if (rd64m(pc) == w) std::this_thread::yield();
             continue;
         }
         pc += 8;                                                        // SET_LABEL and the rest
@@ -1251,10 +1274,15 @@ void start(uint32_t commandList) {
 uint32_t g_jobChainEntry = 0;   // u64 command list of the (single) SPURS job chain
 const bool g_jobsOn = !std::getenv("NOJOBS");   // run the job chain on the SPU interpreter
 // what each guest thread is currently blocked in (for lv2_dump_waits)
-struct WaitInfo { std::string what; uint32_t lr = 0; std::chrono::steady_clock::time_point since; };
+// What each guest thread is blocked in (lv2_dump_waits, WAITPROF). Every import and syscall passes through here,
+// thousands of times per frame, so entering and leaving a scope must cost next to nothing: one slot per thread,
+// written without locks; the list of slots is only locked when a thread makes its slot.
+struct WaitSlot { char what[40] = ""; uint32_t lr = 0, tid = 0; std::atomic<uint64_t> since{0}; };
 std::mutex g_waitMx;
-std::map<uint32_t, WaitInfo> g_waits;
+std::vector<WaitSlot*> g_waitSlots;
+thread_local WaitSlot* t_waitSlot = nullptr;
 // WAITPROF=1: time every guest thread spends blocked, by wait site, in ms per second (printed every 4 s)
+const bool g_waitProf = std::getenv("WAITPROF") != nullptr;
 std::map<std::pair<uint32_t, std::string>, uint64_t> g_waitAcc;
 void waitprof_thread() {
     for (;;) {
@@ -1270,27 +1298,61 @@ void waitprof_thread() {
     }
 }
 struct WaitScope {
-    uint32_t tid;
-    WaitScope(const std::string& w, uint32_t lr) : tid(t_tid) {
-        static const bool prof = std::getenv("WAITPROF") != nullptr;
-        static std::once_flag once;
-        if (prof) std::call_once(once, [] { std::thread(waitprof_thread).detach(); });
-        std::lock_guard<std::mutex> lk(g_waitMx); g_waits[tid] = {w, lr, std::chrono::steady_clock::now()};
+    WaitSlot* s;
+    WaitScope(const char* w, uint32_t lr) {
+        if (!t_waitSlot) {
+            t_waitSlot = new WaitSlot;
+            t_waitSlot->tid = t_tid;
+            std::lock_guard<std::mutex> lk(g_waitMx);
+            g_waitSlots.push_back(t_waitSlot);
+            static bool profStarted = false;
+            if (g_waitProf && !profStarted) { profStarted = true; std::thread(waitprof_thread).detach(); }
+        }
+        s = t_waitSlot;
+        std::strncpy(s->what, w, sizeof s->what - 1);
+        s->lr = lr; s->tid = t_tid;
+        s->since = now_us();
     }
     ~WaitScope() {
-        std::lock_guard<std::mutex> lk(g_waitMx);
-        auto it = g_waits.find(tid);
-        if (it != g_waits.end()) {
-            char b[48]; std::snprintf(b, sizeof b, "%.14s@%x", it->second.what.c_str(), it->second.lr);
-            g_waitAcc[{tid, b}] += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - it->second.since).count());
-            g_waits.erase(it);
+        if (g_waitProf) {
+            char b[64]; std::snprintf(b, sizeof b, "%.14s@%x", s->what, s->lr);
+            std::lock_guard<std::mutex> lk(g_waitMx);
+            g_waitAcc[{s->tid, b}] += now_us() - s->since.load();
         }
+        s->since = 0;
     }
 };
 
+const char* g_hotName[4] = {};
+const bool g_jobDump = std::getenv("JOBDUMP") != nullptr;
 bool imports(PPU& c, const char* module, const char* name) {
+    {   // The imports the game calls thousands of times per frame, recognised by the address of their name
+        // (set the first time they come through the normal path below).
+        if (name == g_hotName[0]) { c.wr64(a32(c, 0), t_tid); ret(c, CELL_OK); return true; }   // sys_ppu_thread_get_id
+        if (name == g_hotName[1]) {                                                             // sys_lwmutex_lock
+            auto m = lwm(a32(c, 0));
+            const bool ok = mlock(*m, c.r[4]);
+            if (ok) { c.wr32(a32(c, 0), t_tid); c.wr32(a32(c, 0) + 0xc, uint32_t(m->count)); }
+            ret(c, ok ? CELL_OK : LV2_ETIMEDOUT); return true;
+        }
+        if (name == g_hotName[2]) {                                                             // sys_lwmutex_unlock
+            auto m = lwm(a32(c, 0));
+            munlock(*m);
+            c.wr32(a32(c, 0) + 0xc, uint32_t(m->count));
+            if (!m->count) c.wr32(a32(c, 0), 0xFFFFFFFFu);
+            ret(c, CELL_OK); return true;
+        }
+        if (name == g_hotName[3] && g_jobsOn && !g_jobDump) {                                   // cellSpursRunJobChain
+            jobs::start(g_jobChainEntry); ++jobs::kicks; jobs::kicks.notify_all();
+            ret(c, CELL_OK); return true;
+        }
+        if (!g_hotName[0] && !std::strcmp(name, "sys_ppu_thread_get_id")) g_hotName[0] = name;
+        else if (!g_hotName[1] && !std::strcmp(name, "sys_lwmutex_lock")) g_hotName[1] = name;
+        else if (!g_hotName[2] && !std::strcmp(name, "sys_lwmutex_unlock")) g_hotName[2] = name;
+        else if (!g_hotName[3] && !std::strcmp(name, "cellSpursRunJobChain")) g_hotName[3] = name;
+    }
     const std::string n = name, mod = module;
-    WaitScope ws_(n, uint32_t(c.lr));
+    WaitScope ws_(name, uint32_t(c.lr));
     if (CFG.trace) LOG("[call %x] %s::%s r3=%llx r4=%llx r5=%llx\n", t_tid, module, name, (unsigned long long)c.r[3], (unsigned long long)c.r[4], (unsigned long long)c.r[5]);
     if (mod == "cellGcmSys" && gcm::import(c, n)) return true;
     // --- sysutil: video out 1280x720, English, X to confirm, no save data yet
@@ -1919,7 +1981,8 @@ bool kernel_syscall(PPU& c, uint32_t nr) {
 void syscall(PPU& c) {
     const uint32_t nr = uint32_t(c.r[11]);
     if (CFG.trace) LOG("[sc %x] %u r3=%llx r4=%llx\n", t_tid, nr, (unsigned long long)c.r[3], (unsigned long long)c.r[4]);
-    WaitScope ws_("syscall " + std::to_string(nr) + " r3=0x" + std::to_string(uint32_t(c.r[3])), uint32_t(c.lr));
+    char wsName[40]; std::snprintf(wsName, sizeof wsName, "syscall %d r3=0x%x", int(nr), uint32_t(c.r[3]));
+    WaitScope ws_(wsName, uint32_t(c.lr));
     if (kernel_syscall(c, nr)) return;
     switch (nr) {
         case 1: ret(c, 1); return;                                    // sys_process_getpid
@@ -2015,12 +2078,13 @@ void lv2_dump_waits() {
         if (rc) LOG("[wait] render ctx %x: index %u, expected %x %x\n", rc, gcm::rd(rc + 0x300), gcm::rd(rc + 0x304), gcm::rd(rc + 0x308));
     }
     std::lock_guard<std::mutex> lk(g_waitMx);
-    const auto now = std::chrono::steady_clock::now();
-    for (auto& [tid, w] : g_waits) {
+    const uint64_t now = now_us();
+    for (WaitSlot* w : g_waitSlots) {
+        const uint64_t since = w->since.load();
+        if (!since) continue;
         std::string name;
-        { std::lock_guard<std::mutex> l2(g_thMx); auto it = g_threads.find(tid); if (it != g_threads.end()) name = it->second->name; }
-        LOG("[wait] thread %x '%s': in %s for %.1f s (lr 0x%x)\n", tid, name.c_str(), w.what.c_str(),
-            std::chrono::duration<double>(now - w.since).count(), w.lr);
+        { std::lock_guard<std::mutex> l2(g_thMx); auto it = g_threads.find(w->tid); if (it != g_threads.end()) name = it->second->name; }
+        LOG("[wait] thread %x '%s': in %s for %.1f s (lr 0x%x)\n", w->tid, name.c_str(), w->what, (now - since) / 1e6, w->lr);
     }
 }
 

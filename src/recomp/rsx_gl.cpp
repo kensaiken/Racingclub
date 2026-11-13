@@ -77,6 +77,7 @@ enum : GLenum {
     X(void, glDrawElements, GLenum, GLsizei, GLenum, const void*) X(void, glDrawArrays, GLenum, GLint, GLsizei) \
     X(GLuint, glCreateShader, GLenum) X(void, glShaderSource, GLuint, GLsizei, const GLchar* const*, const GLint*) X(void, glCompileShader, GLuint) \
     X(void, glGetShaderiv, GLuint, GLenum, GLint*) X(void, glGetShaderInfoLog, GLuint, GLsizei, GLsizei*, GLchar*) X(GLuint, glCreateProgram) \
+    X(void, glProgramBinary, GLuint, GLenum, const void*, GLsizei) X(void, glGetProgramBinary, GLuint, GLsizei, GLsizei*, GLenum*, void*) \
     X(void, glAttachShader, GLuint, GLuint) X(void, glLinkProgram, GLuint) X(void, glGetProgramiv, GLuint, GLenum, GLint*) \
     X(void, glGetProgramInfoLog, GLuint, GLsizei, GLsizei*, GLchar*) X(void, glUseProgram, GLuint) X(GLint, glGetUniformLocation, GLuint, const GLchar*) \
     X(void, glUniform4fv, GLint, GLsizei, const GLfloat*) X(void, glUniform1i, GLint, GLint) X(void, glDeleteShader, GLuint) X(GLenum, glGetError) X(void, glReadPixels, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*) X(void, glGetIntegerv, GLenum, GLint*) X(GLboolean, glIsEnabled, GLenum)
@@ -129,6 +130,7 @@ static float half2f(uint16_t h) {
 }
 static uint32_t ea_of(uint32_t offset, uint32_t location /*0 local, 1 main*/) { return (location ? C.ioAddr : C.localAddr) + offset; }
 
+static uint64_t g_texUploads = 0, g_texUploadBytes = 0, g_streamBuilds = 0, g_streamVerts = 0, g_progBuilds = 0;   // work counters, see [slowdraw]
 static uint64_t fnv(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {   // keys used inside this process only
     const uint8_t* b = static_cast<const uint8_t*>(p);
     for (; n >= 8; n -= 8, b += 8) { uint64_t w; std::memcpy(&w, b, 8); h = (h ^ w) * 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
@@ -599,6 +601,7 @@ static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, u
     if (it != programs.end()) return &it->second;
     Program& p = programs[key];
     p.key = key;
+    ++g_progBuilds;
     const VpInfo vi = translate_vp(vpCode, vpStart);
     const FpInfo fi = translate_fp(fpEa, texDims, control);
     p.vpInputs = vi.inputs;
@@ -611,13 +614,48 @@ static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, u
         if (FILE* f = std::fopen(fn, "wb")) { std::fprintf(f, "// VP start %u len %d\n%s\n// FP %x size %u\n%s", vpStart, vi.len, vi.glsl.c_str(), fpEa, fi.size, fi.glsl.c_str()); std::fclose(f); }
     }
     if (vi.unsupported || fi.unsupported) RLOG("[rsx] program %016llx uses unsupported instructions (vp %d fp %d)\n", (unsigned long long)key, vi.unsupported, fi.unsupported);
-    const GLuint vs = compile(GL_VERTEX_SHADER, vi.glsl, "vertex"), fs = compile(GL_FRAGMENT_SHADER, fi.glsl, "fragment");
+    // Linked programs are kept on disk (glcache/): compiling one takes tens of milliseconds, a visible hitch the
+    // first time an effect appears. The file name carries the hash of the generated GLSL, so a change in the
+    // translator makes new files; a driver that rejects a binary just compiles again. RSXNOGLCACHE=1 turns it off.
+    static const bool binCache = std::getenv("RSXNOGLCACHE") == nullptr;
+    static bool dirMade = false;
+    if (binCache && !dirMade) { dirMade = true; SDL_CreateDirectory("glcache"); }
+    char cacheName[96];
+    std::snprintf(cacheName, sizeof cacheName, "glcache/%016llx.bin", (unsigned long long)(fnv(vi.glsl.data(), vi.glsl.size(), fnv(fi.glsl.data(), fi.glsl.size()))));
     p.prog = glCreateProgram();
-    glAttachShader(p.prog, vs);
-    glAttachShader(p.prog, fs);
-    glLinkProgram(p.prog);
     GLint ok = 0;
-    glGetProgramiv(p.prog, GL_LINK_STATUS, &ok);
+    GLuint vs = 0, fs = 0;
+    if (binCache)
+        if (FILE* f = std::fopen(cacheName, "rb")) {
+            std::vector<uint8_t> bin;
+            uint8_t buf[65536]; size_t k;
+            while ((k = std::fread(buf, 1, sizeof buf, f)) > 0) bin.insert(bin.end(), buf, buf + k);
+            std::fclose(f);
+            if (bin.size() > 4) {
+                uint32_t fmt; std::memcpy(&fmt, bin.data(), 4);
+                glProgramBinary(p.prog, fmt, bin.data() + 4, GLsizei(bin.size() - 4));
+                glGetProgramiv(p.prog, GL_LINK_STATUS, &ok);
+                while (glGetError()) {}
+            }
+        }
+    if (!ok) {
+        vs = compile(GL_VERTEX_SHADER, vi.glsl, "vertex"); fs = compile(GL_FRAGMENT_SHADER, fi.glsl, "fragment");
+        glAttachShader(p.prog, vs);
+        glAttachShader(p.prog, fs);
+        glLinkProgram(p.prog);
+        glGetProgramiv(p.prog, GL_LINK_STATUS, &ok);
+        if (ok && binCache) {
+            GLint len = 0;
+            glGetProgramiv(p.prog, 0x8741 /* GL_PROGRAM_BINARY_LENGTH */, &len);
+            if (len > 0) {
+                std::vector<uint8_t> bin(size_t(len) + 4);
+                GLsizei got = 0; GLenum fmt = 0;
+                glGetProgramBinary(p.prog, len, &got, &fmt, bin.data() + 4);
+                const uint32_t f32v = fmt; std::memcpy(bin.data(), &f32v, 4);
+                if (got > 0) if (FILE* f = std::fopen(cacheName, "wb")) { std::fwrite(bin.data(), 1, size_t(got) + 4, f); std::fclose(f); }
+            }
+        }
+    }
     if (!ok) {
         char log[4096]; GLsizei ln = 0;
         glGetProgramInfoLog(p.prog, sizeof log, &ln, log);
@@ -953,6 +991,7 @@ static void bind_texture(int i, float* tsc) {
         tx.target = target;
         tx.sig = sig;
         tx.sampler = ~0ull;
+        ++g_texUploads; g_texUploadBytes += total;
         glBindTexture(target, tx.id);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
@@ -1136,6 +1175,7 @@ static GLuint cached_stream(int a, uint32_t need) {
         glBindBuffer(GL_ARRAY_BUFFER, st.vbo);
         glBufferData(GL_ARRAY_BUFFER, tmp.size() * 4, tmp.data(), 0x88E4 /* GL_STATIC_DRAW */);
         st.count = n; st.sig = stream_sig(p, stride, n); st.checked = frameNo;
+        ++g_streamBuilds; g_streamVerts += n;
     }
     return st.vbo;
 }
@@ -1145,6 +1185,14 @@ static uint64_t pfT[6], pfDraws, pfVerts, pfIdx, pfLast;
 static const char* const pfName[6] = {"target+program", "state+uniforms", "textures", "indices", "vertex conversion", "upload+draw"};
 static void do_draw() {
     if (ranges.empty() || !glOk) return;
+    struct SlowDraw {   // a draw over 6 ms: what it had to build
+        uint64_t t0 = SDL_GetPerformanceCounter(), tu = g_texUploads, tb = g_texUploadBytes, sb = g_streamBuilds, sv = g_streamVerts, pb = g_progBuilds;
+        ~SlowDraw() {
+            const double ms = (SDL_GetPerformanceCounter() - t0) * 1000.0 / SDL_GetPerformanceFrequency();
+            if (ms > 6) RLOG("[slowdraw] %.0f ms: %llu textures uploaded (%llu KB), %llu vertex streams built (%llu vertices), %llu programs built\n", ms, (unsigned long long)(g_texUploads - tu),
+                             (unsigned long long)((g_texUploadBytes - tb) >> 10), (unsigned long long)(g_streamBuilds - sb), (unsigned long long)(g_streamVerts - sv), (unsigned long long)(g_progBuilds - pb));
+        }
+    } slowDraw;
     static const bool prof = std::getenv("RSXPROF") != nullptr;
     uint64_t pt = prof ? SDL_GetPerformanceCounter() : 0;
     int stage = 0;
@@ -1446,6 +1494,16 @@ void flip(uint32_t id) {
     if (!glOk) return;
     ++frameNo;
     stateValid = false;
+    {   // frame pacing: longest gap between two flips, reported every 2 s (a hitch shows here, not in the average)
+        static uint64_t lastFlip = 0, worst = 0, since = 0; static int over = 0;
+        const uint64_t t = SDL_GetPerformanceCounter(), fq = SDL_GetPerformanceFrequency();
+        if (lastFlip) { const uint64_t d = t - lastFlip; worst = std::max(worst, d); if (d * 1000 > fq * 25) ++over; }
+        lastFlip = t;
+        if (t - since > 2 * fq) {
+            if (since) RLOG("[pace] worst frame %.0f ms, %d frames over 25 ms\n", worst * 1000.0 / fq, over);
+            since = t; worst = 0; over = 0;
+        }
+    }
     const Display& d = displays[id & 7];
     int ww = 1280, wh = 720;
     SDL_GetWindowSizeInPixels(win, &ww, &wh);

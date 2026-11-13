@@ -431,3 +431,13 @@ Informe: parón al aparecer la pantalla con el mapa, 30 fps o menos con rivales 
 - **Perfiles nuevos:** `WAITPROF=1` (ms/s bloqueado por hilo y punto de espera), `RIPPROF=seg` (muestreo del hilo de la FIFO a `ripprof.txt`, con módulo para lo que no es del exe), `FRAMELOG=n` (cronología de 40 cuadros), `FIFOPROF=1` separa espera de etiqueta y flip.
 - **Resultado:** 60 fps en título, menús, selección de coche, parrilla y carrera en el recorrido de prueba.
 - Pendiente: microparones (probablemente compilación de shaders la primera vez que aparece un efecto), pintura moteada, sonido.
+
+### Margen de cuadro (13/11, noche)
+El juego necesita que la FIFO llegue a la espera de vblank menos de ~15,8 ms después del flip anterior. Lo que se ha quitado para conseguirlo:
+- **NOP en bloque:** Edge rellena sus huecos con cientos de órdenes vacías; la FIFO las procesaba una a una con una escritura atómica cada vez (~5 ms por cuadro). Ahora salta la racha entera.
+- **Reloj fuera de la ruta caliente:** el registro `[slow]` por orden leía el reloj ~80 000 veces por cuadro (25 % del hilo). Eliminado; queda `[slowdraw]` (dibujos de más de 6 ms, con lo que tuvieron que construir) y `[pace]` (peor cuadro cada 2 s).
+- **Esperas con cesión, no con `Sleep`:** huecos, FIFO sin órdenes, gestor de trabajos (GUARD / END) ceden la CPU los primeros milisegundos.
+- **Importaciones baratas:** el juego hace ~3200 llamadas de sistema por cuadro (`sys_ppu_thread_get_id`, `sys_lwmutex_lock/unlock`, `cellSpursRunJobChain` una vez por trabajo). Las cuatro más frecuentes se atienden al principio de `imports()` reconociéndolas por la dirección de su nombre; `WaitScope` ya no crea cadenas ni toma cerrojos (una ranura por hilo).
+- **Caché de programas GL en disco** (`glcache/`, `RSXNOGLCACHE=1` la desactiva): binarios enlazados con `glGetProgramBinary`.
+- Cronología típica de un cuadro pesado ahora: el juego publica el final a +10 ms del flip y la FIFO llega a la espera a +12-14 ms.
+- **Pendiente:** parones en las transiciones (100-330 ms, idénticos con la caché de shaders fría y caliente, no ocurren en el hilo de la RSX: son del lado PPU); unos segundos a 30 fps al entrar en la parrilla.
