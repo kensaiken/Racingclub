@@ -1467,7 +1467,7 @@ static void init_gl() {
     if (!win) { RLOG("[rsx] window: %s\n", SDL_GetError()); return; }
     glc = SDL_GL_CreateContext(win);
     if (!glc) { RLOG("[rsx] GL context: %s\n", SDL_GetError()); return; }
-    SDL_GL_SetSwapInterval(0);
+    SDL_GL_SetSwapInterval(settings().vsync);
     if (settings().fullscreen) SDL_SetWindowFullscreen(win, true);
 #define RSX_LOAD(ret, name, ...) name = reinterpret_cast<PFN_##name>(SDL_GL_GetProcAddress(#name)); if (!name) { RLOG("[rsx] missing GL function %s\n", #name); return; }
     RSX_GL(RSX_LOAD)
@@ -1486,22 +1486,23 @@ static void init_gl() {
 // ------------------------------------------------------------------ options menu (F1)
 static bool menuOpen = std::getenv("MENUTEST") != nullptr, menuDirty = true;   // MENUTEST=1 (debug): open from the start
 static int menuSel = 1;
-static const int kMenuLines = 9, kMenuFirst = 1, kMenuLast = 6;   // title, 6 options, 2 notes
+static const int kMenuLines = 10, kMenuFirst = 1, kMenuLast = 7;   // title, 7 options, 2 notes
 static void menu_change(int dir) {
     Settings& s = settings();
     switch (menuSel) {
         case 1: s.fullscreen ^= 1; SDL_SetWindowFullscreen(win, s.fullscreen != 0); break;
         case 2: s.scale = std::clamp(s.scale + dir, 1, 3); break;
-        case 3: s.gameHz = s.gameHz == 60 ? 120 : 60; break;
+        case 3: { static const int r[4] = {60, 72, 120, 144}; int i = 0; while (i < 3 && r[i] != s.gameHz) ++i; s.gameHz = r[(i + dir + 4) % 4]; break; }
         case 4: s.refresh ^= 1; break;
         case 5: s.language = 1 + (s.language - 1 + dir + 5) % 5; break;
         case 6: s.showFps ^= 1; if (!s.showFps) SDL_SetWindowTitle(win, "GTI Club"); break;
+        case 7: s.vsync ^= 1; SDL_GL_SetSwapInterval(s.vsync); break;
     }
     menuDirty = true;
 }
 static void draw_menu(int ww, int wh) {
     static GLuint tex = 0, fbo = 0;
-    const int W = 880, H = 500;
+    const int W = 880, H = 550;
     if (!tex) {
         glGenTextures(1, &tex); glGenFramebuffers(1, &fbo);
         glActiveTexture(GL_TEXTURE0 + 15);
@@ -1519,12 +1520,13 @@ static void draw_menu(int ww, int wh) {
         std::swprintf(l[0], 96, L"OPCIONES");
         std::swprintf(l[1], 96, L"Pantalla completa\t‹ %ls ›", s.fullscreen ? L"Sí" : L"No");
         std::swprintf(l[2], 96, L"Resolución interna\t‹ %ls ›", res[std::clamp(s.scale, 1, 3) - 1]);
-        std::swprintf(l[3], 96, L"Imágenes por segundo *\t‹ %ls ›", s.gameHz == 120 ? L"120 (experimental)" : L"60 (original)");
-        std::swprintf(l[4], 96, L"Pantalla a 120 Hz al jugar *\t‹ %ls ›", s.refresh ? L"Sí" : L"No");
+        std::swprintf(l[3], 96, L"Imágenes por segundo *\t‹ %ls ›", s.gameHz == 60 ? L"60 (original)" : s.gameHz == 72 ? L"72 (ideal en 144 Hz)" : s.gameHz == 120 ? L"120 (experimental)" : L"144 (experimental)");
+        std::swprintf(l[4], 96, L"Adaptar la pantalla al juego *\t‹ %ls ›", s.refresh ? L"Sí" : L"No");
         std::swprintf(l[5], 96, L"Idioma del juego *\t‹ %ls ›", lang[std::clamp(s.language, 1, 5) - 1]);
         std::swprintf(l[6], 96, L"Contador de FPS en el título\t‹ %ls ›", s.showFps ? L"Sí" : L"No");
-        std::swprintf(l[7], 96, L"* se aplica al reiniciar el juego");
-        std::swprintf(l[8], 96, L"Flechas: elegir y cambiar   ·   F1 o Esc: cerrar   ·   F11: pantalla completa");
+        std::swprintf(l[7], 96, L"V-Sync\t‹ %ls ›", s.vsync ? L"Sí" : L"No");
+        std::swprintf(l[8], 96, L"* se aplica al reiniciar el juego");
+        std::swprintf(l[9], 96, L"Flechas: elegir y cambiar   ·   F1 o Esc: cerrar   ·   F11: pantalla completa");
         const wchar_t* lines[kMenuLines];
         for (int i = 0; i < kMenuLines; ++i) lines[i] = l[i];
         static std::vector<uint32_t> px;
