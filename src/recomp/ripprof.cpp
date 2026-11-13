@@ -1,7 +1,9 @@
-// RIPPROF=<seconds>: sampling profiler for one host thread (the RSX FIFO thread registers itself). Starting that
-// many seconds after launch it records the thread's instruction pointer every 250 us for 15 s and writes one line
+// RIPPROF=<seconds>: sampling profiler for one host thread: the one whose name contains RIPTHREAD (default "fifo",
+// the RSX FIFO thread; guest threads register with their PS3 name, e.g. "main" or "Render"). Starting that many
+// seconds after launch it records the thread's instruction pointer every 250 us for RIPLEN seconds (default 15) and writes one line
 // per sample to ripprof.txt: the offset from the image base for code of the exe (resolve with
 // addr2line -f -e recomp_boot.exe, base 0x140000000), "@module+offset" for anything else (GL driver, system).
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -13,12 +15,15 @@
 #include <windows.h>
 namespace gti::recomp {
 static HANDLE g_target = nullptr;
-static void sampler(int startSec) {
-    std::this_thread::sleep_for(std::chrono::seconds(startSec));
+static const auto g_launch = std::chrono::steady_clock::now();
+static double g_sinceLaunch() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_launch).count(); }
+static void sampler(double startSec) {
+    std::this_thread::sleep_for(std::chrono::microseconds(int64_t(startSec * 1e6)));
     const uint64_t base = uint64_t(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)));
     std::vector<uint64_t> rips;
     rips.reserve(70000);
-    const auto end = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    const double len = std::getenv("RIPLEN") ? std::atof(std::getenv("RIPLEN")) : 15.0;
+    const auto end = std::chrono::steady_clock::now() + std::chrono::microseconds(int64_t(len * 1e6));
     while (std::chrono::steady_clock::now() < end) {
         CONTEXT ctx{};
         ctx.ContextFlags = CONTEXT_CONTROL;
@@ -42,13 +47,16 @@ static void sampler(int startSec) {
     }
     std::fclose(f);
 }
-void ripprof_register_thread() {
+void ripprof_register_thread(const char* name) {
     const char* e = std::getenv("RIPPROF");
-    if (!e || g_target) return;
+    const char* want = std::getenv("RIPTHREAD") ? std::getenv("RIPTHREAD") : "fifo";
+    if (!e || g_target || !name || !std::strstr(name, want)) return;
     g_target = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId());
-    if (g_target) std::thread(sampler, std::atoi(e)).detach();
+    static const auto launch = std::chrono::steady_clock::now();
+    (void)launch;
+    if (g_target) std::thread(sampler, std::max(0.0, std::atof(e) - g_sinceLaunch())).detach();
 }
 } // namespace gti::recomp
 #else
-namespace gti::recomp { void ripprof_register_thread() {} }
+namespace gti::recomp { void ripprof_register_thread(const char*) {} }
 #endif

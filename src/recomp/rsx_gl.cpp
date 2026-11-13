@@ -1010,9 +1010,28 @@ static void bind_texture(int i, float* tsc) {
                 if (tf.dxt) {
                     glCompressedTexImage2D(tgt, l, tf.ifmt, lw, lh, 0, lb, C.mem + p);
                 } else {
-                    buf.resize(size_t(lw) * lh * tf.bpp);
                     const bool swz = !ln && (lw & (lw - 1)) == 0 && (lh & (lh - 1)) == 0;
                     const uint32_t lwl = ilog2(lw), lhl = ilog2(lh);
+                    if (!swz && tf.swap == 0 && baseFmt != 0x9e) {   // rows as they are in memory: no copy at all
+                        if (ln && pitch) glPixelStorei(GL_UNPACK_ROW_LENGTH, GLint(pitch / tf.bpp));
+                        glTexImage2D(tgt, l, tf.ifmt, lw, lh, 0, tf.fmt, tf.type, C.mem + p);
+                        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+                        p += lb;
+                        continue;
+                    }
+                    buf.resize(size_t(lw) * lh * tf.bpp);
+                    if (swz && tf.bpp == 4 && tf.swap == 0) {   // swizzled 32-bit texels: x and y bits never overlap, one table each
+                        static std::vector<uint32_t> xs, ys;
+                        xs.resize(lw); ys.resize(lh);
+                        for (uint32_t x = 0; x < lw; ++x) xs[x] = swizzle_index(x, 0, lwl, lhl) * 4;
+                        for (uint32_t y = 0; y < lh; ++y) ys[y] = swizzle_index(0, y, lwl, lhl) * 4;
+                        const uint8_t* src = C.mem + p;
+                        uint32_t* d = reinterpret_cast<uint32_t*>(buf.data());
+                        for (uint32_t y = 0; y < lh; ++y) {
+                            const uint8_t* row = src + ys[y];
+                            for (uint32_t x = 0; x < lw; ++x) std::memcpy(d++, row + xs[x], 4);
+                        }
+                    } else
                     for (uint32_t y = 0; y < lh; ++y)
                         for (uint32_t x = 0; x < lw; ++x) {
                             const uint32_t src = swz ? swizzle_index(x, y, lwl, lhl) * tf.bpp : (ln && pitch ? y * pitch + x * tf.bpp : (y * lw + x) * tf.bpp);

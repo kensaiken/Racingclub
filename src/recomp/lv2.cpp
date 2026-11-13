@@ -20,7 +20,7 @@
 #include <thread>
 #include <vector>
 
-namespace gti::recomp { void ripprof_register_thread(); }   // ripprof.cpp
+namespace gti::recomp { void ripprof_register_thread(const char* name); }   // ripprof.cpp
 namespace gti::recomp {
 
 extern uint64_t g_missLr;
@@ -92,6 +92,7 @@ std::atomic<int> g_exitCode{0};
 
 void run_thread(std::shared_ptr<GThread> t, uint32_t entryOpd, uint64_t arg, uint32_t stackSize) {
     t_tid = t->id;
+    ripprof_register_thread(t->name.c_str());
     PPU c;
     G->prepare(c);
     c.tid = t->id;
@@ -382,7 +383,7 @@ uint64_t g_profIdle = 0, g_profHole = 0, g_profExec = 0, g_profLast = 0;
 extern uint64_t g_profSem, g_profFlip, g_profClear;
 void fifo_thread() {
     t_tid = 0x01000200;
-    ripprof_register_thread();
+    ripprof_register_thread("fifo");
     static const bool prof = std::getenv("FIFOPROF") != nullptr;
     uint32_t semA = 0, semB = 0;
     std::vector<uint32_t> callStack;
@@ -2098,6 +2099,7 @@ int lv2_run_main(Guest& g) {
     t->name = "main";
     g_threads[t->id] = t;
     t_tid = t->id;
+    ripprof_register_thread("main");
     PPU c;
     g.prepare(c);
     c.tid = t->id;
