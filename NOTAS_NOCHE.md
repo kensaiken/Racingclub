@@ -420,3 +420,14 @@ Informe: polígonos mezclados a pantalla completa durante unos segundos, 30 fps 
 - **Reflejos:** un cubemap cuyas caras son superficies de render (6 de 256×256 a partir de la primera, separadas `w·h·4`) se monta una vez por cuadro copiando las superficies (`glCopyTexSubImage2D`) en vez de leerse de memoria.
 - **Sombras:** las texturas de profundidad con función de comparación (`addr` bits 28-30) se muestrean con `shcmp` (2×2 tomas, `textureGather`) y devuelven el resultado de la comparación, no la profundidad. `texDimsOf` devuelve 3 para ellas; la función va en `u_tsc[n].z`.
 - Pendiente: la pintura de los coches se ve moteada (revisar la reflexión o el mapa de normales).
+
+### Tras la segunda prueba del usuario (13/11): 60 fps estables
+Informe: parón al aparecer la pantalla con el mapa, 30 fps o menos con rivales en pantalla y en varias zonas, microparones en las colisiones.
+- **Causa de los 30 fps: latencias de sondeo, no falta de velocidad.** Cronología con `FRAMELOG=n`: la FIFO ejecuta el cuadro a la vez que el juego lo construye y llega a la espera de la etiqueta 0x81 cuando el juego publica el final (12-15 ms tras el flip). Pero la espera del vblank sondeaba con `sleep_for(10 us)` (en Windows ≥ 1-2 ms) y el hilo de render sondea otra etiqueta con `sys_timer_usleep(30)` tras cada flip (~0,8 ms). Se perdían ~3,5 ms por cuadro y cualquier cuadro pesado caía al vblank siguiente.
+  - La espera de la etiqueta 0x81 se despierta desde el hilo de vblank (`g_vblankTick`, `wait`/`notify_all`).
+  - `sys_timer_usleep` por debajo de 1,5 ms cede la CPU en bucle hasta que pasa el tiempo.
+- **6 hilos de SPU:** `run_job` crea las descripciones de búfer de Edge de los trabajadores 3-5 (copia de la de la SPU 0, anillo propio y etiquetas RSX 0x600/0x610/0x620). La espera de trabajos del hilo de render baja de 175 a 60 ms/s.
+- **RSX:** un solo recorrido del programa de fragmentos por dibujo (hash y constantes), hash del programa de vértices solo tras una carga, `fnv` de 8 en 8 bytes, estado GL y parámetros de muestreo solo cuando cambian, `half2f` sin `ldexp`. Órdenes por cuadro pesado: 18 → 11,7 ms.
+- **Perfiles nuevos:** `WAITPROF=1` (ms/s bloqueado por hilo y punto de espera), `RIPPROF=seg` (muestreo del hilo de la FIFO a `ripprof.txt`, con módulo para lo que no es del exe), `FRAMELOG=n` (cronología de 40 cuadros), `FIFOPROF=1` separa espera de etiqueta y flip.
+- **Resultado:** 60 fps en título, menús, selección de coche, parrilla y carrera en el recorrido de prueba.
+- Pendiente: microparones (probablemente compilación de shaders la primera vez que aparece un efecto), pintura moteada, sonido.

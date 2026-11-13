@@ -118,17 +118,20 @@ static inline uint16_t be16(uint32_t ea) { return uint16_t(C.mem[ea] << 8 | C.me
 static inline float f32(uint32_t bits) { float f; std::memcpy(&f, &bits, 4); return f; }
 static inline float rf(uint32_t m) { return f32(R[m >> 2]); }
 static float half2f(uint16_t h) {
-    const uint32_t s = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
-    float v;
-    if (e == 0) v = std::ldexp(float(m), -24);
-    else if (e == 31) v = m ? NAN : INFINITY;
-    else v = std::ldexp(float(m | 0x400), int(e) - 25);
-    return s ? -v : v;
+    const uint32_t sgn = uint32_t(h & 0x8000) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+    uint32_t u;
+    if (e == 0) {
+        if (!m) u = sgn;
+        else { const float v = float(m) * (1.f / 16777216.f); std::memcpy(&u, &v, 4); u |= sgn; }   // subnormal: m * 2^-24
+    } else if (e == 31) u = sgn | 0x7f800000u | (m << 13);
+    else u = sgn | ((e + 112) << 23) | (m << 13);
+    float f; std::memcpy(&f, &u, 4); return f;
 }
 static uint32_t ea_of(uint32_t offset, uint32_t location /*0 local, 1 main*/) { return (location ? C.ioAddr : C.localAddr) + offset; }
 
-static uint64_t fnv(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
+static uint64_t fnv(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {   // keys used inside this process only
     const uint8_t* b = static_cast<const uint8_t*>(p);
+    for (; n >= 8; n -= 8, b += 8) { uint64_t w; std::memcpy(&w, b, 8); h = (h ^ w) * 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
     for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
     return h;
 }
@@ -580,13 +583,17 @@ static GLuint compile(GLenum type, const std::string& src, const char* what) {
     return s;
 }
 
+static std::vector<float> g_fpConsts;   // constants of the fragment program of the current draw (filled by get_program)
+static uint64_t vpGen = 1;              // bumped whenever vertex program words are uploaded
 static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, uint32_t control) {
     // vertex program words up to the end bit
     uint32_t n = 0;
     while (vpStart + n < 512) { ++n; if (vpCode[(vpStart + n - 1) * 4 + 3] & 1) break; }
-    const uint32_t fsz = fp_size(fpEa);
-    uint64_t key = fnv(vpCode + vpStart * 4, n * 16);
-    key = fp_walk(fpEa, key, nullptr);
+    static uint64_t vpKeyGen = 0, vpKey = 0; static uint32_t vpKeyStart = ~0u;
+    if (vpKeyGen != vpGen || vpKeyStart != vpStart) { vpKey = fnv(vpCode + vpStart * 4, n * 16); vpKeyGen = vpGen; vpKeyStart = vpStart; }
+    uint64_t key = vpKey;
+    g_fpConsts.clear();
+    key = fp_walk(fpEa, key, &g_fpConsts);
     key ^= (uint64_t(texDims) << 1) ^ (uint64_t(control & 0x4e) << 40) ^ uint64_t(vpStart) * 0x9E3779B97F4A7C15ull;
     auto it = programs.find(key);
     if (it != programs.end()) return &it->second;
@@ -747,8 +754,10 @@ static void apply_scissor() {
     glScissor(x0 * cur.aaX, y0 * cur.aaY, std::max(0, x1 - x0) * cur.aaX, std::max(0, y1 - y0) * cur.aaY);
 }
 
+static bool stateValid = false;   // false after anything else touched the GL state apply_state() sets
 static void clear_surface(uint32_t mask) {
     if (!bind_target()) return;
+    stateValid = false;
     apply_scissor();
     GLbitfield bits = 0;
     {   // RSXSTEP=frame: the main surface starts that frame in magenta, so every draw's contribution shows
@@ -777,7 +786,7 @@ static void clear_surface(uint32_t mask) {
 }
 
 // ------------------------------------------------------------------ textures
-struct Tex { GLuint id = 0; uint64_t sig = 0; uint64_t lastUse = 0; GLenum target = GL_TEXTURE_2D; uint64_t regSig = 0, checked = ~0ull; };
+struct Tex { GLuint id = 0; uint64_t sig = 0; uint64_t lastUse = 0; GLenum target = GL_TEXTURE_2D; uint64_t regSig = 0, checked = ~0ull, sampler = ~0ull; };
 static std::unordered_map<uint64_t, Tex> texCache;
 
 static uint32_t swizzle_index(uint32_t x, uint32_t y, uint32_t lw, uint32_t lh) {   // Morton order, x in the low bit
@@ -943,6 +952,7 @@ static void bind_texture(int i, float* tsc) {
         if (!tx.id) glGenTextures(1, &tx.id);
         tx.target = target;
         tx.sig = sig;
+        tx.sampler = ~0ull;
         glBindTexture(target, tx.id);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
@@ -976,6 +986,12 @@ static void bind_texture(int i, float* tsc) {
         glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, mips - 1);
     } else glBindTexture(target, tx.id);
     tx.lastUse = frameNo;
+    {   // the sampler state lives in the GL texture object: set it only when the registers changed
+        const uint32_t sreg[6] = {addr, ctl0, filt, remap, R[(base + 0x1c) >> 2], mips};
+        const uint64_t sk = fnv(sreg, sizeof sreg);
+        if (tx.sampler == sk) return;
+        tx.sampler = sk;
+    }
     // remap: per output channel (A, R, G, B) a source channel and a mode (0 zero, 1 one, 2 source)
     {
         const GLint srcCh[4] = {GL_ALPHA, GL_RED, GL_GREEN, GL_BLUE};
@@ -1050,6 +1066,14 @@ static GLenum gl_prim(uint32_t p) {
 }
 
 static void apply_state() {
+    static const uint16_t regs[] = {0x310, 0x314, 0x318, 0x320, 0x31c, 0x324, 0xa74, 0xa6c, 0xa70, 0x328, 0x330, 0x334, 0x338, 0x33c, 0x340, 0x344, 0x32c,
+                                    0x183c, 0x1830, 0x1834, 0xa68, 0xa78, 0xa7c};
+    static uint32_t last[sizeof regs / sizeof regs[0]];
+    uint32_t now[sizeof regs / sizeof regs[0]];
+    for (size_t k = 0; k < sizeof regs / sizeof regs[0]; ++k) now[k] = R[regs[k] >> 2];
+    if (stateValid && !std::memcmp(now, last, sizeof now)) return;
+    std::memcpy(last, now, sizeof now);
+    stateValid = true;
     const auto en = [](GLenum c, bool on) { on ? glEnable(c) : glDisable(c); };
     en(GL_BLEND, R[0x310 >> 2] & 1);
     const uint32_t sf = R[0x314 >> 2], df = R[0x318 >> 2], eq = R[0x320 >> 2], bc = R[0x31c >> 2];
@@ -1156,10 +1180,7 @@ static void do_draw() {
     const float alpha[4] = {float(R[0x304 >> 2] & 1), float(af >= 0x200 ? af - 0x200 : 7), (R[0x30c >> 2] & 0xff) / 255.f, 0};
     glUniform4fv(p->uAlpha, 1, alpha);
     if (p->nConst && p->uFc >= 0) {   // fragment program constants (patched into the microcode by the game)
-        static std::vector<float> fcv;
-        fcv.clear();
-        fp_walk(fpEa, 0, &fcv);
-        glUniform4fv(p->uFc, GLsizei(fcv.size() / 4), fcv.data());
+        glUniform4fv(p->uFc, GLsizei(g_fpConsts.size() / 4), g_fpConsts.data());
     }
     const float wp[4] = {1.f / cur.aaX, 1.f / cur.aaY, 0, 0};
     glUniform4fv(p->uWpos, 1, wp);
@@ -1178,8 +1199,8 @@ static void do_draw() {
     const uint32_t restartIdx = R[0x1db0 >> 2];
     auto push = [&](uint32_t v) { idx.push_back(v); if (v != 0xffffffffu) { vmin = std::min(vmin, v); vmax = std::max(vmax, v); } };
     for (const Range& r : ranges) {
-        std::vector<uint32_t> seq;
-        seq.reserve(r.count);
+        static std::vector<uint32_t> seq;
+        seq.clear();
         for (uint32_t k = 0; k < r.count; ++k) {
             uint32_t v = rangesIndexed ? (i16 ? be16(ibase + 2 * (r.first + k)) : be32(ibase + 4 * (r.first + k))) : r.first + k;
             if (rangesIndexed) v += R[0x173c >> 2];
@@ -1424,6 +1445,7 @@ void flip(uint32_t id) {
     if (!initTried) init_gl();
     if (!glOk) return;
     ++frameNo;
+    stateValid = false;
     const Display& d = displays[id & 7];
     int ww = 1280, wh = 720;
     SDL_GetWindowSizeInPixels(win, &ww, &wh);
@@ -1486,7 +1508,7 @@ void method(uint32_t m, uint32_t arg) {
     if (!glOk) { R[m >> 2] = arg; return; }
     if (rsxTrace) RLOG("[rsxm] %04x = %08x\n", m, arg);
     if (m >= 0x0b80 && m < 0x0c00) {   // transform program words
-        if (vpLoad < 512 * 4) vpCode[vpLoad++] = arg;
+        if (vpLoad < 512 * 4) { vpCode[vpLoad++] = arg; ++vpGen; }
         return;
     }
     if (m >= 0x1f00 && m < 0x1f80) {   // transform constants

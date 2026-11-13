@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+namespace gti::recomp { void ripprof_register_thread(); }   // ripprof.cpp
 namespace gti::recomp {
 
 extern uint64_t g_missLr;
@@ -243,10 +244,16 @@ bool g_vblankSynced = false;
 // that frame's command buffer. A few commands of the frame still follow the flip (counters, the jump into the other
 // buffer): the handler runs only after the FIFO has executed them (at its next jump or when it runs dry), or a late
 // FIFO thread would read commands of the next frame. The console's RSX is never late; a host thread can be.
+uint64_t g_profSem = 0, g_profFlip = 0, g_profClear = 0;   // FIFOPROF: label waits, flips, clears (us)
+// FRAMELOG=n: timeline (ms) of 40 frames starting at flip n: V vblank (label 0x81 before>after), P put moved,
+// S label wait starts, E label wait ends, F flip, D flip handler delivered
+long g_flStart = std::getenv("FRAMELOG") ? std::atol(std::getenv("FRAMELOG")) : -1;
+void fl(const char* tag, uint32_t v = 0);
+std::atomic<uint32_t> g_vblankTick{0};   // bumped (and waiters woken) after every vblank handler call
 bool g_flipDue = false;
 uint64_t g_flipDueSince = 0;
 void call_guest(uint32_t opd, uint64_t arg);
-void deliver_flip() { if (g_flipDue) { g_flipDue = false; call_guest(flipHandler, 1); } }
+void deliver_flip() { if (g_flipDue) { g_flipDue = false; call_guest(flipHandler, 1); fl("D"); } }
 std::atomic<uint64_t> g_lbl400{0};   // RSX writes of label 0x400 (Edge output ring position)
 std::mutex callMx;   // guest handler calls from the RSX threads
 
@@ -254,6 +261,17 @@ uint32_t io2ea(uint32_t off) { return ioAddr + off; }
 uint32_t rd(uint32_t a) { return __builtin_bswap32(__atomic_load_n(reinterpret_cast<uint32_t*>(G->mem + a), __ATOMIC_SEQ_CST)); }
 void wr(uint32_t a, uint32_t v) { __atomic_store_n(reinterpret_cast<uint32_t*>(G->mem + a), __builtin_bswap32(v), __ATOMIC_SEQ_CST); }
 
+void fl(const char* tag, uint32_t v) {
+    const long f = long(flips.load());
+    if (g_flStart < 0 || f < g_flStart || f > g_flStart + 40) return;
+    static std::mutex m; static std::string buf; static uint64_t t0 = 0;
+    std::lock_guard<std::mutex> lk(m);
+    const uint64_t t = now_us();
+    if (!t0) t0 = t;
+    char b[48]; std::snprintf(b, sizeof b, " %s%.1f", tag, (t - t0) / 1000.0); buf += b;
+    if (v) { std::snprintf(b, sizeof b, "(%x)", v); buf += b; }
+    if (tag[0] == 'F' || buf.size() > 600) { LOG("[fl]%s\n", buf.c_str()); buf.clear(); }
+}
 void call_guest(uint32_t opd, uint64_t arg) {   // runs a guest callback (flip / vblank / user handler) on this host thread
     if (!opd) return;
     std::lock_guard<std::mutex> lk(callMx);
@@ -282,8 +300,18 @@ void method(uint32_t m, uint32_t arg, uint32_t& semOff406e, uint32_t& semOff4097
         case 0x0050: wr(ctrl + 8, arg); break;                       // NV406E_SET_REFERENCE
         case 0x0064: semOff406e = arg; break;                        // NV406E_SEMAPHORE_OFFSET
         case 0x0068: {                                               // NV406E_SEMAPHORE_ACQUIRE: wait for the label
-            for (int k = 0; k < 200000 && rd(labels + semOff406e) != arg; ++k) std::this_thread::sleep_for(std::chrono::microseconds(10));
-            if (semOff406e == 0x810) g_vblankSynced = true;
+            const uint64_t ts = now_us();
+            if (semOff406e == 0x810) fl("S");
+            if (semOff406e == 0x810) {   // waits for the vblank handler: woken by the vblank thread, not by polling
+                for (;;) {
+                    const uint32_t tick = g_vblankTick.load();
+                    if (rd(labels + semOff406e) == arg || now_us() - ts > 2000000) break;
+                    g_vblankTick.wait(tick);
+                }
+            } else
+                for (const uint64_t until = ts + 2000000; rd(labels + semOff406e) != arg && now_us() < until;) std::this_thread::yield();
+            g_profSem += now_us() - ts;
+            if (semOff406e == 0x810) { g_vblankSynced = true; fl("E"); }
             break;
         }
         case 0x006c: wr(labels + semOff406e, arg); break;            // NV406E_SEMAPHORE_RELEASE
@@ -294,7 +322,8 @@ void method(uint32_t m, uint32_t arg, uint32_t& semOff406e, uint32_t& semOff4097
             if (g_flipNow || (g_vblankSynced && !g_flipLate)) {
                 g_vblankSynced = false;
                 while (flipPending.load()) std::this_thread::sleep_for(std::chrono::microseconds(50));   // an earlier unsynced flip
-                rsx::flip(arg); ++flips; g_flipDue = true; g_flipDueSince = now_us();
+                { const uint64_t tf = now_us(); rsx::flip(arg); g_profFlip += now_us() - tf; }
+                ++flips; g_flipDue = true; g_flipDueSince = now_us(); fl("F");
                 {   // RINGLOG=1: bytes of Edge output each SPU ring took per frame (largest of the last 2 s)
                     static const bool ringLog = std::getenv("RINGLOG") != nullptr;
                     if (ringLog) {
@@ -346,8 +375,10 @@ bool plausible_stream(uint32_t o, uint32_t put, int steps) {
 
 // FIFOPROF=1: where the FIFO thread spends its time (ms per second): idle, waiting at holes, executing methods
 uint64_t g_profIdle = 0, g_profHole = 0, g_profExec = 0, g_profLast = 0;
+extern uint64_t g_profSem, g_profFlip, g_profClear;
 void fifo_thread() {
     t_tid = 0x01000200;
+    ripprof_register_thread();
     static const bool prof = std::getenv("FIFOPROF") != nullptr;
     uint32_t semA = 0, semB = 0;
     std::vector<uint32_t> callStack;
@@ -356,11 +387,13 @@ void fifo_thread() {
         const uint32_t put = rd(ctrl), get = rd(ctrl + 4);
         static uint32_t lastPut = 0xFFFFFFFFu;
         static int putLogs = 0;
+        { static uint32_t flPut = 0; if (put != flPut && g_flStart >= 0) { flPut = put; fl("P", put); } }
         if (put != lastPut && putLogs < 600) { ++putLogs; LOG("[rsx] put %x (get %x, cmd@get %08x %08x, @put-8 %08x %08x, @put %08x)\n", put, get, rd(io2ea(get)), rd(io2ea(get) + 4), rd(io2ea(put) - 8), rd(io2ea(put) - 4), rd(io2ea(put))); lastPut = put; }
         if (g_flipDue && (get == put || now_us() - g_flipDueSince > 20000)) deliver_flip();
         if (prof && now_us() - g_profLast > 4000000) {
             const double k = 1.0 / (4.0 * 1000.0);
-            if (g_profLast) LOG("[fifoprof] per second: idle %.0f ms, hole wait %.0f ms, executing %.0f ms\n", g_profIdle * k, g_profHole * k, g_profExec * k);
+            if (g_profLast) LOG("[fifoprof] per second: idle %.0f ms, hole wait %.0f ms, label wait %.0f ms, flip %.0f ms, other commands %.0f ms\n", g_profIdle * k, g_profHole * k, g_profSem * k, g_profFlip * k, (g_profExec - g_profSem - g_profFlip) * k);
+            g_profSem = g_profFlip = 0;
             g_profIdle = g_profHole = g_profExec = 0; g_profLast = now_us();
         }
         if (get == put) { const uint64_t t0 = prof ? now_us() : 0; if (++idle > 100) std::this_thread::sleep_for(std::chrono::microseconds(50)); if (prof) g_profIdle += now_us() - t0; continue; }
@@ -455,7 +488,8 @@ void vblank_thread() {
         next += std::chrono::microseconds(16667);
         std::this_thread::sleep_until(next);
         if (flipPending.load()) { ++flips; call_guest(flipHandler, 1); flipPending = false; }
-        call_guest(vblankHandler, 1);
+        { const uint32_t b = labels ? rd(labels + 0x810) : 0; call_guest(vblankHandler, 1); fl("V", b * 16 + (labels ? rd(labels + 0x810) : 0)); }
+        ++g_vblankTick; g_vblankTick.notify_all();
         static int tick = 0;
         if (tick == 600 && ctx) {   // ~10 s: dump the command stream before the current GET (debug)
             const uint32_t gg = rd(ctrl + 4);
@@ -744,7 +778,7 @@ uint32_t op(PPU& c, bool isSave) {
 namespace jobs {
 constexpr uint32_t LS_STUB = 0x100, LS_CTX = 0x2c00, LS_JOB = 0x2d00, LS_BIN = 0x3000, LS_STACK = 0x3fff0;
 constexpr uint32_t EVENTFLAG_JOB = 0xbad880;   // job binary that sets a SPURS event flag (done on the host)
-const int g_workers = std::getenv("SPUS") ? std::max(1, std::atoi(std::getenv("SPUS"))) : 3;   // host threads running jobs. The game's job chain has max contention 3 and only creates Edge output buffers for SPUs 0-2: a 4th worker finds none and its geometry is dropped
+const int g_workers = std::getenv("SPUS") ? std::max(1, std::atoi(std::getenv("SPUS"))) : 6;   // host threads running jobs. The game only describes Edge output buffers for SPUs 0-2; run_job creates those of workers 3-5 (more than 6 have none and would drop their geometry)
 
 uint32_t list = 0;
 std::thread th;
@@ -802,8 +836,15 @@ void run_job(const JobDesc& J) {
         if (eaBin == 0xbaea80 && !ringsDone) {
             ringsDone = true;
             const uint32_t mb = std::getenv("EDGERING") ? uint32_t(std::atoi(std::getenv("EDGERING"))) : 24;
-            for (uint32_t r = 0; r < 3 && mb; ++r) {
+            // The game fills the buffer descriptions of SPUs 0-2 only (its job chain runs on 3 SPUs). Workers 3-5
+            // get descriptions of their own, copied from SPU 0, with their own ring and RSX label (0x600...), so
+            // six host threads can share the Edge jobs.
+            for (uint32_t r = 0; r < uint32_t(std::min(g_workers, 6)) && mb; ++r) {
                 const uint32_t e = 0x01061980u + 0x80u * r, size = mb << 20;
+                if (r >= 3) {
+                    std::memcpy(G->mem + e, G->mem + 0x01061980u, 0x80);
+                    gcm::wr(e + 20, (gcm::rd(e + 20) & 0xfffff000u) | (0x600u + 0x10u * (r - 3)));
+                }
                 const uint32_t oldStart = gcm::rd(e), label = gcm::rd(e + 20) & 0xff0;
                 // Edge keeps 29 bits of the RSX offset of its index buffers: the rings must lie below ioAddr + 512 MB.
                 // 0x44000000 up is unused (user memory ends at 0x3D500000, the host heap starts at 0x60000000).
@@ -1103,7 +1144,7 @@ void ring_watchdog() {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         if (!gcm::ctrl || !gcm::labels || gcm::rd(gcm::ctrl) != gcm::rd(gcm::ctrl + 4)) continue;
         const uint64_t now = now_us();
-        for (int w = 0; w < 3; ++w) {
+        for (int w = 0; w < std::min(g_workers, 6); ++w) {
             if (!g_workerJob[w].load() || now - g_workerSince[w].load() < 150000) continue;
             const uint32_t e = 0x01061980u + 0x80u * uint32_t(w);   // that SPU's output buffer info
             const uint32_t cur = gcm::rd(e + 12), label = gcm::rd(e + 20) & 0xff0;
@@ -1213,10 +1254,38 @@ const bool g_jobsOn = !std::getenv("NOJOBS");   // run the job chain on the SPU 
 struct WaitInfo { std::string what; uint32_t lr = 0; std::chrono::steady_clock::time_point since; };
 std::mutex g_waitMx;
 std::map<uint32_t, WaitInfo> g_waits;
+// WAITPROF=1: time every guest thread spends blocked, by wait site, in ms per second (printed every 4 s)
+std::map<std::pair<uint32_t, std::string>, uint64_t> g_waitAcc;
+void waitprof_thread() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(4));
+        std::string o;
+        {
+            std::lock_guard<std::mutex> lk(g_waitMx);
+            char b[160];
+            for (auto& [k, us] : g_waitAcc) if (us > 40000) { std::snprintf(b, sizeof b, " | %x %s %.0f", k.first & 0xfff, k.second.c_str(), us / 4000.0); o += b; }
+            g_waitAcc.clear();
+        }
+        LOG("[waitprof] blocked ms/s%s\n", o.c_str());
+    }
+}
 struct WaitScope {
     uint32_t tid;
-    WaitScope(const std::string& w, uint32_t lr) : tid(t_tid) { std::lock_guard<std::mutex> lk(g_waitMx); g_waits[tid] = {w, lr, std::chrono::steady_clock::now()}; }
-    ~WaitScope() { std::lock_guard<std::mutex> lk(g_waitMx); g_waits.erase(tid); }
+    WaitScope(const std::string& w, uint32_t lr) : tid(t_tid) {
+        static const bool prof = std::getenv("WAITPROF") != nullptr;
+        static std::once_flag once;
+        if (prof) std::call_once(once, [] { std::thread(waitprof_thread).detach(); });
+        std::lock_guard<std::mutex> lk(g_waitMx); g_waits[tid] = {w, lr, std::chrono::steady_clock::now()};
+    }
+    ~WaitScope() {
+        std::lock_guard<std::mutex> lk(g_waitMx);
+        auto it = g_waits.find(tid);
+        if (it != g_waits.end()) {
+            char b[48]; std::snprintf(b, sizeof b, "%.14s@%x", it->second.what.c_str(), it->second.lr);
+            g_waitAcc[{tid, b}] += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - it->second.since).count());
+            g_waits.erase(it);
+        }
+    }
 };
 
 bool imports(PPU& c, const char* module, const char* name) {
@@ -1866,7 +1935,13 @@ void syscall(PPU& c) {
             if (a32(c, 1)) c.wr64(a32(c, 1), t->exitValue);
             ret(c, CELL_OK); return;
         }
-        case 141: std::this_thread::sleep_for(std::chrono::microseconds(c.r[3])); ret(c, CELL_OK); return;   // sys_timer_usleep
+        case 141: {   // sys_timer_usleep. Windows cannot sleep less than about a millisecond: short waits (the render thread
+            // polls a label every 30 us right after each flip) are done by yielding until the time has passed.
+            const uint64_t us = c.r[3];
+            if (us >= 1500) std::this_thread::sleep_for(std::chrono::microseconds(us));
+            else { const uint64_t until = now_us() + us; while (now_us() < until) std::this_thread::yield(); }
+            ret(c, CELL_OK); return;
+        }
         case 142: std::this_thread::sleep_for(std::chrono::seconds(c.r[3])); ret(c, CELL_OK); return;        // sys_timer_sleep
         case 145: { const uint64_t u = now_us() + 1700000000ull * 1000000ull;                               // sys_time_get_current_time(u64* sec, u64* nsec)
             if (a32(c, 0)) c.wr64(a32(c, 0), u / 1000000); if (a32(c, 1)) c.wr64(a32(c, 1), (u % 1000000) * 1000); ret(c, CELL_OK); return; }
