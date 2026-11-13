@@ -90,6 +90,7 @@ std::mutex g_thMx;
 std::map<uint32_t, std::shared_ptr<GThread>> g_threads;
 uint32_t g_nextTid = 0x01000100;
 thread_local uint32_t t_tid = 0;
+std::atomic<uint32_t> g_rumble{0};   // last cellPadSetActDirect: small motor << 8 | large motor
 const bool g_loadLog = std::getenv("LOADLOG") != nullptr;   // LOADLOG=1: slow file reads and inflates, with the thread that did them
 std::atomic<bool> g_exit{false};
 std::atomic<int> g_exitCode{0};
@@ -223,6 +224,7 @@ PadState pad_state() {
                 else if (b == "cross") s.digital2 |= 0x40; else if (b == "circle") s.digital2 |= 0x20;
                 else if (b == "square") s.digital2 |= 0x80; else if (b == "triangle") s.digital2 |= 0x10;
                 else if (b == "r2") s.digital2 |= 0x02; else if (b == "l2") s.digital2 |= 0x01;
+                else if (b == "l3") s.digital1 |= 0x02; else if (b == "r3") s.digital1 |= 0x04;
             }
         }
         p0 = p1 + 1;
@@ -1690,13 +1692,18 @@ bool imports(PPU& c, const char* module, const char* name) {
     if (n == "cellSaveDataAutoSave2") { ret(c, savedata::op(c, true)); return true; }
     if (n == "cellSaveDataListLoad2") { ret(c, savedata::ERR_NODATA); return true; }
     // --- pad (sys_io): one DualShock 3 connected on port 0; buttons from the host pad state (pad_state())
-    if (n == "cellPadInit" || n == "cellPadEnd" || n == "cellPadSetPortSetting" || n == "cellPadSetActDirect") { ret(c, CELL_OK); return true; }
+    if (n == "cellPadInit" || n == "cellPadEnd" || n == "cellPadSetPortSetting") { ret(c, CELL_OK); return true; }
+    if (n == "cellPadSetActDirect") {   // (port, CellPadActParam* {u8 motor[6]}): motor 0 = small (on/off), motor 1 = large (0..255)
+        if (a32(c, 0) == 0 && a32(c, 1)) g_rumble.store(uint32_t(c.rd8(a32(c, 1)) ? 1 : 0) << 8 | c.rd8(a32(c, 1) + 1));
+        { static int shown = 0; if (g_rumble.load() && shown < 4) { ++shown; LOG("[pad] vibration %03x%c", g_rumble.load(), 10); } }
+        ret(c, CELL_OK); return true;
+    }
     if (n == "cellPadGetInfo2") {   // {max_connect, now_connect, system_info, port_status[7], port_setting[7], device_capability[7], device_type[7]}
         const uint32_t p = a32(c, 0);
         std::memset(c.mem + p, 0, 4 * (3 + 28));
         c.wr32(p, 7); c.wr32(p + 4, 1);
         c.wr32(p + 12, 1);             // port 0 connected
-        c.wr32(p + 12 + 28 * 2, 3);    // capability: PS3 conformity | press mode
+        c.wr32(p + 12 + 28 * 2, 0x13); // capability: PS3 conformity | press mode | actuator (vibration)
         ret(c, CELL_OK); return true;
     }
     if (n == "cellPadGetInfo") {   // {max_connect, now_connect, system_info, u16 vendor[127], u16 product[127], u8 status[127]}
@@ -2333,6 +2340,7 @@ void syscall(PPU& c) {
 } // namespace
 
 void lv2_set_pad(const PadState& s) { std::lock_guard<std::mutex> lk(g_padMx); g_pad = s; g_padLive = true; }
+uint32_t lv2_rumble() { return g_rumble.load(); }
 
 void lv2_install(Guest& g, const Lv2Config& cfg) {
     G = &g;

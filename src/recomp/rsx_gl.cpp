@@ -1594,6 +1594,16 @@ static void pump_events() {
             else if (menuOpen && (sc == SDL_SCANCODE_RIGHT || sc == SDL_SCANCODE_RETURN || sc == SDL_SCANCODE_SPACE)) menu_change(1);
         }
     }
+    {   // vibration the game asks for (cellPadSetActDirect), renewed while it lasts
+        static uint32_t last = 0; static uint64_t renewed = 0;
+        const uint32_t rb = menuOpen ? 0 : lv2_rumble();
+        const uint64_t now = SDL_GetTicks();
+        if (pad && (rb != last || (rb && now - renewed > 150))) {
+            const uint16_t low = uint16_t((rb & 0xff) * 257), high = (rb >> 8) ? 0xffff : 0;
+            SDL_RumbleGamepad(pad, low, high, rb ? 300 : 0);
+            last = rb; renewed = now;
+        }
+    }
     if (menuOpen) { lv2_set_pad(PadState{}); return; }   // the game sees no input while the menu is open
     // input -> DualShock 3 state
     PadState s;
@@ -1616,6 +1626,8 @@ static void pump_events() {
     if (k[SDL_SCANCODE_ESCAPE] || btn(SDL_GAMEPAD_BUTTON_EAST)) s.digital2 |= 0x20;
     if (k[SDL_SCANCODE_X] || k[SDL_SCANCODE_SPACE] || btn(SDL_GAMEPAD_BUTTON_SOUTH)) s.digital2 |= 0x40;
     if (k[SDL_SCANCODE_C] || btn(SDL_GAMEPAD_BUTTON_WEST)) s.digital2 |= 0x80;
+    if (k[SDL_SCANCODE_L] || btn(SDL_GAMEPAD_BUTTON_LEFT_STICK)) s.digital1 |= 0x02;    // L3: headlights
+    if (k[SDL_SCANCODE_H] || btn(SDL_GAMEPAD_BUTTON_RIGHT_STICK)) s.digital1 |= 0x04;   // R3: horn
     float lx = axis(SDL_GAMEPAD_AXIS_LEFTX), ly = axis(SDL_GAMEPAD_AXIS_LEFTY);
     if (k[SDL_SCANCODE_A]) lx = -1; if (k[SDL_SCANCODE_D]) lx = 1;
     auto a8 = [](float v) { return uint16_t(std::clamp(int(128 + v * 127.5f), 0, 255)); };

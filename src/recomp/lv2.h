@@ -20,7 +20,8 @@ struct PadState {
     uint16_t analog[4] = {0x80, 0x80, 0x80, 0x80};   // right x, right y, left x, left y
     uint16_t pressure[12] = {};
 };
-void lv2_set_pad(const PadState& s);   // live input from the host (overrides the test script)
+void lv2_set_pad(const PadState& s);
+uint32_t lv2_rumble();   // vibration the game asks for: small motor (0/1) << 8 | large motor (0..255)   // live input from the host (overrides the test script)
 
 void lv2_install(Guest& g, const Lv2Config& cfg);   // also installs the import stubs (hle_install)
 void lv2_dump_waits();   // what every guest thread is blocked in (debug)
