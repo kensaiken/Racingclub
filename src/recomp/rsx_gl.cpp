@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -563,8 +564,7 @@ static FpInfo translate_fp(uint32_t ea, uint32_t texDims, uint32_t control) {
             "    if (f == 0) pass = false; else if (f == 1) pass = a < r; else if (f == 2) pass = a == r; else if (f == 3) pass = a <= r;\n"
             "    else if (f == 4) pass = a > r; else if (f == 5) pass = a != r; else if (f == 6) pass = a >= r;\n"
             "    if (!pass) discard;\n  }\n";
-    if (std::getenv("RSXRED")) tail += "  o_c0 = v_col0;\n";
-    fi.glsl = h + b + tail + "}\n";
+    if (std::getenv("RSXRED")) tail += "  o_c0 = v_col0;\n";    fi.glsl = h + b + tail + "}\n";
     return fi;
 }
 
@@ -907,6 +907,12 @@ static void bind_texture(int i, float* tsc) {
     const uint32_t pitch = ctl3 & 0xfffff;
     tsc[0] = un ? 1.f / w : 1.f; tsc[1] = un ? 1.f / h : 1.f; tsc[2] = float((addr >> 28) & 7); tsc[3] = 1.f;   // z: depth compare function (shcmp)
     glActiveTexture(GL_TEXTURE0 + i);
+    if (std::getenv("SHADOWLOG") && texDimsOf(i) == 3) {   // debug: shadow-map lookups
+        static std::set<uint64_t> seen;
+        const bool hasDepth = surfaces.count((uint64_t(loc) << 33) | (uint64_t(1) << 32) | off), hasColor = surfaces.count((uint64_t(loc) << 33) | off);
+        if (seen.insert(uint64_t(off) << 8 | uint64_t(i)).second && seen.size() < 40)
+            RLOG("[shadow] unit %d: depth texture at %s 0x%x %ux%u fmt %02x func %u wrap %x: depth surface %s, color surface %s\n", i, loc ? "main" : "local", off, w, h, f, (addr >> 28) & 7, addr & 0xfff, hasDepth ? "found" : "missing", hasColor ? "found" : "missing");
+    }
     // render target?
     for (int z = 0; z < 2; ++z) {
         auto it = surfaces.find((uint64_t(loc) << 33) | (uint64_t(z) << 32) | off);
@@ -1649,6 +1655,17 @@ void flip(uint32_t id) {
         if (shotEvery > 0 && frameNo % shotEvery == 0) {   // RSXSHOT=N: save every color surface every N frames
             RLOG("[shot] frame %llu at %.2f s\n", (unsigned long long)frameNo, SDL_GetTicks() / 1000.0);
             for (auto& sf : surfaces) {
+                if (sf.second.depth && std::getenv("RSXSHOTZ") && sf.second.w >= 512 && sf.second.w == sf.second.h) {   // RSXSHOTZ=1: square depth surfaces (shadow maps) as raw floats
+                    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+                    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, 0x821A /* DEPTH_STENCIL_ATTACHMENT */, GL_TEXTURE_2D, sf.second.tex, 0);
+                    std::vector<float> z(size_t(sf.second.w) * sf.second.h);
+                    glReadPixels(0, 0, int(sf.second.w), int(sf.second.h), GL_DEPTH_COMPONENT, 0x1406 /* FLOAT */, z.data());
+                    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, 0x821A, GL_TEXTURE_2D, 0, 0);
+                    char fn[96];
+                    std::snprintf(fn, sizeof fn, "rsxshot_%05llu_Z%x_%u.f32", (unsigned long long)frameNo, uint32_t(sf.first), sf.second.w);
+                    if (FILE* zf = std::fopen(fn, "wb")) { std::fwrite(z.data(), 4, z.size(), zf); std::fclose(zf); }
+                    continue;
+                }
                 if (sf.second.depth) continue;
                 if (std::getenv("RSXSHOTD") && sf.first != uint64_t(d.offset)) continue;   // RSXSHOTD=1: the display buffer only
                 glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sf.second.tex, 0);

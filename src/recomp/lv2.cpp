@@ -90,6 +90,7 @@ std::mutex g_thMx;
 std::map<uint32_t, std::shared_ptr<GThread>> g_threads;
 uint32_t g_nextTid = 0x01000100;
 thread_local uint32_t t_tid = 0;
+const bool g_loadLog = std::getenv("LOADLOG") != nullptr;   // LOADLOG=1: slow file reads and inflates, with the thread that did them
 std::atomic<bool> g_exit{false};
 std::atomic<int> g_exitCode{0};
 
@@ -1469,9 +1470,10 @@ std::atomic<bool> g_started{false};
 constexpr uint32_t kUnwritten = 0x7fc0dead;
 std::atomic<uint64_t> g_holes{0}, g_waited{0};
 void port_thread() {
-    if (!audio_out_open()) return;
+    // The game waits for its mixer even with the sound off: the port then runs on its clock and nothing is played.
+    const bool play = settings().sound && !std::getenv("NOSOUND") && audio_out_open();
     host_thread_priority_high();
-    LOG("[snd] audio port playing: %u channels, %u blocks\n", g_ch, g_blocks);
+    LOG("[snd] audio port %s: %u channels, %u blocks\n", play ? "playing" : "running silent (sound off)", g_ch, g_blocks);
     std::vector<float> out(512);
     uint64_t blocksOut = 0; float peak = 0;
     auto next = std::chrono::steady_clock::now();
@@ -1481,7 +1483,7 @@ void port_thread() {
         // clock is nudged to keep about 6 blocks queued, which also follows the sound card's real rate.
         next += std::chrono::nanoseconds(5333333);
         {
-            const int q = audio_out_queued();
+            const int q = play ? audio_out_queued() : 6 * 256;
             if (q > 9 * 256) next += std::chrono::microseconds(300); else if (q < 3 * 256) next -= std::chrono::microseconds(300);
             auto now = std::chrono::steady_clock::now();
             if (next < now - std::chrono::milliseconds(50)) next = now;   // stalled (debugger, suspend): do not catch up in a burst
@@ -1517,7 +1519,7 @@ void port_thread() {
             out[2 * i] = std::clamp(l, -1.f, 1.f); out[2 * i + 1] = std::clamp(r, -1.f, 1.f);
             peak = std::max(peak, std::max(std::fabs(l), std::fabs(r)));
         }
-        audio_out_push(out.data(), 256);
+        if (play) audio_out_push(out.data(), 256);
         { static FILE* wf = std::getenv("SNDWAV") ? std::fopen("snd_out.f32", "wb") : nullptr; if (wf) std::fwrite(out.data(), 4, 512, wf); }   // debug: raw stereo float dump
         std::memset(G->mem + g_port + idx * 256 * g_ch * 4, 0, 256 * g_ch * 4);
         gcm::wr(g_port + idx * 256 * g_ch * 4, kUnwritten);
@@ -1809,7 +1811,7 @@ bool imports(PPU& c, const char* module, const char* name) {
     if (n == "_sys_free") { ret(c, CELL_OK); return true; }
     if (n == "sys_prx_load_module" || n == "sys_prx_start_module" || n == "sys_prx_stop_module" || n == "sys_prx_unload_module") { ret(c, CELL_OK); return true; }
     if (n == "sys_get_random_number") { for (uint32_t k = 0; k < a32(c, 1); ++k) c.wr8(a32(c, 0) + k, uint8_t(std::rand())); ret(c, CELL_OK); return true; }
-    if (n == "cellSpursCreateTask" && a32(c, 2) != 0xbc5180 && settings().sound && !std::getenv("NOSOUND")) {   // (taskset, u32* taskId, elf, contextSave, contextSize, lsPattern, arg): the Zlib task is done on the host
+    if (n == "cellSpursCreateTask" && a32(c, 2) != 0xbc5180) {   // (taskset, u32* taskId, elf, contextSave, contextSize, lsPattern, arg): the Zlib task is done on the host
         const uint32_t arg = a32(c, 6);
         const uint32_t id = snd::create_task(a32(c, 0), a32(c, 2), a32(c, 3), arg ? c.rd64(arg) : 0, arg ? c.rd64(arg + 8) : 0);
         c.wr32(a32(c, 1), id);
@@ -1831,7 +1833,7 @@ bool imports(PPU& c, const char* module, const char* name) {
         ret(c, CELL_OK); return true;
     }
     if (n == "cellAudioPortStart") {
-        if (!snd::g_started.exchange(true) && settings().sound && !std::getenv("NOSOUND")) std::thread(snd::port_thread).detach();
+        if (!snd::g_started.exchange(true)) std::thread(snd::port_thread).detach();
         ret(c, CELL_OK); return true;
     }
     // --- SPURS: the Edge Zlib inflate task is done on the host (same result as the SPU task), event flags polled
@@ -1919,6 +1921,7 @@ bool imports(PPU& c, const char* module, const char* name) {
             const uint32_t counter = ctrw & ~3u, mode = ctrw & 3;
             uLongf outLen = dstMax;
             int zr = Z_STREAM_END;
+            const uint64_t tz = now_us();
             for (int wbits : {-15, 15}) {   // raw deflate, then zlib-wrapped
                 z_stream zs{};
                 zs.next_in = c.mem + src; zs.avail_in = srcSize;
@@ -1930,6 +1933,7 @@ bool imports(PPU& c, const char* module, const char* name) {
                 if (zr == Z_STREAM_END) break;
             }
             if (zr != Z_STREAM_END && srcSize == dstMax) { std::memcpy(c.mem + dst, c.mem + src, srcSize); zr = Z_STREAM_END; outLen = srcSize; }   // stored
+            if (g_loadLog && now_us() - tz > 3000) LOG("[load] thread %x: inflate %u -> %lu bytes took %.1f ms (flip %llu)%c", t_tid, srcSize, (unsigned long)outLen, (now_us() - tz) / 1000.0, (unsigned long long)gcm::flips.load(), 10);
             static int logged = 0;
             if (std::getenv("ZLIBDUMP")) {
                 std::string s; char b[16];
@@ -1981,7 +1985,9 @@ bool imports(PPU& c, const char* module, const char* name) {
         FILE* f = nullptr;
         { std::lock_guard<std::mutex> lk(g_fsMx); auto it = g_files.find(a32(c, 0)); if (it != g_files.end()) f = it->second.f; }
         if (!f) { ret(c, 0x80010009); return true; }
+        const uint64_t tio = now_us();
         const size_t k = n == "cellFsRead" ? std::fread(c.mem + a32(c, 1), 1, size_t(c.r[5]), f) : std::fwrite(c.mem + a32(c, 1), 1, size_t(c.r[5]), f);
+        if (g_loadLog && now_us() - tio > 3000) LOG("[load] thread %x: %s of %llu bytes took %.1f ms (flip %llu)%c", t_tid, n.c_str(), (unsigned long long)c.r[5], (now_us() - tio) / 1000.0, (unsigned long long)gcm::flips.load(), 10);
         if (a32(c, 3)) c.wr64(a32(c, 3), k);
         ret(c, CELL_OK); return true;
     }
@@ -2288,11 +2294,15 @@ void syscall(PPU& c) {
         case 141: {   // sys_timer_usleep. Windows cannot sleep less than about a millisecond: short waits (the render thread
             // polls a label every 30 us right after each flip) are done by yielding until the time has passed.
             const uint64_t us = c.r[3];
+            if (g_loadLog && us >= 50000) LOG("[load] thread %x: usleep %llu us (lr %llx, flip %llu)%c", t_tid, (unsigned long long)us, (unsigned long long)c.lr, (unsigned long long)gcm::flips.load(), 10);
             if (us >= 1500) std::this_thread::sleep_for(std::chrono::microseconds(us));
             else { const uint64_t until = now_us() + us; while (now_us() < until) std::this_thread::yield(); }
             ret(c, CELL_OK); return;
         }
-        case 142: std::this_thread::sleep_for(std::chrono::seconds(c.r[3])); ret(c, CELL_OK); return;        // sys_timer_sleep
+        case 142:   // sys_timer_sleep. 0x1e300: after sceNpManagerGetStatus answers "offline" (there is no PSN here) the game
+                    // waits a whole second for a sign-in that cannot come, right after START at the title: skipped.
+            if (uint32_t(c.lr) == 0x1e300 && c.r[3] == 1) { ret(c, CELL_OK); return; }
+            if (g_loadLog) LOG("[load] thread %x: sleep %llu s (lr %llx)%c", t_tid, (unsigned long long)c.r[3], (unsigned long long)c.lr, 10); std::this_thread::sleep_for(std::chrono::seconds(c.r[3])); ret(c, CELL_OK); return;        // sys_timer_sleep
         case 145: { const uint64_t u = now_us() + 1700000000ull * 1000000ull;                               // sys_time_get_current_time(u64* sec, u64* nsec)
             if (a32(c, 0)) c.wr64(a32(c, 0), u / 1000000); if (a32(c, 1)) c.wr64(a32(c, 1), (u % 1000000) * 1000); ret(c, CELL_OK); return; }
         case 147: ret(c, 79800000); return;                                                                    // sys_time_get_timebase_frequency

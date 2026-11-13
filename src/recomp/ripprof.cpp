@@ -21,6 +21,7 @@ static void sampler(double startSec) {
     std::this_thread::sleep_for(std::chrono::microseconds(int64_t(startSec * 1e6)));
     const uint64_t base = uint64_t(reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)));
     std::vector<uint64_t> rips;
+    std::vector<float> times;   // RIPTIME=1: seconds since launch of every sample, in ripprof_t.txt
     rips.reserve(70000);
     const double len = std::getenv("RIPLEN") ? std::atof(std::getenv("RIPLEN")) : 15.0;
     const auto end = std::chrono::steady_clock::now() + std::chrono::microseconds(int64_t(len * 1e6));
@@ -28,7 +29,7 @@ static void sampler(double startSec) {
         CONTEXT ctx{};
         ctx.ContextFlags = CONTEXT_CONTROL;
         if (SuspendThread(g_target) != DWORD(-1)) {
-            if (GetThreadContext(g_target, &ctx)) rips.push_back(ctx.Rip);
+            if (GetThreadContext(g_target, &ctx)) { rips.push_back(ctx.Rip); times.push_back(float(g_sinceLaunch())); }
             ResumeThread(g_target);
         }
         const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(250);
@@ -46,6 +47,7 @@ static void sampler(double startSec) {
         std::fprintf(f, "@%s+%llx\n", slash ? slash + 1 : name, static_cast<unsigned long long>(r - uint64_t(reinterpret_cast<uintptr_t>(h))));
     }
     std::fclose(f);
+    if (std::getenv("RIPTIME")) if (FILE* t = std::fopen("ripprof_t.txt", "w")) { for (float x : times) std::fprintf(t, "%.4f\n", x); std::fclose(t); }
 }
 void ripprof_register_thread(const char* name) {
     const char* e = std::getenv("RIPPROF");
