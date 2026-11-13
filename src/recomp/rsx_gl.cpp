@@ -67,6 +67,7 @@ enum : GLenum {
     X(void, glActiveTexture, GLenum) X(void, glPixelStorei, GLenum, GLint) X(void, glGenFramebuffers, GLsizei, GLuint*) \
     X(void, glBindFramebuffer, GLenum, GLuint) X(void, glFramebufferTexture2D, GLenum, GLenum, GLenum, GLuint, GLint) \
     X(void, glDrawBuffers, GLsizei, const GLenum*) X(GLenum, glCheckFramebufferStatus, GLenum) \
+    X(void, glCopyTexSubImage2D, GLenum, GLint, GLint, GLint, GLint, GLint, GLsizei, GLsizei) \
     X(void, glBlitFramebuffer, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum) \
     X(void, glDeleteFramebuffers, GLsizei, const GLuint*) X(void, glGenBuffers, GLsizei, GLuint*) X(void, glBindBuffer, GLenum, GLuint) \
     X(void, glBufferData, GLenum, GLsizeiptr, const void*, GLenum) X(void, glBindBufferBase, GLenum, GLuint, GLuint) \
@@ -381,7 +382,10 @@ static FpInfo translate_fp(uint32_t ea, uint32_t texDims, uint32_t control) {
                 if (!std::strcmp(kind, "txl")) r = "textureLod(" + smp + ", (" + coord + ").xyz, (" + coord + ").w)";
                 else r = "texture(" + smp + ", (" + coord + ").xyz)";
             } else if (dim == 2) r = "texture(" + smp + ", (" + coord + ").xyz)";
-            else {
+            else if (dim == 3) {   // depth texture with a compare function: 1 where the test passes (2x2 taps)
+                const bool proj = !std::strcmp(kind, "txp");
+                r = "vec4(shcmp(" + smp + ", " + (proj ? "(" + coord + ").xyz / (" + coord + ").w" : "(" + coord + ").xyz") + ", " + sc + ".z))";
+            } else {
                 std::string uv = "(" + coord + ").xy";
                 if (!std::strcmp(kind, "txp")) uv = "((" + coord + ").xy / (" + coord + ").w)";
                 uv = "(" + uv + " * " + sc + ".xy)";
@@ -527,6 +531,11 @@ static FpInfo translate_fp(uint32_t ea, uint32_t texDims, uint32_t control) {
     }
     h += "bool fcond1(float c, int lt, int eq, int gt) { return (lt != 0 && c < 0.0) || (eq != 0 && c == 0.0) || (gt != 0 && c > 0.0); }\n"
          "bool fcond(vec4 c, int lt, int eq, int gt) { return fcond1(c.x, lt, eq, gt) || fcond1(c.y, lt, eq, gt) || fcond1(c.z, lt, eq, gt) || fcond1(c.w, lt, eq, gt); }\n"
+         "float shcmp(sampler2D t, vec3 p, float f) {\n"
+         "  vec4 d = textureGather(t, p.xy, 0); vec4 r = vec4(p.z); vec4 c;\n"
+         "  if (f < 1.5) c = vec4(lessThan(d, r)); else if (f < 2.5) c = vec4(equal(d, r)); else if (f < 3.5) c = vec4(lessThanEqual(d, r));\n"
+         "  else if (f < 4.5) c = vec4(greaterThan(d, r)); else if (f < 5.5) c = vec4(notEqual(d, r)); else c = vec4(greaterThanEqual(d, r));\n"
+         "  return dot(c, vec4(0.25));\n}\n"
          "vec4 flit(vec4 s) { float d = max(s.x, 0.0); float sp = s.x > 0.0 ? exp2(s.w * log2(max(s.y, 1e-30))) : 0.0; return vec4(1.0, d, sp, 1.0); }\n"
          "vec4 frefl(vec4 n, vec4 e) { return vec4(2.0 * dot(n.xyz, e.xyz) / dot(n.xyz, n.xyz) * n.xyz - e.xyz, 0.0); }\n"
          "vec4 col0() { return gl_FrontFacing ? v_col0 : v_col0; }\n"
@@ -815,6 +824,8 @@ static uint32_t texDimsOf(int i) {
     const uint32_t dim = (fmtReg >> 4) & 0xf;
     if (fmtReg & 4) return 1;
     if (dim == 3) return 2;
+    const uint32_t f = (fmtReg >> 8) & 0x9f;   // DEPTH24_D8 / DEPTH24_D8_FLOAT / DEPTH16 / DEPTH16_FLOAT
+    if (f >= 0x90 && f <= 0x93 && ((R[(base + 8) >> 2] >> 28) & 7) != 7 && ((R[(base + 8) >> 2] >> 28) & 7) != 0) return 3;   // shadow map: depth compare
     return 0;
 }
 
@@ -838,7 +849,7 @@ static void bind_texture(int i, float* tsc) {
     const uint32_t mips = std::max<uint32_t>(1, fmtReg >> 16);
     const uint32_t w = std::max<uint32_t>(1, rect >> 16), h = std::max<uint32_t>(1, rect & 0xffff);
     const uint32_t pitch = ctl3 & 0xfffff;
-    tsc[0] = un ? 1.f / w : 1.f; tsc[1] = un ? 1.f / h : 1.f; tsc[2] = 1.f; tsc[3] = 1.f;
+    tsc[0] = un ? 1.f / w : 1.f; tsc[1] = un ? 1.f / h : 1.f; tsc[2] = float((addr >> 28) & 7); tsc[3] = 1.f;   // z: depth compare function (shcmp)
     glActiveTexture(GL_TEXTURE0 + i);
     // render target?
     for (int z = 0; z < 2; ++z) {
@@ -853,6 +864,44 @@ static void bind_texture(int i, float* tsc) {
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap_of(addr & 0xf));
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap_of((addr >> 8) & 0xf));
             apply_border_color(GL_TEXTURE_2D, base);
+            return;
+        }
+    }
+    if (cube) {   // cube map whose faces are render targets (the environment the cars and windows reflect)
+        const uint32_t faceStride = (w * h * 4 + 127) & ~127u;
+        const uint64_t key0 = (uint64_t(loc) << 33) | off;
+        if (surfaces.find(key0) != surfaces.end()) {
+            struct RenderedCube { GLuint id = 0; uint64_t built = ~0ull; uint32_t w = 0, h = 0; };
+            static std::map<uint64_t, RenderedCube> rcubes;
+            static GLuint copyFbo = 0;
+            RenderedCube& rc = rcubes[key0];
+            if (!rc.id || rc.w != w || rc.h != h) {
+                if (rc.id) glDeleteTextures(1, &rc.id);
+                glGenTextures(1, &rc.id);
+                glBindTexture(GL_TEXTURE_CUBE_MAP, rc.id);
+                for (int k = 0; k < 6; ++k) glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + k, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                rc.w = w; rc.h = h; rc.built = ~0ull;
+            }
+            glBindTexture(GL_TEXTURE_CUBE_MAP, rc.id);
+            if (rc.built != frameNo) {   // once per frame: the faces are drawn before the scene that uses them
+                rc.built = frameNo;
+                if (!copyFbo) glGenFramebuffers(1, &copyFbo);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, copyFbo);
+                for (uint32_t k = 0; k < 6; ++k) {
+                    auto it = surfaces.find(key0 + uint64_t(k) * faceStride);
+                    if (it == surfaces.end()) continue;
+                    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, it->second.tex, 0);
+                    glCopyTexSubImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + k, 0, 0, 0, 0, 0, GLsizei(std::min(w, it->second.w)), GLsizei(std::min(h, it->second.h)));
+                }
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, cur.fbo);
+            }
+            const GLint sw[4] = {GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA};
+            glTexParameteriv(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_SWIZZLE_RGBA, sw);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
             return;
         }
     }

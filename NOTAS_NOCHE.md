@@ -417,3 +417,6 @@ Informe: polígonos mezclados a pantalla completa durante unos segundos, 30 fps 
 - Muestreo (`SAMPLE=1 --chain`): en los tramos lentos el hilo de render del juego espera el flip el 62 % del tiempo; el límite es el hilo de la RSX cuando el cuadro pasa de ~1100 dibujos.
 - **Estado:** título y carrera a 60 fps; la selección de coche y la parrilla, entre 31 y 48.
 - **Pendiente:** bajar más el coste por dibujo (texturas 2,1 µs, programa 1,2, estado 1,1, índices 1,3); reflejos (los cubemaps renderizados se leen de memoria y no de la superficie: por eso falta brillo en coches y escenarios); sonido sin comprobar.
+- **Reflejos:** un cubemap cuyas caras son superficies de render (6 de 256×256 a partir de la primera, separadas `w·h·4`) se monta una vez por cuadro copiando las superficies (`glCopyTexSubImage2D`) en vez de leerse de memoria.
+- **Sombras:** las texturas de profundidad con función de comparación (`addr` bits 28-30) se muestrean con `shcmp` (2×2 tomas, `textureGather`) y devuelven el resultado de la comparación, no la profundidad. `texDimsOf` devuelve 3 para ellas; la función va en `u_tsc[n].z`.
+- Pendiente: la pintura de los coches se ve moteada (revisar la reflexión o el mapa de normales).
