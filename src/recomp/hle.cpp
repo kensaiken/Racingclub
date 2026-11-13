@@ -101,6 +101,9 @@ void hle_dump_counts() {
     std::lock_guard<std::mutex> lk(g_cntMx);
     for (auto& [k, v] : g_cnt) std::fprintf(stderr, "[hlecount] %10llu  %s  (last lr %x)\n", (unsigned long long)v.first, k.c_str(), v.second);
 }
-void hle_install() { g_hostHook = hook; }
+void hle_install() {
+    g_hostHook = hook;
+    for (auto& im : kImports) rc_mark_hooked(im.addr);
+}
 
 } // namespace gti::recomp

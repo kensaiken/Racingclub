@@ -881,6 +881,10 @@ uint32_t rd32m(uint32_t a) { return __builtin_bswap32(*reinterpret_cast<const ui
 uint16_t rd16m(uint32_t a) { return uint16_t(G->mem[a] << 8 | G->mem[a + 1]); }
 uint64_t rd64m(uint32_t a) { return uint64_t(rd32m(a)) << 32 | rd32m(a + 4); }
 
+// Waiters of cellSpursEventFlagWait sleep on this and are woken by every set_event_flag: polling with a 50 us sleep
+// really slept ~2 ms on Windows, several times per frame (the render thread waits for the geometry jobs).
+std::mutex g_efMx;
+std::condition_variable g_efCv;
 void set_event_flag(uint32_t ef, uint16_t bits) {   // same storage as cellSpursEventFlagWait reads (u16 at +0)
     uint32_t* p = reinterpret_cast<uint32_t*>(G->mem + ef);
     uint32_t raw = __atomic_load_n(p, __ATOMIC_SEQ_CST);
@@ -888,6 +892,8 @@ void set_event_flag(uint32_t ef, uint16_t bits) {   // same storage as cellSpurs
         const uint32_t nw = __builtin_bswap32(__builtin_bswap32(raw) | (uint32_t(bits) << 16));
         if (__atomic_compare_exchange_n(p, &raw, nw, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) break;
     }
+    { std::lock_guard<std::mutex> lk(g_efMx); }
+    g_efCv.notify_all();
 }
 
 struct JobDesc { uint32_t jea; uint8_t d[256]; std::vector<uint8_t> in; };   // descriptor + input DMA data as grabbed   // descriptor copied when the job is grabbed (the game reuses the slots)
@@ -919,7 +925,7 @@ void run_job(const JobDesc& J) {
             // The game fills the buffer descriptions of SPUs 0-2 only (its job chain runs on 3 SPUs). Workers 3-5
             // get descriptions of their own, copied from SPU 0, with their own ring and RSX label (0x600...), so
             // six host threads can share the Edge jobs.
-            for (uint32_t r = 0; r < uint32_t(std::min(g_workers, 6)) && mb; ++r) {
+            for (uint32_t r = 0; r < uint32_t(std::min(g_workers, 8)) && mb; ++r) {
                 const uint32_t e = 0x01061980u + 0x80u * r, size = mb << 20;
                 if (r >= 3) {
                     std::memcpy(G->mem + e, G->mem + 0x01061980u, 0x80);
@@ -1164,6 +1170,7 @@ void run_job(const JobDesc& J) {
                 std::string out; char b[48];
                 for (size_t k = 0; k < v.size() && k < 12; ++k) { std::snprintf(b, sizeof b, " %x:%llu", 0x3000 + v[k].second * 0x400, (unsigned long long)v[k].first); out += b; }
                 LOG("[spuprof] edge chunks (LS addr:entries):%s\n", out.c_str());
+                spurt::spu_slow_report();
                 std::memset(spurt::g_spuProfCnt, 0, sizeof spurt::g_spuProfCnt);
             }
         }
@@ -1914,7 +1921,11 @@ bool imports(PPU& c, const char* module, const char* name) {
                 ret(c, CELL_OK); return true;
             }
             if (n == "cellSpursEventFlagTryWait") { ret(c, 0x80410901); return true; }   // CELL_SPURS_TASK_ERROR_BUSY
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            {   // woken by set_event_flag; the 1 ms timeout covers bits set by anything else
+                std::unique_lock<std::mutex> lk(jobs::g_efMx);
+                const uint32_t seen = __atomic_load_n(p, __ATOMIC_SEQ_CST);
+                jobs::g_efCv.wait_for(lk, std::chrono::milliseconds(1), [&] { return __atomic_load_n(p, __ATOMIC_SEQ_CST) != seen; });
+            }
         }
     }
     if (n == "_cellSpursLFQueuePushBody") {   // (lfqueue, const void* element, isBlocking)

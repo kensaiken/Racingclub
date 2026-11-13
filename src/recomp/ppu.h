@@ -189,6 +189,7 @@ extern const FuncEntry kFuncs[];
 extern const size_t kFuncCount;
 using HostHook = bool (*)(PPU&, uint32_t addr);   // returns true if it handled the call (stub)
 extern HostHook g_hostHook;
+void rc_mark_hooked(uint32_t addr);   // calls to addr must go through g_hostHook (system library stubs)
 void rc_call(PPU& c, uint32_t addr);
 uint64_t rc_timebase();                    // PS3 time base counter (79.8 MHz)
 using SyscallHook = void (*)(PPU&);

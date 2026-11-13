@@ -13,6 +13,8 @@ extern bool g_spuProf;
 extern uint64_t g_spuProfCnt[64][256];
 // entries into the slow (every instruction is an entry point) variant: indirect branches to unforeseen targets
 extern uint64_t g_spuSlowEntries;
+void spu_slow_note(uint32_t ea, uint32_t pc);   // SPUPROF=1: where the slow variant is entered ([spuslow] report)
+void spu_slow_report();
 
 // A chunk runs from pc until it leaves its 1 KB of code. Result: next pc, | 0x80000000 = the interpreter must
 // execute the instruction at that pc, | 0x40000000 (fast chunks only) = pc is not an entry point of the fast chunk.

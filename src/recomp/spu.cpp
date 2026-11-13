@@ -6,6 +6,10 @@
 #include <cmath>
 #include <atomic>
 #include <cstring>
+#include <cstdio>
+#include <string>
+#include <vector>
+#include <map>
 #include <mutex>
 
 namespace gti::recomp {
@@ -433,3 +437,17 @@ bool Spu::step() {
 }
 
 } // namespace gti::recomp
+
+namespace gti::recomp::spurt {
+static std::mutex g_slowMx;
+static std::map<uint64_t, uint64_t> g_slowPcs;
+void spu_slow_note(uint32_t ea, uint32_t pc) { std::lock_guard<std::mutex> lk(g_slowMx); ++g_slowPcs[uint64_t(ea) << 32 | pc]; }
+void spu_slow_report() {
+    std::vector<std::pair<uint64_t, uint64_t>> v;
+    { std::lock_guard<std::mutex> lk(g_slowMx); for (auto& kv : g_slowPcs) v.push_back({kv.second, kv.first}); g_slowPcs.clear(); }
+    std::sort(v.rbegin(), v.rend());
+    std::string o; char b[48];
+    for (size_t k = 0; k < v.size() && k < 40; ++k) { std::snprintf(b, sizeof b, " %x:%x:%llu", uint32_t(v[k].second >> 32), uint32_t(v[k].second), (unsigned long long)v[k].first); o += b; }
+    std::fprintf(stderr, "[spuslow] slow-path entries (program:LS:count):%s\n", o.c_str());
+}
+} // namespace gti::recomp::spurt

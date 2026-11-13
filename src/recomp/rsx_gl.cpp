@@ -701,9 +701,10 @@ static void surface_gl_format(uint32_t fmt, GLenum& ifmt, GLenum& f, GLenum& ty)
 static uint64_t g_texGen = 1;
 static Surface& get_surface(uint32_t loc, uint32_t off, uint32_t w, uint32_t h, uint32_t fmt, bool depth) {
     const uint64_t key = (uint64_t(loc) << 33) | (uint64_t(depth) << 32) | off;
+    const bool fresh = surfaces.find(key) == surfaces.end();
     Surface& s = surfaces[key];
+    if (fresh) ++g_texGen;
     if (!s.tex || s.w != w || s.h != h || s.fmt != fmt) {
-        ++g_texGen;
         // The game reuses an address with different sizes within a frame (the depth buffer of the 256x256 cube
         // faces and of the 2560x720 scene share one): the texture of each size is kept and comes back, instead of
         // being destroyed and created again several times per frame.
@@ -715,6 +716,7 @@ static Surface& get_surface(uint32_t loc, uint32_t off, uint32_t w, uint32_t h, 
             if (parked[k].key == key && parked[k].w == w && parked[k].h == h && parked[k].fmt == fmt) { s.tex = parked[k].tex; parked.erase(parked.begin() + k); break; }
         if (s.tex) { s.w = w; s.h = h; s.fmt = fmt; s.depth = depth; s.lastUse = frameNo; return s; }
         glGenTextures(1, &s.tex);
+        ++g_texGen;   // bound on the active unit below
         glBindTexture(GL_TEXTURE_2D, s.tex);
         if (depth) {
             if (fmt == 1) glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT16, w, h, 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, nullptr);
@@ -899,28 +901,55 @@ static void apply_border_color(GLenum target, uint32_t base) {
     glTexParameterfv(target, GL_TEXTURE_BORDER_COLOR, c);
 }
 
+static uint64_t g_memoHits = 0, g_memoMiss[4] = {};   // RSXPROF: texture-unit memo hits; misses: no memo, generation, age, registers
 static bool g_bindMemoOk = false;   // set by bind_texture_impl when the binding is a plain cached texture
 static void bind_texture_impl(int i, float* tsc);
 // Per texture unit: the registers of its last binding. A draw that samples the same texture as the previous draw
 // on that unit (most of them: >60000 draws per second) then costs nothing; the content check still runs every
 // few frames because the memo expires.
+static GLuint g_lastId = 0; static GLenum g_lastTarget = 0; static uint64_t g_lastSurf = 0;   // surface key | bit 63, 0 = plain texture   // what bind_texture_impl bound when g_bindMemoOk
+// Bindings already worked out, keyed by the unit's registers (any unit): a draw that samples a texture seen before
+// (most of the >60000 draws per second) only binds its GL texture, or nothing when the unit already holds it.
+// Valid while no texture/surface changed (g_texGen) and for 4 frames (the content check), and only if the GL
+// texture still carries the sampler state of these registers (another unit may have set other filters on it).
 static void bind_texture(int i, float* tsc) {
-    struct Memo { uint32_t regs[9]; uint64_t gen = 0, frame = 0; float tsc[4]; bool valid = false; };
-    static Memo memo[16];
+    struct Fast { uint64_t gen, frame, surf; GLuint id; GLenum target; float tsc[4]; };
+    static std::unordered_map<uint64_t, Fast> fast;
+    static std::unordered_map<GLuint, uint64_t> paramsOf;   // GL texture -> registers its sampler state was set for
+    static GLuint boundOn[16] = {};
+    static uint64_t boundGen = 0;
     static const bool off = std::getenv("RSXNOTEXMEMO") != nullptr;
+    if (boundGen != g_texGen) { std::memset(boundOn, 0, sizeof boundOn); boundGen = g_texGen; }
     const uint32_t base = i < 8 ? 0x1a00 + 0x20 * i : 0x1b00 + 0x20 * (i - 8);
     uint32_t regs[9];
     for (int k = 0; k < 8; ++k) regs[k] = R[(base >> 2) + k];
     regs[8] = R[(0x1840 + 4 * i) >> 2];
-    Memo& m = memo[i];
-    if (!off && m.valid && m.gen == g_texGen && frameNo - m.frame < 4 && !std::memcmp(m.regs, regs, sizeof regs)) {
-        std::memcpy(tsc, m.tsc, sizeof m.tsc);
-        return;
+    const uint64_t h = fnv(regs, sizeof regs);
+    if (!off) {
+        auto it = fast.find(h);
+        if (it != fast.end() && it->second.gen == g_texGen && frameNo - it->second.frame < 4) {
+            const Fast& f = it->second;
+            auto pit = paramsOf.find(f.id);
+            bool ok = pit != paramsOf.end() && pit->second == h;
+            if (ok && f.surf) { auto sit = surfaces.find(f.surf & ~(1ull << 63)); ok = sit != surfaces.end() && sit->second.tex == f.id; }
+            if (ok) {
+                if (boundOn[i] != f.id) { glActiveTexture(GL_TEXTURE0 + i); glBindTexture(f.target, f.id); boundOn[i] = f.id; }
+                std::memcpy(tsc, f.tsc, sizeof f.tsc);
+                ++g_memoHits;
+                return;
+            }
+            ++g_memoMiss[3];
+        } else ++g_memoMiss[it == fast.end() ? 0 : it->second.gen != g_texGen ? 1 : 2];
     }
-    g_bindMemoOk = false;
+    g_bindMemoOk = false; g_lastSurf = 0;
     bind_texture_impl(i, tsc);
-    m.valid = g_bindMemoOk;
-    if (m.valid) { std::memcpy(m.regs, regs, sizeof regs); m.gen = g_texGen; m.frame = frameNo; std::memcpy(m.tsc, tsc, sizeof m.tsc); }
+    if (g_bindMemoOk && g_lastId) {
+        Fast& f = fast[h];
+        f.gen = g_texGen; f.frame = frameNo; f.surf = g_lastSurf; f.id = g_lastId; f.target = g_lastTarget; std::memcpy(f.tsc, tsc, sizeof f.tsc);
+        paramsOf[g_lastId] = h;
+        boundOn[i] = g_lastId;
+        if (fast.size() > 20000) fast.clear();
+    } else boundOn[i] = 0;   // unknown: bound by the slow path (cube, unsupported format...)
 }
 static void bind_texture_impl(int i, float* tsc) {
     const uint32_t base = i < 8 ? 0x1a00 + 0x20 * i : 0x1b00 + 0x20 * (i - 8);
@@ -947,6 +976,7 @@ static void bind_texture_impl(int i, float* tsc) {
         auto it = surfaces.find((uint64_t(loc) << 33) | (uint64_t(z) << 32) | off);
         if (it != surfaces.end() && !cube) {
             glBindTexture(GL_TEXTURE_2D, it->second.tex);
+            g_bindMemoOk = true; g_lastId = it->second.tex; g_lastTarget = GL_TEXTURE_2D; g_lastSurf = it->first | (1ull << 63);
             const GLint sw[4] = {GL_RED, GL_GREEN, GL_BLUE, GL_ALPHA};
             glTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_RGBA, sw);
             const uint32_t mag = (filt >> 24) & 7;
@@ -1034,8 +1064,7 @@ static void bind_texture_impl(int i, float* tsc) {
     }
     const GLenum target = cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
     if (!tx.id || tx.sig != sig || tx.target != target) {
-        ++g_texGen;
-        if (tx.id && tx.target != target) { glDeleteTextures(1, &tx.id); tx.id = 0; }
+        if (tx.id && tx.target != target) { ++g_texGen; glDeleteTextures(1, &tx.id); tx.id = 0; }   // re-uploads keep the GL name: bindings stay valid
         if (!tx.id) glGenTextures(1, &tx.id);
         tx.target = target;
         tx.sig = sig;
@@ -1093,6 +1122,7 @@ static void bind_texture_impl(int i, float* tsc) {
         glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, mips - 1);
     } else glBindTexture(target, tx.id);
     tx.lastUse = frameNo;
+    g_lastId = tx.id; g_lastTarget = target;
     {   // the sampler state lives in the GL texture object: set it only when the registers changed
         const uint32_t sreg[6] = {addr, ctl0, filt, remap, R[(base + 0x1c) >> 2], mips};
         const uint64_t sk = fnv(sreg, sizeof sreg);
@@ -1437,6 +1467,7 @@ static void do_draw() {
             std::string o; char b[64];
             for (int q = 0; q < 6; ++q) { std::snprintf(b, sizeof b, " %s %.0f,", pfName[q], pfT[q] * k); o += b; pfT[q] = 0; }
             if (pfLast) RLOG("[rsxprof] ms/s:%s | per second: %.0f draws, %.0f k vertices, %.0f k indices\n", o.c_str(), pfDraws * 1000.0 / (now - pfLast), pfVerts / double(now - pfLast), pfIdx / double(now - pfLast));
+            if (pfLast) { RLOG("[rsxprof] texture units: %llu memo hits, misses: %llu new, %llu generation, %llu age, %llu sampler state\n", (unsigned long long)g_memoHits, (unsigned long long)g_memoMiss[0], (unsigned long long)g_memoMiss[1], (unsigned long long)g_memoMiss[2], (unsigned long long)g_memoMiss[3]); g_memoHits = 0; for (auto& x : g_memoMiss) x = 0; }
             pfDraws = pfVerts = pfIdx = 0; pfLast = now;
         }
     }

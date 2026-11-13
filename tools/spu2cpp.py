@@ -391,6 +391,14 @@ def gen(read, ea, size, base):
     n = size // 4
     end = base + size
     leaders = leaders_of(code, base, size)
+    # entry points found at run time (indirect branch targets the static scan cannot see): tools/spu_leaders/<ea>.txt,
+    # one hex LS address per line, written from the [spuslow] report of SPUPROF=1
+    extra = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'spu_leaders', f'{ea:x}.txt')
+    if os.path.exists(extra):
+        for line in open(extra):
+            line = line.split('#')[0].strip()
+            if line and base <= int(line, 16) < end:
+                leaders.add(int(line, 16) & ~3)
     fn = f'spu_{ea:x}'
     nch = (size + CH - 1) // CH
     files = []
@@ -444,6 +452,7 @@ def gen(read, ea, size, base):
              f'        pc = k_{fn}_fast[c](r, s, pc);',
              '        if (pc & 0x40000000u) {   // not an entry point of the fast chunk',
              '            ++g_spuSlowEntries;',
+             f'            if (g_spuProf) spu_slow_note(0x{ea:x}u, pc & 0x3fffffffu);',
              f'            pc = k_{fn}_slow[c](r, s, pc & 0x3fffffffu, false);',
              '        }',
              '        if (pc & 0x80000000u) { pc &= 0x7fffffffu; break; }',

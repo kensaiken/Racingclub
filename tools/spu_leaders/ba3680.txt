@@ -1,0 +1,5 @@
+# indirect branch targets seen at run time (SPUPROF=1 [spuslow])
+6030
+4624
+3928
+310c
