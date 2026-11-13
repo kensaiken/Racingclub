@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <cstring>
 #include <cwchar>
+#include <thread>
+#include <chrono>
 #ifdef _WIN32
 #include <windows.h>
 // kernel-mode-thunk vblank wait (gdi32): blocks until the next real vertical blank of the primary display
@@ -62,19 +64,55 @@ bool host_wait_refresh() {
     static KmtWaitVblank w{};
     static int state = 0;   // 0 not opened, 1 ok, -1 unavailable
     if (state == 0) {
+        // a DC of the primary monitor itself: the screen DC (GetDC(nullptr)) spans every monitor, and with two of
+        // them the wait did not follow the one the game is on (frames took two refreshes or more)
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof mi;
+        const POINT origin{0, 0};
+        GetMonitorInfoW(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &mi);
         KmtOpenAdapterFromHdc o{};
-        o.hDc = GetDC(nullptr);
+        o.hDc = CreateDCW(mi.szDevice, mi.szDevice, nullptr, nullptr);
         state = o.hDc && D3DKMTOpenAdapterFromHdc(&o) == 0 ? 1 : -1;
-        if (o.hDc) ReleaseDC(nullptr, o.hDc);
+        if (o.hDc) DeleteDC(o.hDc);
         w.hAdapter = o.hAdapter; w.vidPnSourceId = o.vidPnSourceId;
     }
     if (state < 0) return false;
     if (D3DKMTWaitForVerticalBlankEvent(&w) != 0) { state = -1; return false; }
     return true;
 }
+// 1 ms Windows timer for the whole run. Short sleeps (the SPU job workers, the RSX thread and the vblank pacing
+// all sleep tens of microseconds to a few milliseconds) otherwise last a whole 15.6 ms tick: on Windows 11 the
+// resolution another program asked for no longer applies to this one, and frames halved to 30 per second.
+void host_timer_init() {
+    static const bool done = [] {
+        HMODULE w = LoadLibraryW(L"winmm.dll");
+        auto begin = w ? reinterpret_cast<UINT(WINAPI*)(UINT)>(reinterpret_cast<void*>(GetProcAddress(w, "timeBeginPeriod"))) : nullptr;
+        // and no "efficiency mode" when the window is in the background (alt-tab to OBS): Windows would slow
+        // the threads down (EcoQoS) and the game would stutter
+        PROCESS_POWER_THROTTLING_STATE pt{};
+        pt.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+        pt.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+        pt.StateMask = 0;
+        using SetInfo = BOOL(WINAPI*)(HANDLE, int, void*, DWORD);   // Windows 8+, looked up so older SDK headers do
+        if (auto set = reinterpret_cast<SetInfo>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessInformation"))))
+            set(GetCurrentProcess(), int(ProcessPowerThrottling), &pt, sizeof pt);
+        return begin && begin(1) == 0;
+    }();
+    (void)done;
+    if (std::getenv("TIMERTEST")) {   // debug: how long short sleeps really take
+        LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f);
+        for (int us : {50, 500, 1000}) {
+            QueryPerformanceCounter(&t0);
+            for (int k = 0; k < 20; ++k) std::this_thread::sleep_for(std::chrono::microseconds(us));
+            QueryPerformanceCounter(&t1);
+            std::fprintf(stderr, "[timer] sleep %d us takes %.3f ms (timeBeginPeriod %s)%c", us, (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart / 20, done ? "ok" : "failed", 10);
+        }
+    }
+}
 // time-critical work (sound mixing): the calling thread goes ahead of the normal ones
 // also puts the whole process above normal programs once, like most games: OBS or a browser then cannot take its time slices
 void host_thread_priority_high() {
+    if (std::getenv("NOPRIO")) return;
     static const bool cls = SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) != 0; (void)cls;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 }
@@ -123,5 +161,6 @@ void host_restore_refresh() {}
 bool host_wait_refresh() { return false; }
 bool host_menu_bitmap(const wchar_t* const*, int, int, int, int, uint32_t*) { return false; }
 void host_thread_priority_high() {}
+void host_timer_init() {}
 }
 #endif

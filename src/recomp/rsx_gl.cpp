@@ -1596,7 +1596,7 @@ static void pump_events() {
     }
     {   // vibration the game asks for (cellPadSetActDirect), renewed while it lasts
         static uint32_t last = 0; static uint64_t renewed = 0;
-        const uint32_t rb = menuOpen ? 0 : lv2_rumble();
+        const uint32_t rb = menuOpen || std::getenv("NORUMBLE") ? 0 : lv2_rumble();
         const uint64_t now = SDL_GetTicks();
         if (pad && (rb != last || (rb && now - renewed > 150))) {
             const uint16_t low = uint16_t((rb & 0xff) * 257), high = (rb >> 8) ? 0xffff : 0;
@@ -1722,7 +1722,12 @@ void flip(uint32_t id) {
         if (warned++ < 5) RLOG("[rsx] flip %u: display buffer at 0x%x was never rendered\n", id, d.offset);
     }
     if (menuOpen) draw_menu(ww, wh);
-    SDL_GL_SwapWindow(win);
+    {   // SWAPLOG=1: how long presenting takes (it blocks when the compositor or the driver throttles)
+        static const bool swapLog = std::getenv("SWAPLOG") != nullptr;
+        const uint64_t ts = swapLog ? SDL_GetTicksNS() : 0;
+        SDL_GL_SwapWindow(win);
+        if (swapLog) { static uint64_t sum = 0, mx = 0, n = 0; const uint64_t d = SDL_GetTicksNS() - ts; sum += d; mx = std::max(mx, d); if (++n == 240) { RLOG("[swap] 240 presents: %.2f ms average, %.2f ms longest\n", sum / 240e6, mx / 1e6); sum = mx = n = 0; } }
+    }
     pump_events();
     static uint64_t lastT = SDL_GetTicks(), lastF = 0;
     const uint64_t now = SDL_GetTicks();

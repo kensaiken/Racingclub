@@ -23,7 +23,7 @@
 #include <thread>
 #include <vector>
 
-namespace gti::recomp { void ripprof_register_thread(const char* name); void host_thread_priority_high(); int host_display_hz(); bool host_set_refresh(int hz); void host_restore_refresh(); bool host_wait_refresh(); }   // ripprof.cpp, host_win.cpp   // ripprof.cpp
+namespace gti::recomp { void ripprof_register_thread(const char* name); void host_thread_priority_high(); void host_timer_init(); int host_display_hz(); bool host_set_refresh(int hz); void host_restore_refresh(); bool host_wait_refresh(); }   // ripprof.cpp, host_win.cpp   // ripprof.cpp
 namespace gti::recomp {
 
 extern uint64_t g_missLr;
@@ -2394,6 +2394,7 @@ void lv2_dump_waits() {
 }
 
 int lv2_run_main(Guest& g) {
+    host_timer_init();
     // main thread, started like lv2 starts a process: r3 argc, r4 argv, r5 envp, r7 thread id, r8-r10 TLS image
     auto t = std::make_shared<GThread>();
     t->id = g_nextTid++;
