@@ -20,7 +20,7 @@
 #include <thread>
 #include <vector>
 
-namespace gti::recomp { void ripprof_register_thread(const char* name); }   // ripprof.cpp
+namespace gti::recomp { void ripprof_register_thread(const char* name); int host_display_hz(); bool host_set_refresh(int hz); void host_restore_refresh(); bool host_wait_refresh(); }   // ripprof.cpp, host_win.cpp   // ripprof.cpp
 namespace gti::recomp {
 
 extern uint64_t g_missLr;
@@ -258,7 +258,8 @@ std::atomic<uint32_t> g_vblankTick{0};   // bumped (and waiters woken) after eve
 bool g_flipDue = false;
 uint64_t g_flipDueSince = 0;
 void call_guest(uint32_t opd, uint64_t arg);
-void deliver_flip() { if (g_flipDue) { g_flipDue = false; call_guest(flipHandler, 1); fl("D"); } }
+uint64_t g_tDeliver = 0, g_tPut = 0, g_mBuild = 0, g_mRsx = 0, g_mLate = 0, g_mN = 0;   // [margin] statistics
+void deliver_flip() { if (g_flipDue) { g_flipDue = false; call_guest(flipHandler, 1); g_tDeliver = now_us(); fl("D"); } }
 std::atomic<uint64_t> g_lbl400{0};   // RSX writes of label 0x400 (Edge output ring position)
 std::mutex callMx;   // guest handler calls from the RSX threads
 
@@ -306,6 +307,15 @@ void method(uint32_t m, uint32_t arg, uint32_t& semOff406e, uint32_t& semOff4097
         case 0x0064: semOff406e = arg; break;                        // NV406E_SEMAPHORE_OFFSET
         case 0x0068: {                                               // NV406E_SEMAPHORE_ACQUIRE: wait for the label
             const uint64_t ts = now_us();
+            if (semOff406e == 0x810 && g_tDeliver) {   // frame margin: flip -> game published the frame -> FIFO reached the vblank wait
+                const uint64_t build = g_tPut > g_tDeliver ? g_tPut - g_tDeliver : 0, rsxT = ts - g_tDeliver;
+                g_mBuild = std::max(g_mBuild, build); g_mRsx = std::max(g_mRsx, rsxT); if (rsxT > 15500) ++g_mLate;
+                if (++g_mN >= 240) {
+                    LOG("[margin] last %llu frames: game published the frame up to %.1f ms after the flip, the RSX finished up to %.1f ms after it; %llu frames past 15.5 ms\n",
+                        (unsigned long long)g_mN, g_mBuild / 1000.0, g_mRsx / 1000.0, (unsigned long long)g_mLate);
+                    g_mBuild = g_mRsx = g_mLate = g_mN = 0;
+                }
+            }
             if (semOff406e == 0x810) { fl("h", uint32_t(g_frHoleUs / 100)); fl("n", uint32_t(g_frHoles)); fl("i", uint32_t(g_frIdleUs / 100)); fl("S"); g_frHoleUs = g_frIdleUs = g_frHoles = 0; }
             if (semOff406e == 0x810) {   // waits for the vblank handler: woken by the vblank thread, not by polling
                 for (;;) {
@@ -392,7 +402,7 @@ void fifo_thread() {
         const uint32_t put = rd(ctrl), get = rd(ctrl + 4);
         static uint32_t lastPut = 0xFFFFFFFFu;
         static int putLogs = 0;
-        { static uint32_t flPut = 0; if (put != flPut && g_flStart >= 0) { flPut = put; fl("P", put); } }
+        { static uint32_t flPut = 0; if (put != flPut) { flPut = put; g_tPut = now_us(); if (g_flStart >= 0) fl("P", put); } }
         if (put != lastPut && putLogs < 600) { ++putLogs; LOG("[rsx] put %x (get %x, cmd@get %08x %08x, @put-8 %08x %08x, @put %08x)\n", put, get, rd(io2ea(get)), rd(io2ea(get) + 4), rd(io2ea(put) - 8), rd(io2ea(put) - 4), rd(io2ea(put))); lastPut = put; }
         if (g_flipDue && (get == put || now_us() - g_flipDueSince > 20000)) deliver_flip();
         if (prof && now_us() - g_profLast > 4000000) {
@@ -510,10 +520,44 @@ void fifo_thread() {
 
 void vblank_thread() {
     t_tid = 0x01000201;
+    // Pacing of the emulated 60 Hz vblank. When the display refreshes at a multiple of 60 the vblank follows the real
+    // refreshes (every image is then shown for the same number of them); a display at another rate (144 Hz) is
+    // switched to 120 Hz while the game runs. REFRESCO=0 leaves the display alone, VBLANKTIMER=1 forces the timer.
+    int perVblank = 0;   // display refreshes per vblank; 0 = timer
+    {
+        int hz = host_display_hz();
+        const char* e = std::getenv("REFRESCO");
+        if (hz > 0 && hz % 60 != 0 && !(e && !std::strcmp(e, "0"))) {
+            const int want = e && std::atoi(e) > 0 ? std::atoi(e) : 120;
+            if (host_set_refresh(want)) { LOG("[vblank] display switched from %d to %d Hz while the game runs\n", hz, want); hz = want; }
+            else LOG("[vblank] the display has no %d Hz mode: staying at %d Hz\n", want, hz);
+        }
+        if (hz > 0 && hz % 60 == 0 && !std::getenv("VBLANKTIMER")) perVblank = hz / 60;
+        LOG("[vblank] display %d Hz: vblank %s\n", hz, perVblank ? "follows the display refresh" : "on a 60 Hz timer");
+    }
     auto next = std::chrono::steady_clock::now();
+    uint64_t lastTick = now_us();
+    int odd = 0;
     for (;;) {
-        next += std::chrono::microseconds(16667);
-        std::this_thread::sleep_until(next);
+        if (perVblank) {
+            for (int k = 0; k < perVblank && perVblank; ++k) if (!host_wait_refresh()) perVblank = 0;
+            const uint64_t t = now_us(), dt = t - lastTick;
+            lastTick = t;
+            // the refreshes must really be 60 Hz: most of every 240 vblanks have to be 16.67 ms apart (stalls excluded)
+            static int good = 0, seen = 0;
+            (void)odd;
+            if (dt > 15600 && dt < 17700) ++good;
+            if (++seen == 240) {
+                if (good < 160) { LOG("[vblank] only %d of 240 vblanks were 16.67 ms apart (display reports %d Hz): back to the 60 Hz timer\n", good, host_display_hz()); perVblank = 0; host_restore_refresh(); }
+                good = seen = 0;
+            }
+            next = std::chrono::steady_clock::now();
+        }
+        if (!perVblank) {   // sleep most of the interval, yield through the last 2 ms (Windows sleeps are coarse)
+            next += std::chrono::microseconds(16667);
+            std::this_thread::sleep_until(next - std::chrono::microseconds(2000));
+            while (std::chrono::steady_clock::now() < next) std::this_thread::yield();
+        }
         if (flipPending.load()) { ++flips; call_guest(flipHandler, 1); flipPending = false; }
         { const uint32_t b = labels ? rd(labels + 0x810) : 0; call_guest(vblankHandler, 1); fl("V", b * 16 + (labels ? rd(labels + 0x810) : 0)); }
         ++g_vblankTick; g_vblankTick.notify_all();

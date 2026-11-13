@@ -13,6 +13,7 @@
 #include <thread>
 
 using namespace gti::recomp;
+namespace gti::recomp { void host_restore_refresh(); }
 namespace gti::recomp { extern bool g_shadowOn; void rc_dump_all_shadows(); extern uint32_t g_watchLo, g_watchHi; }
 
 int main(int argc, char** argv) {
@@ -40,12 +41,12 @@ int main(int argc, char** argv) {
         for (int k = 0; k < seconds * 2; ++k) { std::this_thread::sleep_for(std::chrono::milliseconds(500)); rc_dump_all_shadows(); }
     } else if (seconds <= 0) {   // --seconds 0: play until the window is closed
         while (!rsx::quit_requested()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        std::_Exit(0);
+        gti::recomp::host_restore_refresh(); std::_Exit(0);
     } else
         for (int k = 0; k < seconds * 10 && !rsx::quit_requested(); ++k) std::this_thread::sleep_for(std::chrono::milliseconds(100));
     std::fprintf(stderr, "[boot] %d s elapsed, stopping\n", seconds);
     if (g_shadowOn) rc_dump_all_shadows();
     hle_dump_counts();
     lv2_dump_waits();
-    std::_Exit(0);
+    gti::recomp::host_restore_refresh(); std::_Exit(0);
 }
