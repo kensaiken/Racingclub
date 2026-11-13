@@ -59,13 +59,27 @@ inline Q shufb(const Q& a, const Q& bb, const Q& c) {
     const __m128i spec = _mm_blendv_epi8(isC0, _mm_set1_epi8(char(0x80)), isE0);
     return mk(_mm_blendv_epi8(res, spec, C));   // top bit of the control byte selects the special value
 }
-inline Q insmask(uint32_t addr, int size) {   // cbd/chd/cwd/cdd family
-    alignas(16) uint8_t o[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f};
-    const int t = int(addr & 0xF) & ~(size - 1);
-    if (size == 1) o[t] = 3;
-    else if (size == 2) { o[t] = 2; o[t + 1] = 3; }
-    else for (int k = 0; k < size; ++k) o[t + k] = uint8_t(k);
-    return mk(swp(_mm_load_si128(reinterpret_cast<const __m128i*>(o))));
+// cbd/chd/cwd/cdd family. The 16 x 4 possible masks are precomputed (in the Q layout): building one byte by byte
+// and reloading it as a vector stalls on store forwarding, and scalar code runs this for every load and store.
+struct InsMaskTable {
+    alignas(16) uint8_t m[4][16][16];
+    InsMaskTable() {
+        for (int ls = 0; ls < 4; ++ls) for (int a = 0; a < 16; ++a) {
+            const int size = 1 << ls;
+            uint8_t o[16];
+            for (int k = 0; k < 16; ++k) o[k] = uint8_t(0x10 + k);
+            const int t = a & ~(size - 1);
+            if (size == 1) o[t] = 3;
+            else if (size == 2) { o[t] = 2; o[t + 1] = 3; }
+            else for (int k = 0; k < size; ++k) o[t + k] = uint8_t(k);
+            for (int k = 0; k < 16; ++k) m[ls][a][k ^ 3] = o[k];   // SPU byte k is at memory offset k ^ 3
+        }
+    }
+};
+inline const InsMaskTable g_insMask;
+inline Q insmask(uint32_t addr, int size) {
+    const int ls = size == 1 ? 0 : size == 2 ? 1 : size == 4 ? 2 : 3;
+    return mk(_mm_load_si128(reinterpret_cast<const __m128i*>(g_insMask.m[ls][addr & 0xF])));
 }
 // Byte shifts and rotates of the whole register, straight in the Q layout: SPU byte i of the result is at memory
 // offset i ^ 3 and comes from SPU byte i + n (or i - n), which is at offset (i + n) ^ 3.

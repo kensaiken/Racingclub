@@ -466,9 +466,14 @@ def main():
     table = []
     for spec in sys.argv[3:]:
         parts = spec.split(':')
-        ea, size = int(parts[0], 16), int(parts[1], 0)
-        base = int(parts[2], 16) if len(parts) > 2 else 0x3000
-        fn, files = gen(read, ea, size, base)
+        if parts[0] == 'file':   # file:path:offset:size:lsbase:id - code that is not in the EBOOT (a module loaded at run time); id names it
+            data = open(parts[1], 'rb').read()
+            foff, size, base, ea = int(parts[2], 0), int(parts[3], 0), int(parts[4], 16), int(parts[5], 16)
+            fn, files = gen(lambda va, n, d=data, o=foff, e=ea: d[o + va - e: o + va - e + n], ea, size, base)
+        else:
+            ea, size = int(parts[0], 16), int(parts[1], 0)
+            base = int(parts[2], 16) if len(parts) > 2 else 0x3000
+            fn, files = gen(read, ea, size, base)
         for name, src in files:
             open(os.path.join(outdir, name), 'w').write(src)
         table.append((ea, base, size, fn))

@@ -127,6 +127,10 @@ void Spu::run(uint64_t maxSteps) {
             const uint32_t before = pc;
             ++compiledCalls; compiled(*this);
             if (pc != before) { if (pc < hookBelow && onBranch && !onBranch(*this, pc)) break; continue; }   // otherwise the interpreter executes the instruction the program left at
+        } else if (compiled3 && pc >= compiled3Lo && pc < compiled3Hi) {
+            const uint32_t before = pc;
+            ++compiledCalls; compiled3(*this);
+            if (pc != before) { if (pc < hookBelow && onBranch && !onBranch(*this, pc)) break; continue; }
         } else if (compiled2 && pc >= compiled2Lo && pc < compiled2Hi) {
             const uint32_t before = pc;
             ++compiledCalls; compiled2(*this);

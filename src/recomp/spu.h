@@ -58,6 +58,8 @@ public:
     uint32_t compiledLo = 0, compiledHi = 0;
     void (*compiled2)(Spu&) = nullptr;   // a second recompiled region (a module the program loads)
     uint32_t compiled2Lo = 0, compiled2Hi = 0;
+    void (*compiled3)(Spu&) = nullptr;
+    uint32_t compiled3Lo = 0, compiled3Hi = 0;
 
     bool readChPub(uint32_t ch, uint32_t& v) { return readCh(ch, v); }
     bool writeChPub(uint32_t ch, uint32_t v) { return writeCh(ch, v); }

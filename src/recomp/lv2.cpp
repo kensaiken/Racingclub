@@ -1344,7 +1344,7 @@ struct Task {
     Spu spu;
     std::mutex m; std::condition_variable cv;
     bool signalled = false;
-    uint32_t taskset = 0, id = 0;
+    uint32_t taskset = 0, id = 0, ctxSave = 0;
 };
 std::mutex g_tm;
 std::atomic<uint64_t> g_signals{0}, g_passes{0};
@@ -1366,6 +1366,8 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
     }
     s.lssw(0x1C4, spurs); s.lssw(0x1C8, 0); s.lssw(0x1CC, 0x1f);
     s.lssw(0x2FB8, 0x2700);   // SPURS task library: pointer to the taskset context (system call entry at +0xC4)
+    s.lssw(0x2780, uint32_t(a0 >> 32)); s.lssw(0x2784, uint32_t(a0)); s.lssw(0x2788, uint32_t(a1 >> 32)); s.lssw(0x278C, uint32_t(a1));   // task info: arguments, ELF, context save area
+    s.lssw(0x2794, elf); s.lssw(0x279C, t->ctxSave);
     s.lssw(0x27BC, t->taskset); s.lssw(0x27C4, 0xA70); s.lssw(0x27CC, 0); s.lssw(0x27D0, 0x1f); s.lssw(0x27D4, t->id);
     s.r[1].sw(0, 0x3FFB0);
     s.r[3].sd(0, a0); s.r[3].sd(1, a1);
@@ -1374,6 +1376,7 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
     s.hookBelow = 0x3000;
     s.compiled = nullptr;
     const spurt::Compiled* cpMain = std::getenv("NOSPUREC") ? nullptr : spurt::find_compiled(elf + 0x100);
+    const spurt::Compiled* cpAtrac = std::getenv("NOSPUREC") ? nullptr : spurt::find_compiled(0xa7ac00);   // flashATRAC.pic at LS 0x32980
     const spurt::Compiled* cpMod = std::getenv("NOSPUREC") ? nullptr : spurt::find_compiled(0xbce880);   // mstream_dsp_reverb.pic
     if (cpMain && !std::memcmp(s.ls + cpMain->lsBase, G->mem + cpMain->eaBin, cpMain->size)) { s.compiled = cpMain->fn; s.compiledLo = cpMain->lsBase; s.compiledHi = cpMain->lsBase + cpMain->size; }
     if (std::getenv("SNDTRACE")) s.mfcTrace = 4000;
@@ -1404,7 +1407,14 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
                 t->cv.wait(lk, [&] { return t->signalled; });
                 t->signalled = false;
                 g_wake = now_us();
-                // the module region is enabled once the program has loaded it
+                // the module regions are enabled once the program has loaded them. The ATRAC decoder comes from the
+                // console's system files (flashATRAC.pic, relocated by the loader): recognised by its checksum.
+                if (cpAtrac && !sp.compiled3 && sp.lsw(cpAtrac->lsBase + 0x10)) {
+                    uint32_t h = 0x811c9dc5;
+                    for (uint32_t k = 0; k < cpAtrac->size; ++k) h = (h ^ sp.ls[cpAtrac->lsBase + k]) * 0x01000193;
+                    if (h == 0x29043cac) { sp.compiled3 = cpAtrac->fn; sp.compiled3Lo = cpAtrac->lsBase; sp.compiled3Hi = cpAtrac->lsBase + cpAtrac->size; LOG("[snd] ATRAC decoder runs recompiled%c", 10); }
+                    else { static bool told = false; if (!told) { told = true; LOG("[snd] ATRAC decoder of another system version (checksum %08x): interpreted%c", h, 10); } }
+                }
                 if (cpMod && !sp.compiled2 && !std::memcmp(sp.ls + cpMod->lsBase, G->mem + cpMod->eaBin, cpMod->size)) { sp.compiled2 = cpMod->fn; sp.compiled2Lo = cpMod->lsBase; sp.compiled2Hi = cpMod->lsBase + cpMod->size; LOG("[snd] reverb module runs recompiled\n"); }
                 sp.r[3].sw(0, 0);
                 break;
@@ -1418,9 +1428,6 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
     s.onStop = [&](Spu& sp, uint32_t code) { LOG("[snd] task %u: stop 0x%x at LS 0x%x\n", t->id, code, sp.pc); return false; };
     s.onWriteCh = [&](Spu&, uint32_t ch, uint32_t v) { if (shown++ < 200) LOG("[snd] task %u: wrch %u <- %08x\n", t->id, ch, v); return true; };
     s.onReadCh = [&](Spu&, uint32_t ch, uint32_t& v) { v = 0; if (shown++ < 200) LOG("[snd] task %u: rdch %u\n", t->id, ch); return true; };
-    // The game fills the block the task's argument points to after creating the task and then signals it (on the
-    // console the task has not been scheduled yet by then): start at the first signal, which stays pending.
-    { std::unique_lock<std::mutex> lk(t->m); t->cv.wait(lk, [&] { return t->signalled; }); }
     LOG("[snd] task %u of taskset %x: SPU program %x, entry 0x%x\n", t->id, t->taskset, elf, entry);
     if (const char* w = std::getenv("SNDWATCH")) {   // debug: SNDWATCH=<LS address in hex>: which instruction changes that word
         const uint32_t a = uint32_t(std::strtoul(w, nullptr, 16));
@@ -1435,14 +1442,14 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
     LOG("[snd] task %u stopped at LS 0x%x after %llu instructions (bad instruction %08x)\n", t->id, s.pc, (unsigned long long)s.steps, s.badInstr);
 }
 
-uint32_t create_task(uint32_t taskset, uint32_t elf, uint64_t a0, uint64_t a1) {
+uint32_t create_task(uint32_t taskset, uint32_t elf, uint32_t ctxSave, uint64_t a0, uint64_t a1) {
     Task* t = new Task;
     if (std::getenv("SNDTRACE")) std::thread([=] {   // debug: what the game puts in the task's command word
         uint32_t last = 0; int n = 0;
         while (n < 40) { const uint32_t v = be32(uint32_t(a0)); if (v != last) { last = v; ++n; LOG("[snd] command word = %08x (%llu signals so far)\n", v, (unsigned long long)g_signals.load()); } std::this_thread::yield(); }
     }).detach();
     std::lock_guard<std::mutex> lk(g_tm);
-    t->taskset = taskset; t->id = uint32_t(g_tasks.size());
+    t->taskset = taskset; t->id = uint32_t(g_tasks.size()); t->ctxSave = ctxSave;
     g_tasks.push_back(t);
     std::thread([=] { run_task(t, elf, a0, a1, 0, 0); }).detach();
     return t->id;
@@ -1804,7 +1811,7 @@ bool imports(PPU& c, const char* module, const char* name) {
     if (n == "sys_get_random_number") { for (uint32_t k = 0; k < a32(c, 1); ++k) c.wr8(a32(c, 0) + k, uint8_t(std::rand())); ret(c, CELL_OK); return true; }
     if (n == "cellSpursCreateTask" && a32(c, 2) != 0xbc5180 && settings().sound && !std::getenv("NOSOUND")) {   // (taskset, u32* taskId, elf, contextSave, contextSize, lsPattern, arg): the Zlib task is done on the host
         const uint32_t arg = a32(c, 6);
-        const uint32_t id = snd::create_task(a32(c, 0), a32(c, 2), arg ? c.rd64(arg) : 0, arg ? c.rd64(arg + 8) : 0);
+        const uint32_t id = snd::create_task(a32(c, 0), a32(c, 2), a32(c, 3), arg ? c.rd64(arg) : 0, arg ? c.rd64(arg + 8) : 0);
         c.wr32(a32(c, 1), id);
         ret(c, CELL_OK); return true;
     }
