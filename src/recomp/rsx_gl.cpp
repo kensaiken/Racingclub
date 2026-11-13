@@ -74,7 +74,7 @@ enum : GLenum {
     X(void, glGenVertexArrays, GLsizei, GLuint*) X(void, glBindVertexArray, GLuint) \
     X(void, glVertexAttribPointer, GLuint, GLint, GLenum, GLboolean, GLsizei, const void*) X(void, glEnableVertexAttribArray, GLuint) \
     X(void, glDisableVertexAttribArray, GLuint) X(void, glVertexAttrib4f, GLuint, GLfloat, GLfloat, GLfloat, GLfloat) \
-    X(void, glDrawElements, GLenum, GLsizei, GLenum, const void*) X(void, glDrawArrays, GLenum, GLint, GLsizei) \
+    X(void, glDrawElements, GLenum, GLsizei, GLenum, const void*) X(void, glDrawElementsBaseVertex, GLenum, GLsizei, GLenum, const void*, GLint) X(void, glDrawArrays, GLenum, GLint, GLsizei) \
     X(GLuint, glCreateShader, GLenum) X(void, glShaderSource, GLuint, GLsizei, const GLchar* const*, const GLint*) X(void, glCompileShader, GLuint) \
     X(void, glGetShaderiv, GLuint, GLenum, GLint*) X(void, glGetShaderInfoLog, GLuint, GLsizei, GLsizei*, GLchar*) X(GLuint, glCreateProgram) \
     X(void, glProgramBinary, GLuint, GLenum, const void*, GLsizei) X(void, glGetProgramBinary, GLuint, GLsizei, GLsizei*, GLenum*, void*) \
@@ -1270,22 +1270,39 @@ static void do_draw() {
     const uint32_t ibase = ea_of(R[0x181c >> 2], ia & 1);
     const bool restart = R[0x1dac >> 2] & 1;
     const uint32_t restartIdx = R[0x1db0 >> 2];
-    auto push = [&](uint32_t v) { idx.push_back(v); if (v != 0xffffffffu) { vmin = std::min(vmin, v); vmax = std::max(vmax, v); } };
-    for (const Range& r : ranges) {
+    {   // gather the indices of all ranges into idx (0xffffffff = primitive restart): tight loops, this runs for every index of every draw
+        const GLenum glp = gl_prim(prim);
+        const bool joinStrips = glp != GL_TRIANGLES && glp != GL_LINES && glp != GL_POINTS;
+        const uint32_t add = rangesIndexed ? R[0x173c >> 2] : 0;
+        size_t total = 0;
+        for (const Range& r : ranges) total += size_t(r.count) + 1;
+        idx.resize(prim == 8 ? total * 3 / 2 + 8 : total);
         static std::vector<uint32_t> seq;
-        seq.clear();
-        for (uint32_t k = 0; k < r.count; ++k) {
-            uint32_t v = rangesIndexed ? (i16 ? be16(ibase + 2 * (r.first + k)) : be32(ibase + 4 * (r.first + k))) : r.first + k;
-            if (rangesIndexed) v += R[0x173c >> 2];
-            if (restart && rangesIndexed && v == restartIdx) v = 0xffffffffu;
-            seq.push_back(v);
+        uint32_t* o = idx.data();
+        for (const Range& r : ranges) {
+            if (prim == 8) seq.resize(r.count);
+            uint32_t* d = prim == 8 ? seq.data() : o;
+            if (!rangesIndexed) for (uint32_t k = 0; k < r.count; ++k) d[k] = r.first + k;
+            else if (i16) {
+                const uint8_t* q = C.mem + ibase + 2 * size_t(r.first);
+                for (uint32_t k = 0; k < r.count; ++k) { uint16_t w; std::memcpy(&w, q + 2 * size_t(k), 2); d[k] = uint32_t(__builtin_bswap16(w)) + add; }
+            } else {
+                const uint8_t* q = C.mem + ibase + 4 * size_t(r.first);
+                for (uint32_t k = 0; k < r.count; ++k) { uint32_t w; std::memcpy(&w, q + 4 * size_t(k), 4); d[k] = __builtin_bswap32(w) + add; }
+            }
+            if (restart && rangesIndexed) for (uint32_t k = 0; k < r.count; ++k) d[k] = d[k] == restartIdx ? 0xffffffffu : d[k];
+            if (prim == 8) {   // quads -> triangles
+                for (size_t q = 0; q + 3 < seq.size(); q += 4) { o[0] = seq[q]; o[1] = seq[q + 1]; o[2] = seq[q + 2]; o[3] = seq[q]; o[4] = seq[q + 2]; o[5] = seq[q + 3]; o += 6; }
+            } else {
+                o += r.count;
+                if (&r != &ranges.back() && joinStrips) *o++ = 0xffffffffu;
+            }
         }
-        if (prim == 8) {   // quads -> triangles
-            for (size_t q = 0; q + 3 < seq.size(); q += 4) { push(seq[q]); push(seq[q + 1]); push(seq[q + 2]); push(seq[q]); push(seq[q + 2]); push(seq[q + 3]); }
-        } else {
-            for (uint32_t v : seq) push(v);
-            if (&r != &ranges.back() && gl_prim(prim) != GL_TRIANGLES && gl_prim(prim) != GL_LINES && gl_prim(prim) != GL_POINTS) push(0xffffffffu);
-        }
+        idx.resize(size_t(o - idx.data()));
+        uint32_t lo = 0xffffffffu, hi1 = 0;   // hi1 = highest index + 1 (the restart value wraps to 0 and drops out)
+        for (const uint32_t v : idx) { lo = std::min(lo, v); hi1 = std::max(hi1, v + 1); }
+        if (hi1 == 0) return;
+        vmin = lo; vmax = hi1 - 1;
     }
     if (vmin > vmax || idx.empty()) return;
     {   // RSXSKIPFMT=xxxx: skip draws whose position array has this format (debug); RSXONLYFMT: draw only those
@@ -1363,11 +1380,11 @@ static void do_draw() {
         if (vmap.size() < span) vmap.resize(span);
         for (uint32_t i = 0; i < nv; ++i) vmap[uniq[i] - vmin] = i;
         for (uint32_t& v : idx) if (v != 0xffffffffu) v = vmap[v - vmin];
-    } else
-        for (uint32_t& v : idx) if (v != 0xffffffffu) v -= vmin;
+    }
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.size() * 4, idx.data(), GL_STREAM_DRAW);
-    glDrawElements(gl_prim(prim), GLsizei(idx.size()), GL_UNSIGNED_INT, nullptr);
+    // not sparse: the buffers start at vertex vmin, the base vertex takes it off the indices (restart is tested before it)
+    glDrawElementsBaseVertex(gl_prim(prim), GLsizei(idx.size()), GL_UNSIGNED_INT, nullptr, sparse ? 0 : -GLint(vmin));
     mark();
     if (prof) {
         ++pfDraws; pfVerts += nv; pfIdx += idx.size();
