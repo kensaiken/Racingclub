@@ -1,5 +1,6 @@
 // PS3 system layer for the whole recompiled game: lv2 syscalls and system library imports, on host threads.
 #include "recomp/lv2.h"
+#include "recomp/settings.h"
 #include "recomp/rsx_gl.h"
 #include "recomp/spu_rt.h"
 #include "recomp/hle.h"
@@ -518,6 +519,8 @@ void fifo_thread() {
     }
 }
 
+// GAMEHZ=n: rate of the emulated vblank (experiment: the console has 60)
+const int g_gameHz = settings().gameHz;
 void vblank_thread() {
     t_tid = 0x01000201;
     // Pacing of the emulated 60 Hz vblank. When the display refreshes at a multiple of 60 the vblank follows the real
@@ -527,12 +530,12 @@ void vblank_thread() {
     {
         int hz = host_display_hz();
         const char* e = std::getenv("REFRESCO");
-        if (hz > 0 && hz % 60 != 0 && !(e && !std::strcmp(e, "0"))) {
+        if (hz > 0 && hz % g_gameHz != 0 && settings().refresh && !(e && !std::strcmp(e, "0"))) {
             const int want = e && std::atoi(e) > 0 ? std::atoi(e) : 120;
             if (host_set_refresh(want)) { LOG("[vblank] display switched from %d to %d Hz while the game runs\n", hz, want); hz = want; }
             else LOG("[vblank] the display has no %d Hz mode: staying at %d Hz\n", want, hz);
         }
-        if (hz > 0 && hz % 60 == 0 && !std::getenv("VBLANKTIMER")) perVblank = hz / 60;
+        if (hz > 0 && hz % g_gameHz == 0 && !std::getenv("VBLANKTIMER")) perVblank = hz / g_gameHz;
         LOG("[vblank] display %d Hz: vblank %s\n", hz, perVblank ? "follows the display refresh" : "on a 60 Hz timer");
     }
     auto next = std::chrono::steady_clock::now();
@@ -546,7 +549,7 @@ void vblank_thread() {
             // the refreshes must really be 60 Hz: most of every 240 vblanks have to be 16.67 ms apart (stalls excluded)
             static int good = 0, seen = 0;
             (void)odd;
-            if (dt > 15600 && dt < 17700) ++good;
+            if (dt * g_gameHz > 936000 && dt * g_gameHz < 1062000) ++good;
             if (++seen == 240) {
                 if (good < 160) { LOG("[vblank] only %d of 240 vblanks were 16.67 ms apart (display reports %d Hz): back to the 60 Hz timer\n", good, host_display_hz()); perVblank = 0; host_restore_refresh(); }
                 good = seen = 0;
@@ -554,7 +557,7 @@ void vblank_thread() {
             next = std::chrono::steady_clock::now();
         }
         if (!perVblank) {   // sleep most of the interval, yield through the last 2 ms (Windows sleeps are coarse)
-            next += std::chrono::microseconds(16667);
+            next += std::chrono::microseconds(1000000 / g_gameHz);
             std::this_thread::sleep_until(next - std::chrono::microseconds(2000));
             while (std::chrono::steady_clock::now() < next) std::this_thread::yield();
         }
@@ -1422,7 +1425,7 @@ bool imports(PPU& c, const char* module, const char* name) {
     if (n == "cellSysutilGetSystemParamInt") {
         const uint32_t id = a32(c, 0);
         int32_t v = 0;
-        if (id == 0x0111) v = 1;        // language: English
+        if (id == 0x0111) v = settings().language;   // system language (options menu)
         else if (id == 0x0112) v = 1;   // enter button: cross
         else if (id == 0x0114) v = 0;   // date format
         else if (id == 0x0116) v = 0;   // summer time

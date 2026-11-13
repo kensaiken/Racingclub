@@ -1,5 +1,6 @@
 // RSX -> OpenGL 4.5 renderer (see rsx_gl.h).
 #include "recomp/rsx_gl.h"
+#include "recomp/settings.h"
 #include "recomp/lv2.h"
 
 #include <SDL3/SDL.h>
@@ -17,6 +18,7 @@
 #include <unordered_map>
 #include <vector>
 
+namespace gti::recomp { bool host_menu_bitmap(const wchar_t* const* lines, int n, int sel, int w, int h, uint32_t* out); }   // host_win.cpp
 namespace gti::recomp::rsx {
 
 // ------------------------------------------------------------------ OpenGL loader (only what this file uses)
@@ -740,6 +742,7 @@ static bool bind_target() {
     const uint32_t clipX = R[0x200 >> 2] & 0xffff, clipY = R[0x204 >> 2] & 0xffff;
     uint32_t ax, ay;
     aa_factors(aa, ax, ay);
+    if (clipX + clipW == 1280 && clipY + clipH == 720) { const uint32_t sc = uint32_t(settings().scale); ax *= sc; ay *= sc; }   // internal resolution: the full-screen surfaces only
     const uint32_t w = (clipX + clipW) * ax, h = (clipY + clipH) * ay;
     if (!w || !h) return false;
     const uint32_t ct = R[0x220 >> 2];
@@ -1460,11 +1463,12 @@ static void init_gl() {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 5);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    win = SDL_CreateWindow("GTI Club (recompilado)", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    win = SDL_CreateWindow("GTI Club (F1: opciones)", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
     if (!win) { RLOG("[rsx] window: %s\n", SDL_GetError()); return; }
     glc = SDL_GL_CreateContext(win);
     if (!glc) { RLOG("[rsx] GL context: %s\n", SDL_GetError()); return; }
     SDL_GL_SetSwapInterval(0);
+    if (settings().fullscreen) SDL_SetWindowFullscreen(win, true);
 #define RSX_LOAD(ret, name, ...) name = reinterpret_cast<PFN_##name>(SDL_GL_GetProcAddress(#name)); if (!name) { RLOG("[rsx] missing GL function %s\n", #name); return; }
     RSX_GL(RSX_LOAD)
 #undef RSX_LOAD
@@ -1479,13 +1483,82 @@ static void init_gl() {
     glOk = true;
 }
 
+// ------------------------------------------------------------------ options menu (F1)
+static bool menuOpen = std::getenv("MENUTEST") != nullptr, menuDirty = true;   // MENUTEST=1 (debug): open from the start
+static int menuSel = 1;
+static const int kMenuLines = 9, kMenuFirst = 1, kMenuLast = 6;   // title, 6 options, 2 notes
+static void menu_change(int dir) {
+    Settings& s = settings();
+    switch (menuSel) {
+        case 1: s.fullscreen ^= 1; SDL_SetWindowFullscreen(win, s.fullscreen != 0); break;
+        case 2: s.scale = std::clamp(s.scale + dir, 1, 3); break;
+        case 3: s.gameHz = s.gameHz == 60 ? 120 : 60; break;
+        case 4: s.refresh ^= 1; break;
+        case 5: s.language = 1 + (s.language - 1 + dir + 5) % 5; break;
+        case 6: s.showFps ^= 1; if (!s.showFps) SDL_SetWindowTitle(win, "GTI Club"); break;
+    }
+    menuDirty = true;
+}
+static void draw_menu(int ww, int wh) {
+    static GLuint tex = 0, fbo = 0;
+    const int W = 880, H = 500;
+    if (!tex) {
+        glGenTextures(1, &tex); glGenFramebuffers(1, &fbo);
+        glActiveTexture(GL_TEXTURE0 + 15);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        menuDirty = true;
+    }
+    if (menuDirty) {
+        menuDirty = false;
+        const Settings& s = settings();
+        static const wchar_t* const res[3] = {L"1280 x 720 (original)", L"2560 x 1440", L"3840 x 2160"};
+        static const wchar_t* const lang[5] = {L"English", L"Français", L"Español", L"Deutsch", L"Italiano"};
+        wchar_t l[kMenuLines][96];
+        std::swprintf(l[0], 96, L"OPCIONES");
+        std::swprintf(l[1], 96, L"Pantalla completa\t‹ %ls ›", s.fullscreen ? L"Sí" : L"No");
+        std::swprintf(l[2], 96, L"Resolución interna\t‹ %ls ›", res[std::clamp(s.scale, 1, 3) - 1]);
+        std::swprintf(l[3], 96, L"Imágenes por segundo *\t‹ %ls ›", s.gameHz == 120 ? L"120 (experimental)" : L"60 (original)");
+        std::swprintf(l[4], 96, L"Pantalla a 120 Hz al jugar *\t‹ %ls ›", s.refresh ? L"Sí" : L"No");
+        std::swprintf(l[5], 96, L"Idioma del juego *\t‹ %ls ›", lang[std::clamp(s.language, 1, 5) - 1]);
+        std::swprintf(l[6], 96, L"Contador de FPS en el título\t‹ %ls ›", s.showFps ? L"Sí" : L"No");
+        std::swprintf(l[7], 96, L"* se aplica al reiniciar el juego");
+        std::swprintf(l[8], 96, L"Flechas: elegir y cambiar   ·   F1 o Esc: cerrar   ·   F11: pantalla completa");
+        const wchar_t* lines[kMenuLines];
+        for (int i = 0; i < kMenuLines; ++i) lines[i] = l[i];
+        static std::vector<uint32_t> px;
+        px.resize(size_t(W) * H);
+        if (!host_menu_bitmap(lines, kMenuLines, menuSel, W, H, px.data())) return;
+        glActiveTexture(GL_TEXTURE0 + 15);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glPixelStorei(0x0CF5 /* GL_UNPACK_ALIGNMENT */, 4);
+        glTexImage2D(GL_TEXTURE_2D, 0, 0x8058 /* GL_RGBA8 */, W, H, 0, 0x80E1 /* GL_BGRA */, GL_UNSIGNED_BYTE, px.data());
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    const int dh = std::min(wh * 7 / 10, H * 2), dw = dh * W / H, dx = (ww - dw) / 2, dy = (wh - dh) / 2;
+    glBlitFramebuffer(0, 0, W, H, dx, dy + dh, dx + dw, dy, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+}
+
 static SDL_Gamepad* pad = nullptr;
 static void pump_events() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) quitFlag = true;
         if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad) pad = SDL_OpenGamepad(e.gdevice.which);
+        if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
+            const SDL_Scancode sc = e.key.scancode;
+            if (sc == SDL_SCANCODE_F11 || (sc == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT))) { const int keep = menuSel; menuSel = 1; menu_change(0); menuSel = keep; settings_save(); }
+            else if (sc == SDL_SCANCODE_F1 || (menuOpen && sc == SDL_SCANCODE_ESCAPE)) { menuOpen = !menuOpen; menuDirty = true; if (!menuOpen) settings_save(); }
+            else if (menuOpen && sc == SDL_SCANCODE_UP) { menuSel = menuSel > kMenuFirst ? menuSel - 1 : kMenuLast; menuDirty = true; }
+            else if (menuOpen && sc == SDL_SCANCODE_DOWN) { menuSel = menuSel < kMenuLast ? menuSel + 1 : kMenuFirst; menuDirty = true; }
+            else if (menuOpen && sc == SDL_SCANCODE_LEFT) menu_change(-1);
+            else if (menuOpen && (sc == SDL_SCANCODE_RIGHT || sc == SDL_SCANCODE_RETURN || sc == SDL_SCANCODE_SPACE)) menu_change(1);
+        }
     }
+    if (menuOpen) { lv2_set_pad(PadState{}); return; }   // the game sees no input while the menu is open
     // input -> DualShock 3 state
     PadState s;
     const bool* k = SDL_GetKeyboardState(nullptr);
@@ -1570,8 +1643,10 @@ void flip(uint32_t id) {
         glBlitFramebuffer(0, 0, it->second.w, it->second.h, dx, dy + dh, dx + dw, dy, GL_COLOR_BUFFER_BIT, GL_LINEAR);
         static const int shotEvery = std::getenv("RSXSHOT") ? std::atoi(std::getenv("RSXSHOT")) : 0;
         if (shotEvery > 0 && frameNo % shotEvery == 0) {   // RSXSHOT=N: save every color surface every N frames
+            RLOG("[shot] frame %llu at %.2f s\n", (unsigned long long)frameNo, SDL_GetTicks() / 1000.0);
             for (auto& sf : surfaces) {
                 if (sf.second.depth) continue;
+                if (std::getenv("RSXSHOTD") && sf.first != uint64_t(d.offset)) continue;   // RSXSHOTD=1: the display buffer only
                 glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sf.second.tex, 0);
                 const int sw = int(sf.second.w), sh = int(sf.second.h);
                 std::vector<uint8_t> px(size_t(sw) * sh * 4);
@@ -1587,13 +1662,15 @@ void flip(uint32_t id) {
         static int warned = 0;
         if (warned++ < 5) RLOG("[rsx] flip %u: display buffer at 0x%x was never rendered\n", id, d.offset);
     }
+    if (menuOpen) draw_menu(ww, wh);
     SDL_GL_SwapWindow(win);
     pump_events();
     static uint64_t lastT = SDL_GetTicks(), lastF = 0;
     const uint64_t now = SDL_GetTicks();
+    if (now - lastT >= 2000 && !settings().showFps) { lastT = now; lastF = frameNo; }
     if (now - lastT >= 2000) {
         char title[160];
-        std::snprintf(title, sizeof title, "GTI Club (recompilado) - %.1f fps, %llu dibujos/cuadro, %zu programas", (frameNo - lastF) * 1000.0 / (now - lastT),
+        std::snprintf(title, sizeof title, "GTI Club - %.1f fps (F1: opciones)", (frameNo - lastF) * 1000.0 / (now - lastT),
                       (unsigned long long)drawsThisFrame, programs.size());
         SDL_SetWindowTitle(win, title);
         lastT = now; lastF = frameNo;
