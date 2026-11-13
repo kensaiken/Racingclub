@@ -1483,8 +1483,8 @@ void port_thread() {
         // clock is nudged to keep about 6 blocks queued, which also follows the sound card's real rate.
         next += std::chrono::nanoseconds(5333333);
         {
-            const int q = play ? audio_out_queued() : 6 * 256;
-            if (q > 9 * 256) next += std::chrono::microseconds(300); else if (q < 3 * 256) next -= std::chrono::microseconds(300);
+            const int q = play ? audio_out_queued() : 12 * 256;
+            if (q > 16 * 256) next += std::chrono::microseconds(300); else if (q < 10 * 256) next -= std::chrono::microseconds(300);   // about 70 ms queued: room for a late mixer pass when another program (OBS) takes CPU time
             auto now = std::chrono::steady_clock::now();
             if (next < now - std::chrono::milliseconds(50)) next = now;   // stalled (debugger, suspend): do not catch up in a burst
             if (next - now > std::chrono::microseconds(1500)) std::this_thread::sleep_for(next - now - std::chrono::microseconds(1500));
@@ -1496,7 +1496,7 @@ void port_thread() {
         // marked (a NaN pattern in their first sample), so an unwritten one is recognisable: wait a little for it
         // instead of playing a hole; the SDL queue covers the wait.
         if (be32(g_port + idx * 256 * g_ch * 4) == kUnwritten) {
-            const auto limit = std::chrono::steady_clock::now() + std::chrono::milliseconds(8);
+            const auto limit = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
             while (be32(g_port + idx * 256 * g_ch * 4) == kUnwritten && std::chrono::steady_clock::now() < limit) std::this_thread::yield();
             if (be32(g_port + idx * 256 * g_ch * 4) == kUnwritten) ++g_holes; else ++g_waited;
             next = std::chrono::steady_clock::now();
