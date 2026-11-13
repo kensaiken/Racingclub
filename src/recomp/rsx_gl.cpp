@@ -106,6 +106,8 @@ static uint32_t prim = 0;
 struct Display { uint32_t offset = 0, pitch = 0, w = 0, h = 0; } displays[8];
 
 static SDL_Window* win = nullptr;
+static void set_display_mode(int mode);
+static int g_lastFull = 1;   // the full-screen mode F11 goes back to
 static SDL_GLContext glc = nullptr;
 static bool glOk = false, initTried = false;
 static std::atomic<bool> quitFlag{false};
@@ -1474,7 +1476,7 @@ static void init_gl() {
     glc = SDL_GL_CreateContext(win);
     if (!glc) { RLOG("[rsx] GL context: %s\n", SDL_GetError()); return; }
     SDL_GL_SetSwapInterval(settings().vsync);
-    if (settings().fullscreen) SDL_SetWindowFullscreen(win, true);
+    if (settings().fullscreen) set_display_mode(settings().fullscreen);
 #define RSX_LOAD(ret, name, ...) name = reinterpret_cast<PFN_##name>(SDL_GL_GetProcAddress(#name)); if (!name) { RLOG("[rsx] missing GL function %s\n", #name); return; }
     RSX_GL(RSX_LOAD)
 #undef RSX_LOAD
@@ -1489,6 +1491,30 @@ static void init_gl() {
     glOk = true;
 }
 
+// Display mode: 0 window, 1 borderless window covering the monitor, 2 full screen.
+// Full screen (SDL's desktop full screen) lets the NVIDIA OpenGL driver show the image directly ("independent flip"):
+// lowest latency, but the desktop compositor never sees it, so screen capture (OBS) records black. The borderless
+// mode covers the monitor plus one row, which keeps the window composed: it looks the same and can be captured.
+static void set_display_mode(int mode) {
+    static int sx = 0, sy = 0, sw = 1280, sh = 720;
+    static int cur = 0;
+    if (cur == 0 && mode != 0) { SDL_GetWindowPosition(win, &sx, &sy); SDL_GetWindowSize(win, &sw, &sh); }
+    if (cur == 2) SDL_SetWindowFullscreen(win, false);
+    if (cur != 0) { SDL_SetWindowBordered(win, true); SDL_SetWindowSize(win, sw, sh); SDL_SetWindowPosition(win, sx, sy); }
+    if (mode == 1) {
+        SDL_Rect r{};
+        if (SDL_GetDisplayBounds(SDL_GetDisplayForWindow(win), &r)) {
+            SDL_SetWindowBordered(win, false);
+            SDL_SetWindowPosition(win, r.x, r.y);
+            SDL_SetWindowSize(win, r.w, r.h + 1);
+        }
+    } else if (mode == 2) {
+        SDL_SetWindowFullscreen(win, true);
+    }
+    if (mode != 0) SDL_RaiseWindow(win);
+    if (mode != 0 && std::getenv("FSTOP")) SDL_SetWindowAlwaysOnTop(win, true);   // debug: tests started from a background process
+    cur = mode;
+}
 // ------------------------------------------------------------------ options menu (F1)
 static bool menuOpen = std::getenv("MENUTEST") != nullptr, menuDirty = true;   // MENUTEST=1 (debug): open from the start
 static int menuSel = 1;
@@ -1496,7 +1522,7 @@ static const int kMenuLines = 11, kMenuFirst = 1, kMenuLast = 8;   // title, 8 o
 static void menu_change(int dir) {
     Settings& s = settings();
     switch (menuSel) {
-        case 1: s.fullscreen ^= 1; SDL_SetWindowFullscreen(win, s.fullscreen != 0); break;
+        case 1: s.fullscreen = (s.fullscreen + (dir ? dir : 1) + 3) % 3; if (s.fullscreen) g_lastFull = s.fullscreen; set_display_mode(s.fullscreen); break;
         case 2: s.scale = std::clamp(s.scale + dir, 1, 3); break;
         case 3: { static const int r[4] = {60, 72, 120, 144}; int i = 0; while (i < 3 && r[i] != s.gameHz) ++i; s.gameHz = r[(i + dir + 4) % 4]; break; }
         case 4: s.refresh ^= 1; break;
@@ -1525,7 +1551,7 @@ static void draw_menu(int ww, int wh) {
         static const wchar_t* const lang[5] = {L"English", L"Français", L"Español", L"Deutsch", L"Italiano"};
         wchar_t l[kMenuLines][96];
         std::swprintf(l[0], 96, L"OPCIONES");
-        std::swprintf(l[1], 96, L"Pantalla completa\t‹ %ls ›", s.fullscreen ? L"Sí" : L"No");
+        std::swprintf(l[1], 96, L"Modo de pantalla\t‹ %ls ›", s.fullscreen == 0 ? L"Ventana" : s.fullscreen == 1 ? L"Ventana sin bordes" : L"Pantalla completa");
         std::swprintf(l[2], 96, L"Resolución interna\t‹ %ls ›", res[std::clamp(s.scale, 1, 3) - 1]);
         std::swprintf(l[3], 96, L"Imágenes por segundo *\t‹ %ls ›", s.gameHz == 60 ? L"60 (original)" : s.gameHz == 72 ? L"72 (ideal en 144 Hz)" : s.gameHz == 120 ? L"120 (experimental)" : L"144 (experimental)");
         std::swprintf(l[4], 96, L"Adaptar la pantalla al juego *\t‹ %ls ›", s.refresh ? L"Sí" : L"No");
@@ -1534,7 +1560,7 @@ static void draw_menu(int ww, int wh) {
         std::swprintf(l[7], 96, L"V-Sync\t‹ %ls ›", s.vsync ? L"Sí" : L"No");
         std::swprintf(l[8], 96, L"Sonido *\t‹ %ls ›", s.sound ? L"Sí" : L"No");
         std::swprintf(l[9], 96, L"* se aplica al reiniciar el juego");
-        std::swprintf(l[10], 96, L"Flechas: elegir y cambiar   ·   F1 o Esc: cerrar   ·   F11: pantalla completa");
+        std::swprintf(l[10], 96, L"Flechas: elegir y cambiar   ·   F1 o Esc: cerrar   ·   F11: ventana / pantalla completa");
         const wchar_t* lines[kMenuLines];
         for (int i = 0; i < kMenuLines; ++i) lines[i] = l[i];
         static std::vector<uint32_t> px;
@@ -1560,7 +1586,7 @@ static void pump_events() {
         if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad) pad = SDL_OpenGamepad(e.gdevice.which);
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
             const SDL_Scancode sc = e.key.scancode;
-            if (sc == SDL_SCANCODE_F11 || (sc == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT))) { const int keep = menuSel; menuSel = 1; menu_change(0); menuSel = keep; settings_save(); }
+            if (sc == SDL_SCANCODE_F11 || (sc == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT))) { Settings& st = settings(); if (st.fullscreen) { g_lastFull = st.fullscreen; st.fullscreen = 0; } else st.fullscreen = g_lastFull; set_display_mode(st.fullscreen); menuDirty = true; settings_save(); }
             else if (sc == SDL_SCANCODE_F1 || (menuOpen && sc == SDL_SCANCODE_ESCAPE)) { menuOpen = !menuOpen; menuDirty = true; if (!menuOpen) settings_save(); }
             else if (menuOpen && sc == SDL_SCANCODE_UP) { menuSel = menuSel > kMenuFirst ? menuSel - 1 : kMenuLast; menuDirty = true; }
             else if (menuOpen && sc == SDL_SCANCODE_DOWN) { menuSel = menuSel < kMenuLast ? menuSel + 1 : kMenuFirst; menuDirty = true; }

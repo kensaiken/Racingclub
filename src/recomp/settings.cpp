@@ -10,7 +10,7 @@ namespace {
 const char* const kFile = "gtiport.ini";
 struct Field { const char* name; int Settings::* p; int lo, hi; };
 const Field kFields[] = {
-    {"pantalla_completa", &Settings::fullscreen, 0, 1}, {"resolucion_interna", &Settings::scale, 1, 3}, {"imagenes_por_segundo", &Settings::gameHz, 60, 144},
+    {"pantalla_completa", &Settings::fullscreen, 0, 2}, {"resolucion_interna", &Settings::scale, 1, 3}, {"imagenes_por_segundo", &Settings::gameHz, 60, 144},
     {"pantalla_120hz", &Settings::refresh, 0, 1},        {"idioma", &Settings::language, 1, 5},          {"contador_fps", &Settings::showFps, 0, 1},
     {"vsync", &Settings::vsync, 0, 1},
     {"sonido", &Settings::sound, 0, 1},

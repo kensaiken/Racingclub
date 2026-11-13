@@ -3,7 +3,7 @@
 // options menu (F1). Environment variables used by the test scripts still override them where noted.
 namespace gti::recomp {
 struct Settings {
-    int fullscreen = 0;   // borderless full screen
+    int fullscreen = 0;   // 0 window, 1 borderless window covering the monitor (capturable), 2 full screen
     int scale = 1;        // internal resolution: multiples of the console's 1280x720
     int gameHz = 60;      // emulated vblank rate (the console has 60; 72, 120 and 144 are experimental); GAMEHZ overrides
     int refresh = 1;      // 1 = switch a display that is not a multiple of the game rate (144 Hz) to 120 Hz while playing
