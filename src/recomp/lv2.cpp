@@ -31,7 +31,9 @@ Guest* G = nullptr;
 Lv2Config CFG;
 std::mutex g_log;
 
-#define LOG(...) do { std::lock_guard<std::mutex> lk_(g_log); std::fprintf(stderr, __VA_ARGS__); } while (0)
+const bool g_logTime = std::getenv("LOGTIME") != nullptr;   // LOGTIME=1: every log line starts with the seconds since launch
+double log_seconds();
+#define LOG(...) do { std::lock_guard<std::mutex> lk_(g_log); if (g_logTime) std::fprintf(stderr, "%8.3f ", log_seconds()); std::fprintf(stderr, __VA_ARGS__); } while (0)
 
 // ------------------------------------------------------------------ guest memory allocation
 std::mutex g_memMx;
@@ -162,6 +164,7 @@ bool mwait(HostMutex& m, std::condition_variable_any& cv, uint64_t timeoutUs) {
 // ------------------------------------------------------------------ time
 const auto g_t0 = std::chrono::steady_clock::now();
 uint64_t now_us() { return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - g_t0).count()) + 1000000; }
+double log_seconds() { return double(now_us() - 1000000) / 1e6; }
 
 // ------------------------------------------------------------------ files
 std::string cstr(PPU& c, uint32_t a) { return a ? std::string(reinterpret_cast<const char*>(c.mem + a)) : std::string(); }

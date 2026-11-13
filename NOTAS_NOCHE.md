@@ -441,3 +441,5 @@ El juego necesita que la FIFO llegue a la espera de vblank menos de ~15,8 ms des
 - **Caché de programas GL en disco** (`glcache/`, `RSXNOGLCACHE=1` la desactiva): binarios enlazados con `glGetProgramBinary`.
 - Cronología típica de un cuadro pesado ahora: el juego publica el final a +10 ms del flip y la FIFO llega a la espera a +12-14 ms.
 - **Pendiente:** parones en las transiciones (100-330 ms, idénticos con la caché de shaders fría y caliente, no ocurren en el hilo de la RSX: son del lado PPU); unos segundos a 30 fps al entrar en la parrilla.
+- **Superficies por dirección y tamaño:** el juego usa la misma dirección para el búfer de profundidad de las caras del cubemap (256×256) y el de la escena (2560×720). `get_surface` destruía y creaba la textura (y todos los FBO) varias veces por cuadro; ahora aparca la textura de cada tamaño y la recupera. De miles de creaciones por ejecución a 49. Con esto desaparece el tramo a 30 fps de la parrilla.
+- `LOGTIME=1` antepone los segundos desde el arranque a cada línea; `[hitch]` marca cada hueco de más de 60 ms entre flips.

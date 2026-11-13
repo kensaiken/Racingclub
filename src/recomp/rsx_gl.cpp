@@ -696,7 +696,16 @@ static Surface& get_surface(uint32_t loc, uint32_t off, uint32_t w, uint32_t h, 
     const uint64_t key = (uint64_t(loc) << 33) | (uint64_t(depth) << 32) | off;
     Surface& s = surfaces[key];
     if (!s.tex || s.w != w || s.h != h || s.fmt != fmt) {
-        if (s.tex) glDeleteTextures(1, &s.tex);
+        // The game reuses an address with different sizes within a frame (the depth buffer of the 256x256 cube
+        // faces and of the 2560x720 scene share one): the texture of each size is kept and comes back, instead of
+        // being destroyed and created again several times per frame.
+        struct Parked { uint64_t key; uint32_t w, h, fmt; GLuint tex; };
+        static std::vector<Parked> parked;
+        if (s.tex) parked.push_back({key, s.w, s.h, s.fmt, s.tex});
+        s.tex = 0;
+        for (size_t k = 0; k < parked.size(); ++k)
+            if (parked[k].key == key && parked[k].w == w && parked[k].h == h && parked[k].fmt == fmt) { s.tex = parked[k].tex; parked.erase(parked.begin() + k); break; }
+        if (s.tex) { s.w = w; s.h = h; s.fmt = fmt; s.depth = depth; s.lastUse = frameNo; return s; }
         glGenTextures(1, &s.tex);
         glBindTexture(GL_TEXTURE_2D, s.tex);
         if (depth) {
@@ -711,9 +720,6 @@ static Surface& get_surface(uint32_t loc, uint32_t off, uint32_t w, uint32_t h, 
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
         s.w = w; s.h = h; s.fmt = fmt; s.depth = depth;
-        // fbos referencing the old texture are stale
-        for (auto& f : fbos) glDeleteFramebuffers(1, &f.second);
-        fbos.clear();
         RLOG("[rsx] surface %s at %s 0x%x: %ux%u format %u\n", depth ? "depth" : "color", loc ? "main" : "local", off, w, h, fmt);
     }
     s.lastUse = frameNo;
@@ -1498,6 +1504,7 @@ void flip(uint32_t id) {
         static uint64_t lastFlip = 0, worst = 0, since = 0; static int over = 0;
         const uint64_t t = SDL_GetPerformanceCounter(), fq = SDL_GetPerformanceFrequency();
         if (lastFlip) { const uint64_t d = t - lastFlip; worst = std::max(worst, d); if (d * 1000 > fq * 25) ++over; }
+        if (lastFlip && (t - lastFlip) * 1000 > fq * 60) RLOG("[hitch] %.0f ms without a flip, ending %.2f s after launch\n", (t - lastFlip) * 1000.0 / fq, SDL_GetTicks() / 1000.0);
         lastFlip = t;
         if (t - since > 2 * fq) {
             if (since) RLOG("[pace] worst frame %.0f ms, %d frames over 25 ms\n", worst * 1000.0 / fq, over);
