@@ -696,10 +696,14 @@ static void surface_gl_format(uint32_t fmt, GLenum& ifmt, GLenum& f, GLenum& ty)
     }
 }
 
+// Bumped whenever texture bindings made by bind_texture() may be stale: a surface (render target) appears or
+// changes, a texture is created, re-uploaded or deleted, or other code binds textures (menu, cube copies).
+static uint64_t g_texGen = 1;
 static Surface& get_surface(uint32_t loc, uint32_t off, uint32_t w, uint32_t h, uint32_t fmt, bool depth) {
     const uint64_t key = (uint64_t(loc) << 33) | (uint64_t(depth) << 32) | off;
     Surface& s = surfaces[key];
     if (!s.tex || s.w != w || s.h != h || s.fmt != fmt) {
+        ++g_texGen;
         // The game reuses an address with different sizes within a frame (the depth buffer of the 256x256 cube
         // faces and of the 2560x720 scene share one): the texture of each size is kept and comes back, instead of
         // being destroyed and created again several times per frame.
@@ -895,7 +899,30 @@ static void apply_border_color(GLenum target, uint32_t base) {
     glTexParameterfv(target, GL_TEXTURE_BORDER_COLOR, c);
 }
 
+static bool g_bindMemoOk = false;   // set by bind_texture_impl when the binding is a plain cached texture
+static void bind_texture_impl(int i, float* tsc);
+// Per texture unit: the registers of its last binding. A draw that samples the same texture as the previous draw
+// on that unit (most of them: >60000 draws per second) then costs nothing; the content check still runs every
+// few frames because the memo expires.
 static void bind_texture(int i, float* tsc) {
+    struct Memo { uint32_t regs[9]; uint64_t gen = 0, frame = 0; float tsc[4]; bool valid = false; };
+    static Memo memo[16];
+    static const bool off = std::getenv("RSXNOTEXMEMO") != nullptr;
+    const uint32_t base = i < 8 ? 0x1a00 + 0x20 * i : 0x1b00 + 0x20 * (i - 8);
+    uint32_t regs[9];
+    for (int k = 0; k < 8; ++k) regs[k] = R[(base >> 2) + k];
+    regs[8] = R[(0x1840 + 4 * i) >> 2];
+    Memo& m = memo[i];
+    if (!off && m.valid && m.gen == g_texGen && frameNo - m.frame < 4 && !std::memcmp(m.regs, regs, sizeof regs)) {
+        std::memcpy(tsc, m.tsc, sizeof m.tsc);
+        return;
+    }
+    g_bindMemoOk = false;
+    bind_texture_impl(i, tsc);
+    m.valid = g_bindMemoOk;
+    if (m.valid) { std::memcpy(m.regs, regs, sizeof regs); m.gen = g_texGen; m.frame = frameNo; std::memcpy(m.tsc, tsc, sizeof m.tsc); }
+}
+static void bind_texture_impl(int i, float* tsc) {
     const uint32_t base = i < 8 ? 0x1a00 + 0x20 * i : 0x1b00 + 0x20 * (i - 8);
     const uint32_t off = R[base >> 2], fmtReg = R[(base + 4) >> 2], addr = R[(base + 8) >> 2], ctl0 = R[(base + 0xc) >> 2];
     const uint32_t remap = R[(base + 0x10) >> 2], filt = R[(base + 0x14) >> 2], rect = R[(base + 0x18) >> 2];
@@ -940,6 +967,7 @@ static void bind_texture(int i, float* tsc) {
             static GLuint copyFbo = 0;
             RenderedCube& rc = rcubes[key0];
             if (!rc.id || rc.w != w || rc.h != h) {
+                ++g_texGen;
                 if (rc.id) glDeleteTextures(1, &rc.id);
                 glGenTextures(1, &rc.id);
                 glBindTexture(GL_TEXTURE_CUBE_MAP, rc.id);
@@ -992,9 +1020,12 @@ static void bind_texture(int i, float* tsc) {
     // signature: format registers + sampled content (the content is sampled once per frame and texture)
     const uint64_t key = (uint64_t(loc) << 32 | off) ^ (uint64_t(cube) << 63);
     Tex& tx = texCache[key];
+    g_bindMemoOk = true;
     const uint64_t regSig = fnv(&fmtReg, 4) ^ (uint64_t(rect) << 20) ^ (uint64_t(pitch) << 3) ^ remap * 0x100000001b3ull;
     uint64_t sig = tx.sig;
-    if (!tx.id || tx.checked != frameNo || tx.regSig != regSig) {
+    // The content is re-sampled every 4th frame only (and whenever the registers change): textures are rarely
+    // rewritten in place (render targets are handled apart), and this sampling was a third of the RSX thread.
+    if (!tx.id || tx.regSig != regSig || frameNo - tx.checked >= 4 || tx.checked > frameNo) {
         sig = regSig;
         const uint32_t step = std::max<uint32_t>(64, total / 512);
         for (uint32_t k = 0; k + 8 <= total; k += step) sig = fnv(C.mem + ea + k, 8, sig);
@@ -1003,6 +1034,7 @@ static void bind_texture(int i, float* tsc) {
     }
     const GLenum target = cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
     if (!tx.id || tx.sig != sig || tx.target != target) {
+        ++g_texGen;
         if (tx.id && tx.target != target) { glDeleteTextures(1, &tx.id); tx.id = 0; }
         if (!tx.id) glGenTextures(1, &tx.id);
         tx.target = target;
@@ -1538,7 +1570,7 @@ static void draw_menu(int ww, int wh) {
     const int W = 880, H = 600;
     if (!tex) {
         glGenTextures(1, &tex); glGenFramebuffers(1, &fbo);
-        glActiveTexture(GL_TEXTURE0 + 15);
+        glActiveTexture(GL_TEXTURE0 + 15); ++g_texGen;
         glBindTexture(GL_TEXTURE_2D, tex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -1566,7 +1598,7 @@ static void draw_menu(int ww, int wh) {
         static std::vector<uint32_t> px;
         px.resize(size_t(W) * H);
         if (!host_menu_bitmap(lines, kMenuLines, menuSel, W, H, px.data())) return;
-        glActiveTexture(GL_TEXTURE0 + 15);
+        glActiveTexture(GL_TEXTURE0 + 15); ++g_texGen;
         glBindTexture(GL_TEXTURE_2D, tex);
         glPixelStorei(0x0CF5 /* GL_UNPACK_ALIGNMENT */, 4);
         glTexImage2D(GL_TEXTURE_2D, 0, 0x8058 /* GL_RGBA8 */, W, H, 0, 0x80E1 /* GL_BGRA */, GL_UNSIGNED_BYTE, px.data());
