@@ -1486,7 +1486,7 @@ static void init_gl() {
 // ------------------------------------------------------------------ options menu (F1)
 static bool menuOpen = std::getenv("MENUTEST") != nullptr, menuDirty = true;   // MENUTEST=1 (debug): open from the start
 static int menuSel = 1;
-static const int kMenuLines = 10, kMenuFirst = 1, kMenuLast = 7;   // title, 7 options, 2 notes
+static const int kMenuLines = 11, kMenuFirst = 1, kMenuLast = 8;   // title, 8 options, 2 notes
 static void menu_change(int dir) {
     Settings& s = settings();
     switch (menuSel) {
@@ -1497,12 +1497,13 @@ static void menu_change(int dir) {
         case 5: s.language = 1 + (s.language - 1 + dir + 5) % 5; break;
         case 6: s.showFps ^= 1; if (!s.showFps) SDL_SetWindowTitle(win, "GTI Club"); break;
         case 7: s.vsync ^= 1; SDL_GL_SetSwapInterval(s.vsync); break;
+        case 8: s.sound ^= 1; break;
     }
     menuDirty = true;
 }
 static void draw_menu(int ww, int wh) {
     static GLuint tex = 0, fbo = 0;
-    const int W = 880, H = 550;
+    const int W = 880, H = 600;
     if (!tex) {
         glGenTextures(1, &tex); glGenFramebuffers(1, &fbo);
         glActiveTexture(GL_TEXTURE0 + 15);
@@ -1525,8 +1526,9 @@ static void draw_menu(int ww, int wh) {
         std::swprintf(l[5], 96, L"Idioma del juego *\t‹ %ls ›", lang[std::clamp(s.language, 1, 5) - 1]);
         std::swprintf(l[6], 96, L"Contador de FPS en el título\t‹ %ls ›", s.showFps ? L"Sí" : L"No");
         std::swprintf(l[7], 96, L"V-Sync\t‹ %ls ›", s.vsync ? L"Sí" : L"No");
-        std::swprintf(l[8], 96, L"* se aplica al reiniciar el juego");
-        std::swprintf(l[9], 96, L"Flechas: elegir y cambiar   ·   F1 o Esc: cerrar   ·   F11: pantalla completa");
+        std::swprintf(l[8], 96, L"Sonido *\t‹ %ls ›", s.sound ? L"Sí" : L"No");
+        std::swprintf(l[9], 96, L"* se aplica al reiniciar el juego");
+        std::swprintf(l[10], 96, L"Flechas: elegir y cambiar   ·   F1 o Esc: cerrar   ·   F11: pantalla completa");
         const wchar_t* lines[kMenuLines];
         for (int i = 0; i < kMenuLines; ++i) lines[i] = l[i];
         static std::vector<uint32_t> px;

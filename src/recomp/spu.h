@@ -47,6 +47,8 @@ public:
     std::function<bool(Spu&, uint32_t target)> onBranch;               // called for branches below `hookBelow`
     uint32_t hookBelow = 0;
 
+    uint32_t* interpHist = nullptr;   // debug: interpreted instructions per 256 bytes of local store (1024 counters)
+    int mfcTrace = 0;         // debug: log this many MFC commands
     bool running = false;
     uint64_t steps = 0, interpSteps = 0, compiledCalls = 0;
     uint32_t badInstr = 0;     // first undecoded instruction word (0 = none)
@@ -54,6 +56,8 @@ public:
     // statically recompiled program (tools/spu2cpp.py) covering LS [compiledLo, compiledHi): run() enters it
     void (*compiled)(Spu&) = nullptr;
     uint32_t compiledLo = 0, compiledHi = 0;
+    void (*compiled2)(Spu&) = nullptr;   // a second recompiled region (a module the program loads)
+    uint32_t compiled2Lo = 0, compiled2Hi = 0;
 
     bool readChPub(uint32_t ch, uint32_t& v) { return readCh(ch, v); }
     bool writeChPub(uint32_t ch, uint32_t v) { return writeCh(ch, v); }

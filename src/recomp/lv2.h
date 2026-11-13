@@ -24,6 +24,9 @@ void lv2_set_pad(const PadState& s);   // live input from the host (overrides th
 
 void lv2_install(Guest& g, const Lv2Config& cfg);   // also installs the import stubs (hle_install)
 void lv2_dump_waits();   // what every guest thread is blocked in (debug)
+bool audio_out_open();   // audio_out.cpp: 48 kHz stereo float output
+int audio_out_queued();
+void audio_out_push(const float* stereo, int frames);
 int lv2_run_main(Guest& g);                          // boots the game at the ELF entry; returns exit code
 
 } // namespace gti::recomp

@@ -42,6 +42,7 @@ void put_backwards(uint8_t* dst, const uint8_t* src, uint32_t n) {
 void Spu::mfcCommand(uint32_t cmd) {
     const uint32_t lsa = mfcLsa & (LS_SIZE - 1), size = mfcSize;
     const uint32_t ea = mfcEal;
+    if (mfcTrace > 0) { --mfcTrace; std::fprintf(stderr, "[mfc] cmd %02x ls %05x ea %08x size %x tag %u (pc %05x)\n", cmd, lsa, ea, size, mfcTag, pc); }
     switch (cmd & 0xFF) {
         case 0x40: case 0x41: case 0x42:   // GET(B/F)
             if (size) std::memcpy(ls + lsa, mem + ea, std::min(size, LS_SIZE - lsa));
@@ -125,7 +126,11 @@ void Spu::run(uint64_t maxSteps) {
         if (compiled && pc >= compiledLo && pc < compiledHi) {
             const uint32_t before = pc;
             ++compiledCalls; compiled(*this);
-            if (pc != before) continue;   // otherwise the interpreter executes the instruction the program left at
+            if (pc != before) { if (pc < hookBelow && onBranch && !onBranch(*this, pc)) break; continue; }   // otherwise the interpreter executes the instruction the program left at
+        } else if (compiled2 && pc >= compiled2Lo && pc < compiled2Hi) {
+            const uint32_t before = pc;
+            ++compiledCalls; compiled2(*this);
+            if (pc != before) { if (pc < hookBelow && onBranch && !onBranch(*this, pc)) break; continue; }
         }
         if (!step()) break;
     }
@@ -142,6 +147,7 @@ bool Spu::step() {
     const uint32_t w = lsw(pc);
     uint32_t npc = (pc + 4) & (LS_SIZE - 1);
     ++steps; ++interpSteps;
+    if (interpHist) ++interpHist[pc >> 8];
     const int rt = w & 0x7f, ra = (w >> 7) & 0x7f, rb = (w >> 14) & 0x7f;
     SpuReg& T = r[rt];
     const SpuReg& A = r[ra];

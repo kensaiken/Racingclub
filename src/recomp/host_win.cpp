@@ -72,6 +72,8 @@ bool host_wait_refresh() {
     if (D3DKMTWaitForVerticalBlankEvent(&w) != 0) { state = -1; return false; }
     return true;
 }
+// time-critical work (sound mixing): the calling thread goes ahead of the normal ones
+void host_thread_priority_high() { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST); }
 // Draws the options panel with GDI: n lines of "label<TAB>value" text (line 0 is the title, `sel` is highlighted,
 // lines without a tab are notes) into w x h top-down BGRA pixels.
 bool host_menu_bitmap(const wchar_t* const* lines, int n, int sel, int w, int h, uint32_t* out) {
@@ -116,5 +118,6 @@ bool host_set_refresh(int) { return false; }
 void host_restore_refresh() {}
 bool host_wait_refresh() { return false; }
 bool host_menu_bitmap(const wchar_t* const*, int, int, int, int, uint32_t*) { return false; }
+void host_thread_priority_high() {}
 }
 #endif

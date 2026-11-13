@@ -5,7 +5,9 @@
 #include "recomp/spu_rt.h"
 #include "recomp/hle.h"
 #include "recomp/spu.h"
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -21,7 +23,7 @@
 #include <thread>
 #include <vector>
 
-namespace gti::recomp { void ripprof_register_thread(const char* name); int host_display_hz(); bool host_set_refresh(int hz); void host_restore_refresh(); bool host_wait_refresh(); }   // ripprof.cpp, host_win.cpp   // ripprof.cpp
+namespace gti::recomp { void ripprof_register_thread(const char* name); void host_thread_priority_high(); int host_display_hz(); bool host_set_refresh(int hz); void host_restore_refresh(); bool host_wait_refresh(); }   // ripprof.cpp, host_win.cpp   // ripprof.cpp
 namespace gti::recomp {
 
 extern uint64_t g_missLr;
@@ -176,6 +178,7 @@ std::string host_path(const std::string& p) {
     if (starts("/app_home/")) rest = CFG.usrdir + "/" + p.substr(10);
     else if (starts("/dev_hdd0/game/NPEB00060/USRDIR/")) rest = CFG.usrdir + "/" + p.substr(32);
     else if (starts("/dev_hdd0/")) rest = CFG.hdd0 + "/" + p.substr(10);
+    else if (starts("/dev_flash/")) rest = "dev_flash/" + p.substr(11);   // optional PS3 system files (flashATRAC.pic: the music decoder) next to the executable
     else if (starts("/dev_bdvd/PS3_GAME/USRDIR/")) rest = CFG.usrdir + "/" + p.substr(26);
     else rest = CFG.hdd0 + "/misc" + p;
     return rest;
@@ -1332,6 +1335,207 @@ struct WaitSlot { char what[40] = ""; uint32_t lr = 0, tid = 0; std::atomic<uint
 std::mutex g_waitMx;
 std::vector<WaitSlot*> g_waitSlots;
 thread_local WaitSlot* t_waitSlot = nullptr;
+// ------------------------------------------------------------------ sound: cellAudio port + SPURS tasks on the host
+// The game mixes with MultiStream: a SPURS task (SPU program) that the 'MultiStream PPU Thread' signals for every
+// block, and whose output that thread copies into the cellAudio port ring. Here every such task gets its own SPU
+// (interpreter) on a host thread, and a host thread plays the ring through SDL and advances its read index.
+namespace snd {
+struct Task {
+    Spu spu;
+    std::mutex m; std::condition_variable cv;
+    bool signalled = false;
+    uint32_t taskset = 0, id = 0;
+};
+std::mutex g_tm;
+std::atomic<uint64_t> g_signals{0}, g_passes{0};
+std::atomic<uint64_t> g_waits{0}, g_busySum{0}, g_busyMax{0}, g_wake{0}, g_slow{0};   // mixer pass statistics
+std::vector<Task*> g_tasks;
+uint32_t be32(uint32_t a) { uint32_t x; std::memcpy(&x, G->mem + a, 4); return __builtin_bswap32(x); }
+void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, uint32_t spurs) {
+    ripprof_register_thread("sndtask");
+    if (!std::getenv("SNDNOPRIO")) host_thread_priority_high();
+    Spu& s = t->spu;
+    s.mem = G->mem; s.reset();
+    std::memset(s.ls, 0, sizeof s.ls);
+    const uint32_t phoff = be32(elf + 0x1c), phnum = be32(elf + 0x2c) >> 16, entry = be32(elf + 0x18);
+    for (uint32_t k = 0; k < phnum; ++k) {
+        const uint32_t ph = elf + phoff + 32 * k;
+        if (be32(ph) != 1) continue;
+        const uint32_t off = be32(ph + 4), va = be32(ph + 8), fsz = be32(ph + 16);
+        if (va + fsz <= Spu::LS_SIZE) std::memcpy(s.ls + va, G->mem + elf + off, fsz);
+    }
+    s.lssw(0x1C4, spurs); s.lssw(0x1C8, 0); s.lssw(0x1CC, 0x1f);
+    s.lssw(0x2FB8, 0x2700);   // SPURS task library: pointer to the taskset context (system call entry at +0xC4)
+    s.lssw(0x27BC, t->taskset); s.lssw(0x27C4, 0xA70); s.lssw(0x27CC, 0); s.lssw(0x27D0, 0x1f); s.lssw(0x27D4, t->id);
+    s.r[1].sw(0, 0x3FFB0);
+    s.r[3].sd(0, a0); s.r[3].sd(1, a1);
+    s.r[4].sd(0, tsArgs); s.r[4].sd(1, spurs);
+    s.pc = entry;
+    s.hookBelow = 0x3000;
+    s.compiled = nullptr;
+    const spurt::Compiled* cpMain = std::getenv("NOSPUREC") ? nullptr : spurt::find_compiled(elf + 0x100);
+    const spurt::Compiled* cpMod = std::getenv("NOSPUREC") ? nullptr : spurt::find_compiled(0xbce880);   // mstream_dsp_reverb.pic
+    if (cpMain && !std::memcmp(s.ls + cpMain->lsBase, G->mem + cpMain->eaBin, cpMain->size)) { s.compiled = cpMain->fn; s.compiledLo = cpMain->lsBase; s.compiledHi = cpMain->lsBase + cpMain->size; }
+    if (std::getenv("SNDTRACE")) s.mfcTrace = 4000;
+    int shown = 0;
+    static const bool trace = std::getenv("SNDTRACE") != nullptr;
+    s.onBranch = [&](Spu& sp, uint32_t tg) {
+        const uint32_t nr = sp.r[3].w(0), lr = sp.r[0].w(0);
+        { static std::set<uint64_t> seen; if (seen.size() < 24 && seen.insert(uint64_t(tg) << 40 | uint64_t(lr) << 8 | (nr & 0xff)).second) LOG("[snd] task %u: first call of LS 0x%x from %05x with r3 %08x%c", t->id, tg, lr, nr, 10); }
+        if (trace && shown++ < 200) LOG("[snd] task %u: call LS 0x%x r3 %08x r4 %08x r5 %08x lr %05x\n", t->id, tg, nr, sp.r[4].w(0), sp.r[5].w(0), lr);
+        if (tg == 0) {   // codec module that was never loaded (flashATRAC.pic missing): the stream stays silent
+            static bool told = false;
+            if (!told) { told = true; LOG("[snd] no ATRAC decoder (dev_flash/sys/external/flashATRAC.pic): music streams are silent%c", 10); }
+            ++g_passes;
+            std::memset(sp.ls + 0x12a00, 0, 0x18000);   // the three work buffers the decoder is given: compressed data must not be mixed as PCM
+            { const uint64_t d = now_us() - g_wake; g_busySum += d; ++g_waits; if (d > g_busyMax) g_busyMax = d; if (d > 8000) ++g_slow; }   // debug: time since the last signal
+            if (cpMod && !sp.compiled2 && !std::memcmp(sp.ls + cpMod->lsBase, G->mem + cpMod->eaBin, cpMod->size)) { sp.compiled2 = cpMod->fn; sp.compiled2Lo = cpMod->lsBase; sp.compiled2Hi = cpMod->lsBase + cpMod->size; }
+            sp.r[3].sw(0, 0); sp.pc = lr & 0x3fffc;
+            return true;
+        }
+        if (tg != 0xA70) { LOG("[snd] task %u branched to LS 0x%x (r3 %08x lr %05x): not handled; LS 2ee50 = %08x %08x %08x %08x\n", t->id, tg, nr, lr, sp.lsw(0x2ee50), sp.lsw(0x2ee54), sp.lsw(0x2ee58), sp.lsw(0x2ee5c)); return false; }
+        switch (nr) {
+            case 0: LOG("[snd] task %u exited\n", t->id); return false;     // exit
+            case 1: std::this_thread::yield(); sp.r[3].sw(0, 0); break;         // yield
+            case 2: {                                                           // wait signal
+                const uint64_t t0 = now_us();
+                if (g_wake) { const uint64_t busy = t0 - g_wake; g_busySum += busy; if (busy > g_busyMax) g_busyMax = busy; ++g_waits; }
+                std::unique_lock<std::mutex> lk(t->m);
+                t->cv.wait(lk, [&] { return t->signalled; });
+                t->signalled = false;
+                g_wake = now_us();
+                // the module region is enabled once the program has loaded it
+                if (cpMod && !sp.compiled2 && !std::memcmp(sp.ls + cpMod->lsBase, G->mem + cpMod->eaBin, cpMod->size)) { sp.compiled2 = cpMod->fn; sp.compiled2Lo = cpMod->lsBase; sp.compiled2Hi = cpMod->lsBase + cpMod->size; LOG("[snd] reverb module runs recompiled\n"); }
+                sp.r[3].sw(0, 0);
+                break;
+            }
+            case 3: sp.r[3].sw(0, 0); break;                                    // poll: nothing else wants this SPU
+            default: LOG("[snd] task %u: SPURS task syscall %u not handled\n", t->id, nr); return false;
+        }
+        sp.pc = lr & 0x3fffc;
+        return true;
+    };
+    s.onStop = [&](Spu& sp, uint32_t code) { LOG("[snd] task %u: stop 0x%x at LS 0x%x\n", t->id, code, sp.pc); return false; };
+    s.onWriteCh = [&](Spu&, uint32_t ch, uint32_t v) { if (shown++ < 200) LOG("[snd] task %u: wrch %u <- %08x\n", t->id, ch, v); return true; };
+    s.onReadCh = [&](Spu&, uint32_t ch, uint32_t& v) { v = 0; if (shown++ < 200) LOG("[snd] task %u: rdch %u\n", t->id, ch); return true; };
+    // The game fills the block the task's argument points to after creating the task and then signals it (on the
+    // console the task has not been scheduled yet by then): start at the first signal, which stays pending.
+    { std::unique_lock<std::mutex> lk(t->m); t->cv.wait(lk, [&] { return t->signalled; }); }
+    LOG("[snd] task %u of taskset %x: SPU program %x, entry 0x%x\n", t->id, t->taskset, elf, entry);
+    if (const char* w = std::getenv("SNDWATCH")) {   // debug: SNDWATCH=<LS address in hex>: which instruction changes that word
+        const uint32_t a = uint32_t(std::strtoul(w, nullptr, 16));
+        s.running = true;
+        for (int n = 0; n < 30;) {
+            const uint32_t prev = s.lsw(a), pc0 = s.pc;
+            if (!s.step()) break;
+            if (s.lsw(a) != prev) { ++n; LOG("[snd] LS %05x: %08x -> %08x at pc %05x (mfc ls %05x ea %08x size %x)\n", a, prev, s.lsw(a), pc0, s.mfcLsa, s.mfcEal, s.mfcSize); }
+        }
+    }
+    s.run();
+    LOG("[snd] task %u stopped at LS 0x%x after %llu instructions (bad instruction %08x)\n", t->id, s.pc, (unsigned long long)s.steps, s.badInstr);
+}
+
+uint32_t create_task(uint32_t taskset, uint32_t elf, uint64_t a0, uint64_t a1) {
+    Task* t = new Task;
+    if (std::getenv("SNDTRACE")) std::thread([=] {   // debug: what the game puts in the task's command word
+        uint32_t last = 0; int n = 0;
+        while (n < 40) { const uint32_t v = be32(uint32_t(a0)); if (v != last) { last = v; ++n; LOG("[snd] command word = %08x (%llu signals so far)\n", v, (unsigned long long)g_signals.load()); } std::this_thread::yield(); }
+    }).detach();
+    std::lock_guard<std::mutex> lk(g_tm);
+    t->taskset = taskset; t->id = uint32_t(g_tasks.size());
+    g_tasks.push_back(t);
+    std::thread([=] { run_task(t, elf, a0, a1, 0, 0); }).detach();
+    return t->id;
+}
+void signal(uint32_t taskset, uint32_t id) {
+    ++g_signals;
+    g_wake = now_us();
+    std::lock_guard<std::mutex> lk(g_tm);
+    if (id >= g_tasks.size() || g_tasks[id]->taskset != taskset) return;
+    Task* t = g_tasks[id];
+    { std::lock_guard<std::mutex> l2(t->m); t->signalled = true; }
+    t->cv.notify_all();
+}
+// cellAudio port 0: `blocks` blocks of 256 samples x `ch` big-endian floats, played from the read index
+uint32_t g_port = 0, g_readIdx = 0, g_ch = 8, g_blocks = 8;
+std::atomic<bool> g_started{false};
+constexpr uint32_t kUnwritten = 0x7fc0dead;
+std::atomic<uint64_t> g_holes{0}, g_waited{0};
+void port_thread() {
+    if (!audio_out_open()) return;
+    host_thread_priority_high();
+    LOG("[snd] audio port playing: %u channels, %u blocks\n", g_ch, g_blocks);
+    std::vector<float> out(512);
+    uint64_t blocksOut = 0; float peak = 0;
+    auto next = std::chrono::steady_clock::now();
+    for (;;) {
+        // One block every 256/48000 s on a steady clock, like the console: the game's mixer thread polls the read
+        // index and must see it advance evenly (bursts make it miss blocks). The SDL queue absorbs the jitter; the
+        // clock is nudged to keep about 6 blocks queued, which also follows the sound card's real rate.
+        next += std::chrono::nanoseconds(5333333);
+        {
+            const int q = audio_out_queued();
+            if (q > 9 * 256) next += std::chrono::microseconds(300); else if (q < 3 * 256) next -= std::chrono::microseconds(300);
+            auto now = std::chrono::steady_clock::now();
+            if (next < now - std::chrono::milliseconds(50)) next = now;   // stalled (debugger, suspend): do not catch up in a burst
+            if (next - now > std::chrono::microseconds(1500)) std::this_thread::sleep_for(next - now - std::chrono::microseconds(1500));
+            while (std::chrono::steady_clock::now() < next) std::this_thread::yield();
+        }
+        const uint32_t idx = be32(g_readIdx + 4) % g_blocks;
+        const uint8_t* p = G->mem + g_port + idx * 256 * g_ch * 4;
+        // The mixer thread runs on its own clock and sometimes has not written this block yet. Played blocks are
+        // marked (a NaN pattern in their first sample), so an unwritten one is recognisable: wait a little for it
+        // instead of playing a hole; the SDL queue covers the wait.
+        if (be32(g_port + idx * 256 * g_ch * 4) == kUnwritten) {
+            const auto limit = std::chrono::steady_clock::now() + std::chrono::milliseconds(8);
+            while (be32(g_port + idx * 256 * g_ch * 4) == kUnwritten && std::chrono::steady_clock::now() < limit) std::this_thread::yield();
+            if (be32(g_port + idx * 256 * g_ch * 4) == kUnwritten) ++g_holes; else ++g_waited;
+            next = std::chrono::steady_clock::now();
+        }
+        static uint64_t relHist[8];
+        if (std::getenv("SNDTRACE")) {   // debug: which blocks (relative to the read index) hold data when one is played
+            for (uint32_t r = 0; r < g_blocks && r < 8; ++r) {
+                const uint32_t* q = reinterpret_cast<const uint32_t*>(G->mem + g_port + ((idx + r) % g_blocks) * 256 * g_ch * 4);
+                bool any = false;
+                for (uint32_t k = 0; k < 256 * g_ch && !any; k += 8) any = q[k] != 0;
+                relHist[r] += any;
+            }
+            if (blocksOut % 1875 == 1874) { LOG("[snd] blocks holding data at read time, by distance from the read index: %llu %llu %llu %llu %llu %llu %llu %llu%c", (unsigned long long)relHist[0], (unsigned long long)relHist[1], (unsigned long long)relHist[2], (unsigned long long)relHist[3], (unsigned long long)relHist[4], (unsigned long long)relHist[5], (unsigned long long)relHist[6], (unsigned long long)relHist[7], 10); std::memset(relHist, 0, sizeof relHist); }
+        }
+        auto smp = [&](uint32_t i, uint32_t c) { uint32_t u; std::memcpy(&u, p + (i * g_ch + c) * 4, 4); u = __builtin_bswap32(u); if ((u & 0x7f800000) == 0x7f800000) u = 0; float f; std::memcpy(&f, &u, 4); return f; };
+        for (uint32_t i = 0; i < 256; ++i) {
+            float l = smp(i, 0), r = smp(i, 1);
+            if (g_ch >= 6) { const float c = smp(i, 2) * 0.707f + smp(i, 3) * 0.5f; l += c + smp(i, 4) * 0.707f; r += c + smp(i, 5) * 0.707f; }
+            if (g_ch >= 8) { l += smp(i, 6) * 0.707f; r += smp(i, 7) * 0.707f; }
+            out[2 * i] = std::clamp(l, -1.f, 1.f); out[2 * i + 1] = std::clamp(r, -1.f, 1.f);
+            peak = std::max(peak, std::max(std::fabs(l), std::fabs(r)));
+        }
+        audio_out_push(out.data(), 256);
+        { static FILE* wf = std::getenv("SNDWAV") ? std::fopen("snd_out.f32", "wb") : nullptr; if (wf) std::fwrite(out.data(), 4, 512, wf); }   // debug: raw stereo float dump
+        std::memset(G->mem + g_port + idx * 256 * g_ch * 4, 0, 256 * g_ch * 4);
+        gcm::wr(g_port + idx * 256 * g_ch * 4, kUnwritten);
+        gcm::wr(g_readIdx + 4, (idx + 1) % g_blocks);
+        if (++blocksOut % 1875 == 0) {
+            LOG("[snd] 10 s of audio played, peak level %.3f, %llu signals\n", peak, (unsigned long long)g_signals.load()); peak = 0;
+            LOG("[snd]   %llu codec calls, main %s, module %s%c", (unsigned long long)g_passes.load(), !g_tasks.empty() && g_tasks[0]->spu.compiled ? "recompiled" : "interpreted", !g_tasks.empty() && g_tasks[0]->spu.compiled2 ? "recompiled" : "interpreted", 10);
+            if (std::getenv("SNDDUMP") && blocksOut == 1875 && !g_tasks.empty()) if (FILE* f = std::fopen("snd_ls.bin", "wb")) { std::fwrite(g_tasks[0]->spu.ls, 1, Spu::LS_SIZE, f); std::fclose(f); }
+            { const uint64_t w = g_waits.exchange(0), bs = g_busySum.exchange(0), bm = g_busyMax.exchange(0); LOG("[snd]   codec calls: %.2f ms after the signal on average, %.2f ms at most, %llu over 8 ms%c", w ? bs / 1000.0 / w : 0.0, bm / 1000.0, (unsigned long long)g_slow.exchange(0), 10); LOG("[snd]   blocks waited for: %llu, played as holes: %llu, %d frames queued%c", (unsigned long long)g_waited.exchange(0), (unsigned long long)g_holes.exchange(0), audio_out_queued(), 10); }
+            if (std::getenv("SNDPROF") && !g_tasks.empty()) {   // debug: where the interpreter still runs
+                Spu& sp = g_tasks[0]->spu;
+                static uint32_t hist[1024];
+                if (sp.interpHist) {
+                    std::string o; char b[40];
+                    for (int k = 0; k < 6; ++k) { int best = 0; for (int i = 1; i < 1024; ++i) if (hist[i] > hist[best]) best = i; if (!hist[best]) break; std::snprintf(b, sizeof b, " %05x:%.1fM", best << 8, hist[best] / 1e6); o += b; hist[best] = 0; }
+                    LOG("[snd]   interpreted in 10 s:%s; %llu interpreted, %llu compiled entries\n", o.c_str(), (unsigned long long)sp.interpSteps, (unsigned long long)sp.compiledCalls);
+                }
+                std::memset(hist, 0, sizeof hist); sp.interpHist = hist;
+            }
+            for (Task* t : g_tasks) LOG("[snd]   task %u at LS 0x%x, %llu instructions, lr %05x sp %05x\n", t->id, t->spu.pc, (unsigned long long)t->spu.steps, t->spu.r[0].w(0), t->spu.r[1].w(0));
+        }
+    }
+}
+} // namespace snd
+
 // WAITPROF=1: time every guest thread spends blocked, by wait site, in ms per second (printed every 4 s)
 const bool g_waitProf = std::getenv("WAITPROF") != nullptr;
 std::map<std::pair<uint32_t, std::string>, uint64_t> g_waitAcc;
@@ -1421,7 +1625,7 @@ bool imports(PPU& c, const char* module, const char* name) {
         ret(c, CELL_OK); return true;
     }
     if (n == "cellVideoOutConfigure" || n == "cellAudioOutConfigure") { ret(c, CELL_OK); return true; }
-    if (n == "cellAudioOutGetSoundAvailability") { ret(c, 2); return true; }   // stereo
+    if (n == "cellAudioOutGetSoundAvailability") { ret(c, a32(c, 1) == 0 ? 2 : 0); return true; }   // (audioOut, coding type, fs, option): stereo LPCM only, no Dolby/DTS
     if (n == "cellSysutilGetSystemParamInt") {
         const uint32_t id = a32(c, 0);
         int32_t v = 0;
@@ -1598,6 +1802,31 @@ bool imports(PPU& c, const char* module, const char* name) {
     if (n == "_sys_free") { ret(c, CELL_OK); return true; }
     if (n == "sys_prx_load_module" || n == "sys_prx_start_module" || n == "sys_prx_stop_module" || n == "sys_prx_unload_module") { ret(c, CELL_OK); return true; }
     if (n == "sys_get_random_number") { for (uint32_t k = 0; k < a32(c, 1); ++k) c.wr8(a32(c, 0) + k, uint8_t(std::rand())); ret(c, CELL_OK); return true; }
+    if (n == "cellSpursCreateTask" && a32(c, 2) != 0xbc5180 && settings().sound && !std::getenv("NOSOUND")) {   // (taskset, u32* taskId, elf, contextSave, contextSize, lsPattern, arg): the Zlib task is done on the host
+        const uint32_t arg = a32(c, 6);
+        const uint32_t id = snd::create_task(a32(c, 0), a32(c, 2), arg ? c.rd64(arg) : 0, arg ? c.rd64(arg + 8) : 0);
+        c.wr32(a32(c, 1), id);
+        ret(c, CELL_OK); return true;
+    }
+    if (n == "_cellSpursSendSignal") { snd::signal(a32(c, 0), a32(c, 1)); ret(c, CELL_OK); return true; }
+    if (n == "cellAudioPortOpen") {   // (CellAudioPortParam* {u64 channels, u64 blocks, u64 attr, float level}, u32* portNum)
+        snd::g_ch = uint32_t(c.rd64(a32(c, 0))); snd::g_blocks = uint32_t(c.rd64(a32(c, 0) + 8));
+        if (!snd::g_port) { snd::g_port = alloc_heap(snd::g_blocks * 256 * snd::g_ch * 4, 0x100); snd::g_readIdx = alloc_heap(16, 16); }
+        std::memset(G->mem + snd::g_port, 0, snd::g_blocks * 256 * snd::g_ch * 4);
+        c.wr64(snd::g_readIdx, 0);
+        c.wr32(a32(c, 1), 0);
+        ret(c, CELL_OK); return true;
+    }
+    if (n == "cellAudioGetPortConfig") {   // (portNum, CellAudioPortConfig*)
+        const uint32_t p = a32(c, 1);
+        c.wr32(p, snd::g_readIdx); c.wr32(p + 4, snd::g_started ? 2 : 1); c.wr64(p + 8, snd::g_ch); c.wr64(p + 16, snd::g_blocks);
+        c.wr32(p + 24, snd::g_blocks * 256 * snd::g_ch * 4); c.wr32(p + 28, snd::g_port);
+        ret(c, CELL_OK); return true;
+    }
+    if (n == "cellAudioPortStart") {
+        if (!snd::g_started.exchange(true) && settings().sound && !std::getenv("NOSOUND")) std::thread(snd::port_thread).detach();
+        ret(c, CELL_OK); return true;
+    }
     // --- SPURS: the Edge Zlib inflate task is done on the host (same result as the SPU task), event flags polled
     if (n == "_cellSpursJobChainAttributeInitialize") {   // (attr, jmRev, sdkRev, u64* jobChainEntry, sizeJobDescriptor, maxGrabbedJob, prio*, maxContention, ...)
         g_jobChainEntry = a32(c, 3);
