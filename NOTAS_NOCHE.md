@@ -408,3 +408,12 @@ Faltaba casi toda la geometría opaca (carretera, edificios, coches, cielo) y lo
 - La firma del contenido de cada textura se calcula una vez por cuadro, no en cada dibujo.
 - Resultado: carrera a 60 fps estables; título ~45 fps; menús 30-60.
 - Pendiente: la conversión de vértices sigue siendo la fase más cara (130-230 ms/s).
+
+### Tras la primera prueba del usuario (13/11)
+Informe: polígonos mezclados a pantalla completa durante unos segundos, 30 fps casi siempre, coches y escenarios sin brillo.
+- **Polígonos mezclados:** eran los rescates de `ring_watchdog` (pisan geometría del cuadro). Causa de fondo: los anillos de salida de Edge (3 MB por SPU) están dimensionados para una RSX que los vacía enseguida. Ahora el primer trabajo Edge los sustituye por anillos de 24 MB en `0x44000000` (`EDGERING=MB`, 0 = los del juego). Deben quedar por debajo de `ioAddr + 512 MB`: Edge solo conserva 29 bits del desplazamiento RSX del búfer de índices. Sin rescates desde entonces.
+- **SPU:** la regla de float se reduce a «un producto con un factor cero es cero» (`spu_mul`); el ajuste completo de operandos era correcto pero un 40 % más lento. `shufb`, los desplazamientos por bytes y `gb/gbh/gbb` trabajan directamente en la disposición de `Q`, sin conversiones (`shufb` es el 22 % de las instrucciones de Edge). Trabajo Edge: ~34 µs → ~19 µs.
+- **RSX:** `convert_attr` con un bucle por formato; caché en GPU de los flujos de vértices de la memoria local (`cached_stream`, `RSXNOSTREAMCACHE=1` la desactiva): se convierten una vez y se comprueba una muestra por cuadro. `do_draw` baja a ~9,6 µs por dibujo.
+- Muestreo (`SAMPLE=1 --chain`): en los tramos lentos el hilo de render del juego espera el flip el 62 % del tiempo; el límite es el hilo de la RSX cuando el cuadro pasa de ~1100 dibujos.
+- **Estado:** título y carrera a 60 fps; la selección de coche y la parrilla, entre 31 y 48.
+- **Pendiente:** bajar más el coste por dibujo (texturas 2,1 µs, programa 1,2, estado 1,1, índices 1,3); reflejos (los cubemaps renderizados se leen de memoria y no de la superficie: por eso falta brillo en coches y escenarios); sonido sin comprobar.

@@ -962,29 +962,37 @@ static std::vector<uint32_t> idx;
 
 static void convert_attr(int a, uint32_t first, uint32_t count, float* out) {
     const uint32_t fmt = R[(0x1740 + 4 * a) >> 2], offReg = R[(0x1680 + 4 * a) >> 2];
-    const uint32_t type = fmt & 0xf, size = (fmt >> 4) & 0xf, stride = (fmt >> 8) & 0xff;
+    const uint32_t type = fmt & 0xf, size = std::min<uint32_t>((fmt >> 4) & 0xf, 4), stride = (fmt >> 8) & 0xff;
     const uint32_t base = ea_of(offReg & 0x7fffffff, offReg >> 31) + R[0x1738 >> 2];
-    for (uint32_t v = 0; v < count; ++v) {
-        const uint32_t p = base + stride * (first + v);
-        float* o = out + 4 * v;
-        o[0] = 0; o[1] = 0; o[2] = 0; o[3] = 1;
-        switch (type) {
-            case 1: for (uint32_t k = 0; k < size; ++k) o[k] = std::max(-1.f, int16_t(be16(p + 2 * k)) / 32767.f); break;
-            case 2: for (uint32_t k = 0; k < size; ++k) o[k] = f32(be32(p + 4 * k)); break;
-            case 3: for (uint32_t k = 0; k < size; ++k) o[k] = half2f(be16(p + 2 * k)); break;
-            case 4: for (uint32_t k = 0; k < size; ++k) o[k] = C.mem[p + k] / 255.f; break;
-            case 5: for (uint32_t k = 0; k < size; ++k) o[k] = float(int16_t(be16(p + 2 * k))); break;
-            case 6: {
-                const uint32_t w = be32(p);
-                o[0] = float(int32_t(w << 21) >> 21) / 1023.f;
-                o[1] = float(int32_t(w << 10) >> 21) / 1023.f;
-                o[2] = float(int32_t(w) >> 22) / 511.f;
-                break;
+    const uint8_t* p = C.mem + base + size_t(stride) * first;
+    // one tight loop per type (this runs for every vertex of every draw); missing components are 0, 0, 0, 1
+    const auto r16 = [](const uint8_t* q) { uint16_t v; std::memcpy(&v, q, 2); return uint16_t(__builtin_bswap16(v)); };
+    const auto r32 = [](const uint8_t* q) { uint32_t v; std::memcpy(&v, q, 4); return __builtin_bswap32(v); };
+#define RSX_CONV(EXPR)     for (uint32_t v = 0; v < count; ++v, p += stride, out += 4) {         out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 1;         for (uint32_t k = 0; k < size; ++k) out[k] = (EXPR);     }
+    switch (type) {
+        case 1: RSX_CONV(std::max(-1.f, int16_t(r16(p + 2 * k)) / 32767.f)) break;
+        case 2:
+            if (size == 3) for (uint32_t v = 0; v < count; ++v, p += stride, out += 4) { const uint32_t x[4] = {r32(p), r32(p + 4), r32(p + 8), 0x3f800000u}; std::memcpy(out, x, 16); }
+            else if (size == 4) for (uint32_t v = 0; v < count; ++v, p += stride, out += 4) { const uint32_t x[4] = {r32(p), r32(p + 4), r32(p + 8), r32(p + 12)}; std::memcpy(out, x, 16); }
+            else if (size == 2) for (uint32_t v = 0; v < count; ++v, p += stride, out += 4) { const uint32_t x[4] = {r32(p), r32(p + 4), 0u, 0x3f800000u}; std::memcpy(out, x, 16); }
+            else RSX_CONV(f32(r32(p + 4 * k)))
+            break;
+        case 3: RSX_CONV(half2f(r16(p + 2 * k))) break;
+        case 4: RSX_CONV(p[k] * (1.f / 255.f)) break;
+        case 5: RSX_CONV(float(int16_t(r16(p + 2 * k)))) break;
+        case 6:
+            for (uint32_t v = 0; v < count; ++v, p += stride, out += 4) {
+                const uint32_t w = r32(p);
+                out[0] = float(int32_t(w << 21) >> 21) / 1023.f;
+                out[1] = float(int32_t(w << 10) >> 21) / 1023.f;
+                out[2] = float(int32_t(w) >> 22) / 511.f;
+                out[3] = 1;
             }
-            case 7: for (uint32_t k = 0; k < size; ++k) o[k] = float(C.mem[p + k]); break;
-            default: break;
-        }
+            break;
+        case 7: RSX_CONV(float(p[k])) break;
+        default: for (uint32_t v = 0; v < count; ++v, out += 4) { out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 1; } break;
     }
+#undef RSX_CONV
 }
 
 static GLenum gl_prim(uint32_t p) {
@@ -1018,6 +1026,45 @@ static void apply_state() {
     glFrontFace(ff == GL_CW ? GL_CCW : GL_CW);
     en(GL_POLYGON_OFFSET_FILL, R[0xa68 >> 2] & 1);
     glPolygonOffset(rf(0xa78), rf(0xa7c));
+}
+
+// Vertex streams in RSX local memory (texture coordinates, normals, colours of the level and the cars) do not
+// change from frame to frame: they are converted to floats once and kept in a GL buffer. Edge geometry output
+// (positions, in main memory) is new every frame and goes through the per-draw path. The content of a cached
+// stream is sampled once per frame, so a level change that reuses the address is noticed.
+struct Stream { GLuint vbo = 0; uint32_t count = 0; uint64_t sig = 0, checked = ~0ull; };
+static std::map<uint64_t, Stream> streams;
+static uint64_t stream_sig(const uint8_t* p, uint32_t stride, uint32_t count) {
+    uint64_t h = fnv(&count, 4);
+    const uint32_t step = std::max<uint32_t>(1, count / 24);
+    for (uint32_t v = 0; v < count; v += step) h = fnv(p + size_t(v) * stride, std::min<uint32_t>(stride, 8), h);
+    return fnv(p + size_t(count - 1) * stride, std::min<uint32_t>(stride, 8), h);
+}
+// GL buffer with attribute a converted for vertices 0..need-1 (4 floats each), or 0 when the stream is not cacheable
+static GLuint cached_stream(int a, uint32_t need) {
+    static const bool off = std::getenv("RSXNOSTREAMCACHE") != nullptr;
+    const uint32_t fmt = R[(0x1740 + 4 * a) >> 2], offReg = R[(0x1680 + 4 * a) >> 2];
+    const uint32_t stride = (fmt >> 8) & 0xff;
+    if (off || (offReg >> 31) || stride == 0 || need == 0 || need > 2000000) return 0;
+    const uint32_t base = ea_of(offReg & 0x7fffffff, 0) + R[0x1738 >> 2];
+    if (uint64_t(base) + uint64_t(need + need / 4 + 64) * stride >= 0xfff00000ull) return 0;
+    Stream& st = streams[uint64_t(base) << 16 | (fmt & 0xffff)];
+    const uint8_t* p = C.mem + base;
+    if (st.count && st.checked != frameNo) {
+        st.checked = frameNo;
+        if (stream_sig(p, stride, st.count) != st.sig) st.count = 0;   // the memory holds something else now
+    }
+    if (st.count < need) {
+        static std::vector<float> tmp;
+        const uint32_t n = need + need / 4 + 64;   // room to grow: other draws of the object use later vertices
+        tmp.resize(size_t(n) * 4);
+        convert_attr(a, 0, n, tmp.data());
+        if (!st.vbo) glGenBuffers(1, &st.vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, st.vbo);
+        glBufferData(GL_ARRAY_BUFFER, tmp.size() * 4, tmp.data(), 0x88E4 /* GL_STATIC_DRAW */);
+        st.count = n; st.sig = stream_sig(p, stride, n); st.checked = frameNo;
+    }
+    return st.vbo;
 }
 
 // RSXPROF=1: time inside do_draw by stage (ms per second) and totals per second
@@ -1128,9 +1175,11 @@ static void do_draw() {
         }
     }
     vtx.resize(size_t(na) * nv * 4);
+    GLuint streamVbo[16] = {};
     for (int k = 0; k < na; ++k) {
         const uint32_t fmt = R[(0x1740 + 4 * attrs[k]) >> 2];
         const uint32_t stride = (fmt >> 8) & 0xff;
+        if (!sparse && (streamVbo[k] = cached_stream(attrs[k], vmax + 1)) != 0) continue;
         if (stride == 0) { convert_attr(attrs[k], 0, 1, vtx.data() + size_t(k) * nv * 4); for (uint32_t v = 1; v < nv; ++v) std::memcpy(&vtx[(size_t(k) * nv + v) * 4], &vtx[size_t(k) * nv * 4], 16); }
         else if (!sparse) convert_attr(attrs[k], vmin, nv, vtx.data() + size_t(k) * nv * 4);
         else
@@ -1160,7 +1209,12 @@ static void do_draw() {
     glBufferData(GL_ARRAY_BUFFER, vtx.size() * 4, vtx.data(), GL_STREAM_DRAW);
     for (int k = 0; k < na; ++k) {
         glEnableVertexAttribArray(attrs[k]);
-        glVertexAttribPointer(attrs[k], 4, GL_FLOAT, 0, 16, reinterpret_cast<const void*>(size_t(k) * nv * 16));
+        if (streamVbo[k]) {   // cached stream: holds every vertex from 0, the indices are relative to vmin
+            glBindBuffer(GL_ARRAY_BUFFER, streamVbo[k]);
+            glVertexAttribPointer(attrs[k], 4, GL_FLOAT, 0, 16, reinterpret_cast<const void*>(size_t(vmin) * 16));
+            glBindBuffer(GL_ARRAY_BUFFER, vbo);
+        } else
+            glVertexAttribPointer(attrs[k], 4, GL_FLOAT, 0, 16, reinterpret_cast<const void*>(size_t(k) * nv * 16));
     }
     if (sparse) {
         if (vmap.size() < span) vmap.resize(span);

@@ -166,9 +166,9 @@ bool Spu::step() {
                 D.b[i] = (s & 0xC0) == 0x80 ? 0x00 : (s & 0xE0) == 0xC0 ? 0xFF : (s & 0xE0) == 0xE0 ? 0x80 : ((s & 0x10) ? BB.b[s & 0xF] : AA.b[s & 0xF]);
             } break;
             case 0xC: for (int i = 0; i < 4; ++i) D.sw(i, uint32_t(int32_t(int16_t(AA.w(i))) * int32_t(int16_t(BB.w(i))) + int32_t(C.w(i)))); break;   // mpya
-            case 0xD: for (int i = 0; i < 4; ++i) D.sf(i, C.f(i) - AA.f(i) * BB.f(i)); break;   // fnms
-            case 0xE: for (int i = 0; i < 4; ++i) D.sf(i, AA.f(i) * BB.f(i) + C.f(i)); break;   // fma
-            case 0xF: for (int i = 0; i < 4; ++i) D.sf(i, AA.f(i) * BB.f(i) - C.f(i)); break;   // fms
+            case 0xD: for (int i = 0; i < 4; ++i) D.sf(i, C.f(i) - spu_mul(AA.f(i), BB.f(i))); break;   // fnms
+            case 0xE: for (int i = 0; i < 4; ++i) D.sf(i, spu_mul(AA.f(i), BB.f(i)) + C.f(i)); break;   // fma
+            case 0xF: for (int i = 0; i < 4; ++i) D.sf(i, spu_mul(AA.f(i), BB.f(i)) - C.f(i)); break;   // fms
             default: return bad();
         }
         pc = npc; return true;
@@ -402,7 +402,7 @@ bool Spu::step() {
         // floating point
         case 0x2C4: for (int i = 0; i < 4; ++i) o.sf(i, a.f(i) + bb.f(i)); break;   // fa
         case 0x2C5: for (int i = 0; i < 4; ++i) o.sf(i, a.f(i) - bb.f(i)); break;   // fs
-        case 0x2C6: for (int i = 0; i < 4; ++i) o.sf(i, a.f(i) * bb.f(i)); break;   // fm
+        case 0x2C6: for (int i = 0; i < 4; ++i) o.sf(i, spu_mul(a.f(i), bb.f(i))); break;   // fm
         case 0x3C2: for (int i = 0; i < 4; ++i) o.sw(i, a.f(i) == bb.f(i) ? ~0u : 0); break;   // fceq
         case 0x2C2: for (int i = 0; i < 4; ++i) o.sw(i, a.f(i) > bb.f(i) ? ~0u : 0); break;    // fcgt
         case 0x3CA: for (int i = 0; i < 4; ++i) o.sw(i, std::fabs(a.f(i)) == std::fabs(bb.f(i)) ? ~0u : 0); break;   // fcmeq

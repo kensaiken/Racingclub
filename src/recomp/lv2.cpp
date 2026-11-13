@@ -795,6 +795,25 @@ void run_job(const JobDesc& J) {
         static std::mutex seenMx; static std::map<uint32_t, int> seen;
         std::lock_guard<std::mutex> lk(seenMx);
         if (!seen[eaBin]++) LOG("[job] binary %x: %u bytes (descriptor %x)\n", eaBin, sizeBin, jea);
+        // First Edge geometry job: replace the game's three 3 MB output rings (one per SPU) with larger ones.
+        // The rings are sized for the console, where the RSX frees them fast enough; here jobs kept waiting for
+        // space (30 fps) and some frames did not fit at all. EDGERING=MB sets the size, 0 keeps the game's rings.
+        static bool ringsDone = false;
+        if (eaBin == 0xbaea80 && !ringsDone) {
+            ringsDone = true;
+            const uint32_t mb = std::getenv("EDGERING") ? uint32_t(std::atoi(std::getenv("EDGERING"))) : 24;
+            for (uint32_t r = 0; r < 3 && mb; ++r) {
+                const uint32_t e = 0x01061980u + 0x80u * r, size = mb << 20;
+                const uint32_t oldStart = gcm::rd(e), label = gcm::rd(e + 20) & 0xff0;
+                // Edge keeps 29 bits of the RSX offset of its index buffers: the rings must lie below ioAddr + 512 MB.
+                // 0x44000000 up is unused (user memory ends at 0x3D500000, the host heap starts at 0x60000000).
+                const uint32_t start = 0x44000000u + r * (size + 0x1000);
+                if (!oldStart || !label || start < gcm::ioAddr || uint64_t(start) + size - gcm::ioAddr >= 0x20000000ull) { LOG("[job] Edge ring %u left as it is (start %x, new %x)\n", r, oldStart, start); continue; }
+                gcm::wr(e, start); gcm::wr(e + 4, start - gcm::ioAddr); gcm::wr(e + 8, start + size); gcm::wr(e + 12, start); gcm::wr(e + 24, start + size);
+                gcm::wr(gcm::labels + label, start + size);
+                LOG("[job] Edge ring %u: %x..%x (%u MB) instead of %x\n", r, start, start + size, mb, oldStart);
+            }
+        }
     }
     if (eaBin == EVENTFLAG_JOB) {
         const uint32_t ef = jd32(J, 0x34);

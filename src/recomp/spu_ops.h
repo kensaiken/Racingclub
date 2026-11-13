@@ -22,9 +22,8 @@ inline uint8_t& BR(Q& q, int i) { return reinterpret_cast<uint8_t*>(q.w)[i]; }
 inline uint8_t br(const Q& q, int i) { return reinterpret_cast<const uint8_t*>(q.w)[i]; }
 inline uint16_t& HR(Q& q, int i) { return reinterpret_cast<uint16_t*>(q.w)[i]; }
 inline uint16_t hr(const Q& q, int i) { return reinterpret_cast<const uint16_t*>(q.w)[i]; }
-// float operand / float result with the SPU's non-IEEE rules (see spu.h)
-inline float f(const Q& q, int i) { return spu_float_in(q.w[i]); }
-inline uint32_t fb(float x) { return spu_float_out(x); }
+inline float f(const Q& q, int i) { float x; std::memcpy(&x, &q.w[i], 4); return x; }
+inline uint32_t fb(float x) { uint32_t u; std::memcpy(&u, &x, 4); return u; }
 inline double d(const Q& q, int i) { const uint64_t u = uint64_t(q.w[2 * i]) << 32 | q.w[2 * i + 1]; double x; std::memcpy(&x, &u, 8); return x; }
 inline void sd(Q& q, int i, double x) { uint64_t u; std::memcpy(&u, &x, 8); q.w[2 * i] = uint32_t(u >> 32); q.w[2 * i + 1] = uint32_t(u); }
 inline uint64_t dw(const Q& q, int i) { return uint64_t(q.w[2 * i]) << 32 | q.w[2 * i + 1]; }
@@ -47,17 +46,18 @@ inline void stq(uint8_t* ls, uint32_t a, const Q& q) {
 inline Q splat(uint32_t v) { Q q; q.w[0] = q.w[1] = q.w[2] = q.w[3] = v; return q; }
 inline Q pref(uint32_t v) { Q q{}; q.w[0] = v; return q; }
 
+// In the Q layout SPU byte i sits at memory offset i ^ 3. A control byte and the byte it produces share their
+// position, so shufb needs no conversion: only the source index it selects is flipped (^ 3).
 inline Q shufb(const Q& a, const Q& bb, const Q& c) {
-    const __m128i A = swp(V(a)), Bv = swp(V(bb)), C = swp(V(c));
-    const __m128i idx = _mm_and_si128(C, _mm_set1_epi8(0x0f));
+    const __m128i A = V(a), Bv = V(bb), C = V(c);
+    const __m128i idx = _mm_xor_si128(_mm_and_si128(C, _mm_set1_epi8(0x0f)), _mm_set1_epi8(3));
     const __m128i fromB = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
     __m128i res = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(Bv, idx), fromB);
     // control bytes 10xxxxxx -> 0x00, 110xxxxx -> 0xFF, 111xxxxx -> 0x80
     const __m128i isC0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(char(0xC0))), _mm_set1_epi8(char(0xC0)));
     const __m128i isE0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(char(0xE0))), _mm_set1_epi8(char(0xE0)));
     const __m128i spec = _mm_blendv_epi8(isC0, _mm_set1_epi8(char(0x80)), isE0);
-    res = _mm_blendv_epi8(res, spec, C);   // top bit of the control byte selects the special value
-    return mk(swp(res));
+    return mk(_mm_blendv_epi8(res, spec, C));   // top bit of the control byte selects the special value
 }
 inline Q insmask(uint32_t addr, int size) {   // cbd/chd/cwd/cdd family
     alignas(16) uint8_t o[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f};
@@ -67,19 +67,35 @@ inline Q insmask(uint32_t addr, int size) {   // cbd/chd/cwd/cdd family
     else for (int k = 0; k < size; ++k) o[t + k] = uint8_t(k);
     return mk(swp(_mm_load_si128(reinterpret_cast<const __m128i*>(o))));
 }
+// Byte shifts and rotates of the whole register, straight in the Q layout: SPU byte i of the result is at memory
+// offset i ^ 3 and comes from SPU byte i + n (or i - n), which is at offset (i + n) ^ 3.
 // byte i of the result = byte i + n of the source (0 past the end); n in 0..31
 inline Q qshl_bytes(const Q& a, int n) {
-    const __m128i idx = _mm_adds_epu8(_mm_add_epi8(iota16(), _mm_set1_epi8(char(n))), _mm_set1_epi8(0x70));
-    return mk(swp(_mm_shuffle_epi8(swp(V(a)), idx)));
+    const __m128i s = _mm_add_epi8(_mm_xor_si128(iota16(), _mm_set1_epi8(3)), _mm_set1_epi8(char(n)));
+    return mk(_mm_shuffle_epi8(V(a), _mm_xor_si128(_mm_adds_epu8(s, _mm_set1_epi8(0x70)), _mm_set1_epi8(3))));   // > 15: top bit -> 0
 }
 // byte i of the result = byte i - n of the source (0 before the start); n in 0..31
 inline Q qshr_bytes(const Q& a, int n) {
-    const __m128i idx = _mm_sub_epi8(iota16(), _mm_set1_epi8(char(n)));
-    return mk(swp(_mm_shuffle_epi8(swp(V(a)), idx)));
+    const __m128i s = _mm_sub_epi8(_mm_xor_si128(iota16(), _mm_set1_epi8(3)), _mm_set1_epi8(char(n)));
+    return mk(_mm_shuffle_epi8(V(a), _mm_xor_si128(s, _mm_set1_epi8(3))));   // negative: top bit -> 0
 }
 inline Q qrot_bytes(const Q& a, int n) {
-    const __m128i idx = _mm_and_si128(_mm_add_epi8(iota16(), _mm_set1_epi8(char(n))), _mm_set1_epi8(0x0f));
-    return mk(swp(_mm_shuffle_epi8(swp(V(a)), idx)));
+    const __m128i s = _mm_and_si128(_mm_add_epi8(_mm_xor_si128(iota16(), _mm_set1_epi8(3)), _mm_set1_epi8(char(n))), _mm_set1_epi8(0x0f));
+    return mk(_mm_shuffle_epi8(V(a), _mm_xor_si128(s, _mm_set1_epi8(3))));
+}
+// gb / gbh / gbb: the least significant bit of every word / halfword / byte, first element in the top bit
+inline Q gather_w(const Q& a) {
+    const uint32_t m = uint32_t(_mm_movemask_ps(_mm_castsi128_ps(_mm_slli_epi32(V(a), 31))));   // bit k = word k
+    return pref(((m & 1) << 3) | ((m & 2) << 1) | ((m & 4) >> 1) | ((m & 8) >> 3));
+}
+inline Q gather_h(const Q& a) {
+    const __m128i t = _mm_slli_epi16(V(a), 15);
+    const uint32_t m = uint32_t(_mm_movemask_epi8(_mm_packs_epi16(t, t))) & 0xff;   // bit s = uint16 slot s; word k holds halfwords 2k+1, 2k
+    return pref(((m & 0x03) << 6) | ((m & 0x0c) << 2) | ((m & 0x30) >> 2) | ((m & 0xc0) >> 6));
+}
+inline Q gather_b(const Q& a) {
+    const uint32_t m = uint32_t(_mm_movemask_epi8(_mm_slli_epi64(V(a), 7)));   // bit m = memory byte m; word k holds SPU bytes 4k+3..4k
+    return pref(((m & 0x000f) << 12) | ((m & 0x00f0) << 4) | ((m & 0x0f00) >> 4) | ((m & 0xf000) >> 12));
 }
 // float <-> integer with a power-of-two scale (multiplying a double by 2^k is exact, like ldexp)
 inline uint32_t cflts(float x, double scale) { const double v = double(x) * scale; return uint32_t(v >= 2147483647.0 ? 0x7fffffff : v <= -2147483648.0 ? int32_t(0x80000000u) : int32_t(v)); }

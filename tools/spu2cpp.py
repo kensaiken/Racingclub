@@ -121,11 +121,11 @@ def gen_lines(code, base, size, slow, leaders):
             elif op4 == 0xC:
                 s = f'{{ Q t; for (int i = 0; i < 4; ++i) t.w[i] = uint32_t(int32_t(int16_t({A}.w[i])) * int32_t(int16_t({Bq}.w[i])) + int32_t({Cq}.w[i])); r[{rT}] = t; }}'
             elif op4 == 0xD:
-                s = f'{{ Q t; for (int i = 0; i < 4; ++i) t.w[i] = fb(f({Cq}, i) - f({A}, i) * f({Bq}, i)); r[{rT}] = t; }}'
+                s = f'{{ Q t; for (int i = 0; i < 4; ++i) t.w[i] = fb(f({Cq}, i) - spu_mul(f({A}, i), f({Bq}, i))); r[{rT}] = t; }}'
             elif op4 == 0xE:
-                s = f'{{ Q t; for (int i = 0; i < 4; ++i) t.w[i] = fb(f({A}, i) * f({Bq}, i) + f({Cq}, i)); r[{rT}] = t; }}'
+                s = f'{{ Q t; for (int i = 0; i < 4; ++i) t.w[i] = fb(spu_mul(f({A}, i), f({Bq}, i)) + f({Cq}, i)); r[{rT}] = t; }}'
             elif op4 == 0xF:
-                s = f'{{ Q t; for (int i = 0; i < 4; ++i) t.w[i] = fb(f({A}, i) * f({Bq}, i) - f({Cq}, i)); r[{rT}] = t; }}'
+                s = f'{{ Q t; for (int i = 0; i < 4; ++i) t.w[i] = fb(spu_mul(f({A}, i), f({Bq}, i)) - f({Cq}, i)); r[{rT}] = t; }}'
             else:
                 s = exit_here
             E('  ' + s)
@@ -291,9 +291,9 @@ def gen_lines(code, base, size, slow, leaders):
             0x1B6: f'{{ const uint32_t m = {A}.w[0] & 0xffff; Q o; for (int i = 0; i < 16; ++i) B(o, i) = (m >> (15 - i)) & 1 ? 0xff : 0; {T} = o; }}',
             0x1B5: f'{{ const uint32_t m = {A}.w[0] & 0xff; Q o; for (int i = 0; i < 8; ++i) H(o, i) = (m >> (7 - i)) & 1 ? 0xffff : 0; {T} = o; }}',
             0x1B4: f'{{ const uint32_t m = {A}.w[0] & 0xf; Q o; for (int i = 0; i < 4; ++i) o.w[i] = (m >> (3 - i)) & 1 ? ~0u : 0u; {T} = o; }}',
-            0x1B2: f'{{ const Q a = {A}; uint32_t m = 0; for (int i = 0; i < 16; ++i) m = (m << 1) | (b(a, i) & 1); {T} = pref(m); }}',
-            0x1B1: f'{{ const Q a = {A}; uint32_t m = 0; for (int i = 0; i < 8; ++i) m = (m << 1) | (h(a, i) & 1); {T} = pref(m); }}',
-            0x1B0: f'{{ const Q a = {A}; uint32_t m = 0; for (int i = 0; i < 4; ++i) m = (m << 1) | (a.w[i] & 1); {T} = pref(m); }}',
+            0x1B2: f'{T} = gather_b({A});',
+            0x1B1: f'{T} = gather_h({A});',
+            0x1B0: f'{T} = gather_w({A});',
             0x0D3: B2('(b(a, i) + b(bb, i) + 1) >> 1'),
             0x053: B2('b(a, i) > b(bb, i) ? b(a, i) - b(bb, i) : b(bb, i) - b(a, i)'),
             0x253: f'{{ const Q a = {A}, bb = {Bq}; Q o; for (int i = 0; i < 4; ++i) {{ uint32_t sa = 0, sb = 0; for (int k = 0; k < 4; ++k) {{ sa += b(a, 4 * i + k); sb += b(bb, 4 * i + k); }} H(o, 2 * i) = uint16_t(sb); H(o, 2 * i + 1) = uint16_t(sa); }} {T} = o; }}',
@@ -326,7 +326,7 @@ def gen_lines(code, base, size, slow, leaders):
             0x07A: W2(f'uint32_t(int32_t(a.w[i]) >> {min((-i7) & 0x3f, 31)})'),
             0x07E: H2(f'int16_t(h(a, i)) >> {min((-i7) & 0x1f, 15)}'),
             0x1DF: QQ('qshl_bytes(a, int(bb.w[0] & 0x1f))'),
-            0x1FF: QQ(f'qshl_bytes(a, {u7 & 0x1f})'),
+            0x1FF: (f'{T} = {A};' if (u7 & 0x1f) == 0 else QQ(f'qshl_bytes(a, {u7 & 0x1f})')),
             0x1CF: QQ('qshl_bytes(a, int((bb.w[0] >> 3) & 0x1f))'),
             0x1DC: QQ('qrot_bytes(a, int(bb.w[0] & 0xf))'),
             0x1FC: QQ(f'qrot_bytes(a, {u7 & 0xf})'),
@@ -351,7 +351,7 @@ def gen_lines(code, base, size, slow, leaders):
             0x2D0: B2('b(a, i) > b(bb, i) ? 0xff : 0'),
             0x2C4: F2('f(a, i) + f(bb, i)'),
             0x2C5: F2('f(a, i) - f(bb, i)'),
-            0x2C6: F2('f(a, i) * f(bb, i)'),
+            0x2C6: F2('spu_mul(f(a, i), f(bb, i))'),
             0x3C2: W2('f(a, i) == f(bb, i) ? ~0u : 0u'),
             0x2C2: W2('f(a, i) > f(bb, i) ? ~0u : 0u'),
             0x3CA: W2('std::fabs(f(a, i)) == std::fabs(f(bb, i)) ? ~0u : 0u'),
