@@ -26,12 +26,10 @@ const auto g_dec0 = std::chrono::steady_clock::now();
 // DMA put into main memory, last 16-byte block first: the RSX polls command buffer holes (a jump-to-self at the
 // start) while SPU jobs fill them, so the first word must change only after everything behind it is in place.
 void put_backwards(uint8_t* dst, const uint8_t* src, uint32_t n) {
+    // everything after the first 16 bytes in one copy (it was 16 bytes at a time, from the end: a memcpy call per
+    // block, a tenth of the sound mixer), then the head with its first word last
     uint32_t end = n;
-    while (end > 16) {
-        const uint32_t beg = (end - 1) & ~15u;
-        std::memcpy(dst + beg, src + beg, end - beg);
-        end = beg;
-    }
+    if (end > 16) { std::memcpy(dst + 16, src + 16, end - 16); end = 16; }
     std::atomic_thread_fence(std::memory_order_release);
     if (end >= 4) {   // first word last, atomically
         std::memcpy(dst + 4, src + 4, end - 4);
