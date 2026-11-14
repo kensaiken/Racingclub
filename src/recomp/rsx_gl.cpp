@@ -26,7 +26,7 @@ namespace gti::recomp::rsx {
 // ------------------------------------------------------------------ OpenGL loader (only what this file uses)
 typedef unsigned int GLenum; typedef unsigned char GLboolean; typedef unsigned int GLbitfield; typedef int GLint;
 typedef int GLsizei; typedef unsigned int GLuint; typedef float GLfloat; typedef double GLdouble; typedef char GLchar;
-typedef ptrdiff_t GLsizeiptr; typedef ptrdiff_t GLintptr;
+typedef ptrdiff_t GLsizeiptr; typedef ptrdiff_t GLintptr; typedef struct __GLsync* GLsync; typedef unsigned long long GLuint64;
 enum : GLenum {
     GL_NONE = 0, GL_POINTS = 0, GL_LINES = 1, GL_LINE_LOOP = 2, GL_LINE_STRIP = 3, GL_TRIANGLES = 4, GL_TRIANGLE_STRIP = 5, GL_TRIANGLE_FAN = 6,
     GL_DEPTH_BUFFER_BIT = 0x100, GL_STENCIL_BUFFER_BIT = 0x400, GL_COLOR_BUFFER_BIT = 0x4000,
@@ -54,6 +54,7 @@ enum : GLenum {
     GL_LOWER_LEFT = 0x8CA1, GL_ZERO_TO_ONE = 0x935F, GL_UNPACK_ALIGNMENT = 0x0CF5, GL_UNPACK_ROW_LENGTH = 0x0CF2,
     GL_CW = 0x0900, GL_CCW = 0x0901, GL_FRAMEBUFFER_SRGB = 0x8DB9, GL_RENDERER = 0x1F01, GL_VERSION = 0x1F02, GL_DEBUG_OUTPUT = 0x92E0,
     GL_DEPTH_CLAMP = 0x864F, GL_PROGRAM_POINT_SIZE = 0x8642,
+    GL_MAP_WRITE_BIT = 0x2, GL_MAP_PERSISTENT_BIT = 0x40, GL_MAP_COHERENT_BIT = 0x80, GL_SYNC_GPU_COMMANDS_COMPLETE = 0x9117, GL_SYNC_FLUSH_COMMANDS_BIT = 0x1,
 };
 #define RSX_GL(X) \
     X(const unsigned char*, glGetString, GLenum) X(void, glEnable, GLenum) X(void, glDisable, GLenum) X(void, glViewport, GLint, GLint, GLsizei, GLsizei) \
@@ -74,7 +75,9 @@ enum : GLenum {
     X(void, glCopyTexSubImage2D, GLenum, GLint, GLint, GLint, GLint, GLint, GLsizei, GLsizei) \
     X(void, glBlitFramebuffer, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum) \
     X(void, glDeleteFramebuffers, GLsizei, const GLuint*) X(void, glGenBuffers, GLsizei, GLuint*) X(void, glBindBuffer, GLenum, GLuint) \
-    X(void, glBufferData, GLenum, GLsizeiptr, const void*, GLenum) X(void, glBufferSubData, GLenum, GLintptr, GLsizeiptr, const void*) X(void, glBindBufferBase, GLenum, GLuint, GLuint) \
+    X(void, glBufferData, GLenum, GLsizeiptr, const void*, GLenum) X(void, glBufferSubData, GLenum, GLintptr, GLsizeiptr, const void*) \
+    X(void, glBufferStorage, GLenum, GLsizeiptr, const void*, GLbitfield) X(void*, glMapBufferRange, GLenum, GLintptr, GLsizeiptr, GLbitfield) \
+    X(GLsync, glFenceSync, GLenum, GLbitfield) X(GLenum, glClientWaitSync, GLsync, GLbitfield, GLuint64) X(void, glDeleteSync, GLsync) X(void, glBindBufferBase, GLenum, GLuint, GLuint) \
     X(void, glGenVertexArrays, GLsizei, GLuint*) X(void, glBindVertexArray, GLuint) \
     X(void, glVertexAttribPointer, GLuint, GLint, GLenum, GLboolean, GLsizei, const void*) X(void, glEnableVertexAttribArray, GLuint) \
     X(void, glDisableVertexAttribArray, GLuint) X(void, glVertexAttrib4f, GLuint, GLfloat, GLfloat, GLfloat, GLfloat) \
@@ -1202,6 +1205,30 @@ __attribute__((target("avx2"))) static void bswap32_block(uint32_t* dst, const u
     for (; i + 8 <= n; i += 8) _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 4 * i)), sh));
     for (; i < n; ++i) { uint32_t w; std::memcpy(&w, src + 4 * i, 4); dst[i] = __builtin_bswap32(w); }
 }
+// 16-bit big-endian indices + base -> 32-bit (every index of every draw goes through here)
+__attribute__((target("avx2"))) static void gather_i16(uint32_t* d, const uint8_t* q, uint32_t n, uint32_t add) {
+    const __m128i sh = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+    const __m256i va = _mm256_set1_epi32(int(add));
+    uint32_t k = 0;
+    for (; k + 8 <= n; k += 8)
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + k), _mm256_add_epi32(_mm256_cvtepu16_epi32(_mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(q + 2 * k)), sh)), va));
+    for (; k < n; ++k) { uint16_t w; std::memcpy(&w, q + 2 * size_t(k), 2); d[k] = uint32_t(__builtin_bswap16(w)) + add; }
+}
+// lowest index and highest index + 1 (the restart value 0xffffffff wraps to 0 and drops out of the maximum)
+__attribute__((target("avx2"))) static void index_range(const uint32_t* v, size_t n, uint32_t& lo, uint32_t& hi1) {
+    __m256i mn = _mm256_set1_epi32(-1), mx = _mm256_setzero_si256();
+    const __m256i one = _mm256_set1_epi32(1);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(v + i));
+        mn = _mm256_min_epu32(mn, x); mx = _mm256_max_epu32(mx, _mm256_add_epi32(x, one));
+    }
+    alignas(32) uint32_t a[8], b[8];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(a), mn); _mm256_store_si256(reinterpret_cast<__m256i*>(b), mx);
+    lo = 0xffffffffu; hi1 = 0;
+    for (int k = 0; k < 8; ++k) { lo = std::min(lo, a[k]); hi1 = std::max(hi1, b[k]); }
+    for (; i < n; ++i) { lo = std::min(lo, v[i]); hi1 = std::max(hi1, v[i] + 1); }
+}
 // Number of floats per vertex convert_attr writes for attribute a: float arrays keep their own size (byte swap only,
 // the missing components come from GL's defaults 0, 0, 1), everything else is expanded to 4.
 static uint32_t attr_comps(int a) {
@@ -1332,6 +1359,38 @@ static GLuint cached_stream(int a, uint32_t need) {
     return st.vbo;
 }
 
+// Per-draw vertex and index data go into one persistently mapped buffer used as a ring of 4 segments: a fence is
+// set when the writer leaves a segment and waited for before it comes back (several frames later), so no draw
+// pays for a buffer allocation in the driver (two glBufferData per draw before). RSXNORING=1: old path.
+static GLuint ringBuf = 0;
+static uint8_t* ringPtr = nullptr;
+static constexpr size_t kRingSeg = size_t(16) << 20, kRingSegs = 4;
+static size_t ringHead = 0, ringSegNo = 0;
+static GLsync ringFence[kRingSegs] = {};
+static void ring_init() {
+    if (std::getenv("RSXNORING") || !glBufferStorage || !glMapBufferRange || !glFenceSync) return;
+    glGenBuffers(1, &ringBuf);
+    glBindBuffer(GL_ARRAY_BUFFER, ringBuf);
+    const GLbitfield fl = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+    glBufferStorage(GL_ARRAY_BUFFER, GLsizeiptr(kRingSeg * kRingSegs), nullptr, fl);
+    ringPtr = static_cast<uint8_t*>(glMapBufferRange(GL_ARRAY_BUFFER, 0, GLsizeiptr(kRingSeg * kRingSegs), fl));
+    if (!ringPtr) RLOG("[rsx] persistent vertex ring not available, using glBufferData per draw\n");
+}
+// room for `bytes` (aligned) in the ring; nullptr when it does not fit in a segment (caller falls back)
+static uint8_t* ring_alloc(size_t bytes, size_t align, size_t& off) {
+    if (!ringPtr || bytes > kRingSeg) return nullptr;
+    size_t h = (ringHead + align - 1) & ~(align - 1);
+    if (h + bytes > (ringSegNo + 1) * kRingSeg) {   // next segment: fence this one, wait until the GPU is done with the next
+        ringFence[ringSegNo] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        ringSegNo = (ringSegNo + 1) % kRingSegs;
+        if (ringFence[ringSegNo]) { glClientWaitSync(ringFence[ringSegNo], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull); glDeleteSync(ringFence[ringSegNo]); ringFence[ringSegNo] = nullptr; }
+        h = ringSegNo * kRingSeg;
+    }
+    ringHead = h + bytes;
+    off = h;
+    return ringPtr + h;
+}
+
 // RSXPROF=1: time inside do_draw by stage (ms per second) and totals per second
 static uint64_t pfT[6], pfDraws, pfVerts, pfIdx, pfLast;
 static const char* const pfName[6] = {"target+program", "state+uniforms", "textures", "indices", "vertex conversion", "upload+draw"};
@@ -1418,7 +1477,7 @@ static void do_draw() {
             if (!rangesIndexed) for (uint32_t k = 0; k < r.count; ++k) d[k] = r.first + k;
             else if (i16) {
                 const uint8_t* q = C.mem + ibase + 2 * size_t(r.first);
-                for (uint32_t k = 0; k < r.count; ++k) { uint16_t w; std::memcpy(&w, q + 2 * size_t(k), 2); d[k] = uint32_t(__builtin_bswap16(w)) + add; }
+                gather_i16(d, q, r.count, add);
             } else {
                 const uint8_t* q = C.mem + ibase + 4 * size_t(r.first);
                 for (uint32_t k = 0; k < r.count; ++k) { uint32_t w; std::memcpy(&w, q + 4 * size_t(k), 4); d[k] = __builtin_bswap32(w) + add; }
@@ -1433,7 +1492,7 @@ static void do_draw() {
         }
         idx.resize(size_t(o - idx.data()));
         uint32_t lo = 0xffffffffu, hi1 = 0;   // hi1 = highest index + 1 (the restart value wraps to 0 and drops out)
-        for (const uint32_t v : idx) { lo = std::min(lo, v); hi1 = std::max(hi1, v + 1); }
+        index_range(idx.data(), idx.size(), lo, hi1);
         if (hi1 == 0) return;
         vmin = lo; vmax = hi1 - 1;
     }
@@ -1494,7 +1553,10 @@ static void do_draw() {
         vtxFloats += size_t(nv) * comps[k];
     }
     const bool nSlots = vtxFloats != 0;
-    vtx.resize(vtxFloats);
+    size_t vOff = 0;
+    float* vb = nSlots ? reinterpret_cast<float*>(ring_alloc(vtxFloats * 4, 16, vOff)) : nullptr;   // converted straight into the ring
+    const bool inRing = vb != nullptr;
+    if (!inRing) { vtx.resize(vtxFloats); vb = vtx.data(); }
     static const bool fmtStat = std::getenv("FMTSTAT") != nullptr;   // FMTSTAT=1: converted vertices per attribute format (debug)
     static std::map<uint64_t, uint64_t> fmtHist;
     for (int k = 0; k < na; ++k) {
@@ -1512,13 +1574,13 @@ static void do_draw() {
                 fmtHist.clear();
             }
         }
-        if (stride == 0) { convert_attr(attrs[k], 0, 1, vtx.data() + so); for (uint32_t v = 1; v < nv; ++v) std::memcpy(&vtx[so + v * 4], &vtx[so], 16); }
-        else if (!sparse) convert_attr(attrs[k], vmin, nv, vtx.data() + so, cc);
+        if (stride == 0) { float c4[4]; convert_attr(attrs[k], 0, 1, c4); for (uint32_t v = 0; v < nv; ++v) std::memcpy(vb + so + v * 4, c4, 16); }
+        else if (!sparse) convert_attr(attrs[k], vmin, nv, vb + so, cc);
         else
             for (uint32_t i = 0; i < nv;) {   // runs of consecutive vertices
                 uint32_t j = i + 1;
                 while (j < nv && uniq[j] == uniq[j - 1] + 1) ++j;
-                convert_attr(attrs[k], uniq[i], j - i, vtx.data() + so + size_t(i) * cc, cc);
+                convert_attr(attrs[k], uniq[i], j - i, vb + so + size_t(i) * cc, cc);
                 i = j;
             }
     }
@@ -1528,7 +1590,7 @@ static void do_draw() {
         uint32_t bad = 0;
         float mx = 0;
         for (uint32_t v = 0; v < nv; ++v)
-            for (int c = 0; c < 3; ++c) { const float f = vtx[v * 4 + c]; if (!(std::fabs(f) < 1e5f)) ++bad; else mx = std::max(mx, std::fabs(f)); }
+            for (int c = 0; c < 3; ++c) { const float f = vb[v * 4 + c]; if (!(std::fabs(f) < 1e5f)) ++bad; else mx = std::max(mx, std::fabs(f)); }
         static uint64_t tot[2] = {}, badv[2] = {}, draws[2] = {}, badDraws[2] = {};
         const int m = fo >> 31;
         tot[m] += nv; badv[m] += bad; ++draws[m]; if (bad) ++badDraws[m];
@@ -1537,26 +1599,28 @@ static void do_draw() {
     }
     mark();
     glBindVertexArray(vao);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    if (nSlots) glBufferData(GL_ARRAY_BUFFER, vtx.size() * 4, vtx.data(), GL_STREAM_DRAW);
+    const GLuint vBuf = inRing ? ringBuf : vbo;
+    glBindBuffer(GL_ARRAY_BUFFER, vBuf);
+    if (nSlots && !inRing) glBufferData(GL_ARRAY_BUFFER, vtx.size() * 4, vtx.data(), GL_STREAM_DRAW);
     for (int k = 0; k < na; ++k) {
         glEnableVertexAttribArray(attrs[k]);
         if (streamVbo[k]) {   // cached stream: holds every vertex from 0, the indices are relative to vmin
             glBindBuffer(GL_ARRAY_BUFFER, streamVbo[k]);
             glVertexAttribPointer(attrs[k], 4, GL_FLOAT, 0, 16, reinterpret_cast<const void*>(size_t(vmin) * 16));
-            glBindBuffer(GL_ARRAY_BUFFER, vbo);
+            glBindBuffer(GL_ARRAY_BUFFER, vBuf);
         } else
-            glVertexAttribPointer(attrs[k], GLint(comps[k]), GL_FLOAT, 0, GLsizei(4 * comps[k]), reinterpret_cast<const void*>(size_t(slot[k]) * 4));
+            glVertexAttribPointer(attrs[k], GLint(comps[k]), GL_FLOAT, 0, GLsizei(4 * comps[k]), reinterpret_cast<const void*>(vOff + size_t(slot[k]) * 4));
     }
     if (sparse) {
         if (vmap.size() < span) vmap.resize(span);
         for (uint32_t i = 0; i < nv; ++i) vmap[uniq[i] - vmin] = i;
         for (uint32_t& v : idx) if (v != 0xffffffffu) v = vmap[v - vmin];
     }
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.size() * 4, idx.data(), GL_STREAM_DRAW);
+    size_t iOff = 0;
+    if (uint8_t* ip = ring_alloc(idx.size() * 4, 4, iOff)) { std::memcpy(ip, idx.data(), idx.size() * 4); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ringBuf); }
+    else { iOff = 0; glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo); glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.size() * 4, idx.data(), GL_STREAM_DRAW); }
     // not sparse: the buffers start at vertex vmin, the base vertex takes it off the indices (restart is tested before it)
-    glDrawElementsBaseVertex(gl_prim(prim), GLsizei(idx.size()), GL_UNSIGNED_INT, nullptr, sparse ? 0 : -GLint(vmin));
+    glDrawElementsBaseVertex(gl_prim(prim), GLsizei(idx.size()), GL_UNSIGNED_INT, reinterpret_cast<const void*>(iOff), sparse ? 0 : -GLint(vmin));
     mark();
     if (prof) {
         ++pfDraws; pfVerts += nv; pfIdx += idx.size();
@@ -1646,6 +1710,7 @@ static void init_gl() {
     glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
     glGenVertexArrays(1, &vao); glBindVertexArray(vao);
     glGenBuffers(1, &vbo); glGenBuffers(1, &ibo); glGenBuffers(1, &ubo);
+    ring_init();
     glEnable(0x8D69 /* GL_PRIMITIVE_RESTART_FIXED_INDEX */);
     glEnable(GL_PROGRAM_POINT_SIZE);
     if (std::getenv("RSXCLAMP")) glEnable(GL_DEPTH_CLAMP);
@@ -2034,6 +2099,20 @@ void flip(uint32_t id) {
     }
     drawsThisFrame = 0;
     if (const GLenum e = glGetError()) { static int n = 0; if (n++ < 20) RLOG("[rsx] GL error 0x%x (frame %llu)\n", e, (unsigned long long)frameNo); }
+}
+
+void method_block(uint32_t m0, const uint8_t* args, uint32_t count, bool noInc) {
+    // transform constants (several matrices per draw): straight into vpConst
+    if (!noInc && m0 >= 0x1f00 && m0 + 4 * count <= 0x1f80 && glOk && enabled()) {
+        for (uint32_t i = 0; i < count; ++i) {
+            uint32_t w; std::memcpy(&w, args + 4 * i, 4); w = __builtin_bswap32(w);
+            const uint32_t k = cLoad * 4 + vpConstWord;
+            if (k < 468 * 4) { std::memcpy(&vpConst[k], &w, 4); vpDirtyLo = std::min(vpDirtyLo, k); vpDirtyHi = std::max(vpDirtyHi, k + 1); vpConstDirty = true; }
+            if (++vpConstWord == 4) { vpConstWord = 0; ++cLoad; }
+        }
+        return;
+    }
+    for (uint32_t i = 0; i < count; ++i) { uint32_t w; std::memcpy(&w, args + 4 * i, 4); method(noInc ? m0 : m0 + 4 * i, __builtin_bswap32(w)); }
 }
 
 void method(uint32_t m, uint32_t arg) {

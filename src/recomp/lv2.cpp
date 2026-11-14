@@ -445,6 +445,8 @@ void fifo_thread() {
                     const bool noInc = (cmd & 0x40000000) != 0;
                     const uint8_t* a = m + g + 4;
                     if (m0 == 0x1808 && count) { uint32_t w; std::memcpy(&w, a, 4); if (w) ++g_rsxBegins; }
+                    const uint32_t mEnd = noInc ? m0 : m0 + 4 * (count ? count - 1 : 0);   // last method of the packet
+                    if (count && ((m0 >= 0x100 && mEnd < 0x1d6c) || (m0 > 0x1d74 && mEnd < 0x2000))) { rsx::method_block(m0, a, count, noInc); g += 4 + 4 * count; any = true; continue; }
                     for (uint32_t i = 0; i < count; ++i) {
                         uint32_t arg; std::memcpy(&arg, a + 4 * i, 4); arg = __builtin_bswap32(arg);
                         const uint32_t mm = noInc ? m0 : m0 + 4 * i;
