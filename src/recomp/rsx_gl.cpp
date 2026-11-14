@@ -1586,7 +1586,7 @@ static void set_display_mode(int mode) {
 // ------------------------------------------------------------------ options menu (F1)
 static bool menuOpen = std::getenv("MENUTEST") != nullptr, menuDirty = true;   // MENUTEST=1 (debug): open from the start
 static int menuSel = 1;
-static const int kMenuLines = 12, kMenuFirst = 1, kMenuLast = 9;   // title, 9 options, 2 notes
+static const int kMenuLines = 13, kMenuFirst = 1, kMenuLast = 10;   // title, 10 options, 2 notes
 static void menu_change(int dir) {
     Settings& s = settings();
     switch (menuSel) {
@@ -1598,13 +1598,14 @@ static void menu_change(int dir) {
         case 6: s.showFps ^= 1; if (!s.showFps) SDL_SetWindowTitle(win, "GTI Club"); break;
         case 7: s.vsync ^= 1; SDL_GL_SetSwapInterval(s.vsync); break;
         case 8: s.sound ^= 1; break;
-        case 9: s.aniso = std::clamp(s.aniso + (dir ? dir : 1), 0, 4); ++g_texGen; break;   // the texture cache keeps sampler state: rebuild it
+        case 9: s.aniso = std::clamp(s.aniso + (dir ? dir : 1), 0, 4); ++g_texGen; break;
+        case 10: s.streaming ^= 1; break;   // the texture cache keeps sampler state: rebuild it
     }
     menuDirty = true;
 }
 static void draw_menu(int ww, int wh) {
     static GLuint tex = 0, fbo = 0;
-    const int W = 880, H = 650;
+    const int W = 880, H = 700;
     if (!tex) {
         glGenTextures(1, &tex); glGenFramebuffers(1, &fbo);
         glActiveTexture(GL_TEXTURE0 + 15); ++g_texGen;
@@ -1632,8 +1633,9 @@ static void draw_menu(int ww, int wh) {
             static const wchar_t* const an[5] = {L"No", L"2x", L"4x", L"8x", L"16x"};
             std::swprintf(l[9], 96, L"Filtrado anisótropo\t‹ %ls ›", an[std::clamp(s.aniso, 0, 4)]);
         }
-        std::swprintf(l[10], 96, L"* se aplica al reiniciar el juego");
-        std::swprintf(l[11], 96, L"Flechas: elegir y cambiar   ·   F1 o Esc: cerrar   ·   F11: ventana / pantalla completa");
+        std::swprintf(l[10], 96, L"Modo directo (60 para OBS/Twitch) *\t‹ %ls ›", s.streaming ? L"Sí" : L"No");
+        std::swprintf(l[11], 96, L"* se aplica al reiniciar el juego");
+        std::swprintf(l[12], 96, L"Flechas: elegir y cambiar   ·   F1 o Esc: cerrar   ·   F11: ventana / pantalla completa");
         const wchar_t* lines[kMenuLines];
         for (int i = 0; i < kMenuLines; ++i) lines[i] = l[i];
         static std::vector<uint32_t> px;

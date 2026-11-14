@@ -10,6 +10,7 @@ struct Settings {
     int language = 3;     // PS3 system language id (1 English, 2 French, 3 Spanish, 4 German, 5 Italian)
     int vsync = 0;        // swap interval 1: no tearing in exclusive full screen, a little more latency
     int aniso = 4;        // anisotropic filtering at least 2^aniso (0 = only what the game asks for, 4 = 16x)
+    int streaming = 0;    // live streaming / recording: 60 images per second and the display at 120 Hz, whatever gameHz says
     int sound = 1;        // sound effects (the game's MultiStream mixer runs on a host thread)
     int showFps = 1;      // frame rate in the window title
 };

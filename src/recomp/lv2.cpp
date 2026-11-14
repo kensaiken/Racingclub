@@ -526,7 +526,8 @@ void fifo_thread() {
 }
 
 // GAMEHZ=n: rate of the emulated vblank (experiment: the console has 60)
-const int g_gameHz = settings().gameHz;
+// streaming mode: 60 per second like the video (OBS, Twitch), so every game image is exactly one video frame
+const int g_gameHz = settings().streaming && !std::getenv("GAMEHZ") ? 60 : settings().gameHz;
 void vblank_thread() {
     t_tid = 0x01000201;
     // Pacing of the emulated 60 Hz vblank. When the display refreshes at a multiple of 60 the vblank follows the real
@@ -536,7 +537,7 @@ void vblank_thread() {
     {
         int hz = host_display_hz();
         const char* e = std::getenv("REFRESCO");
-        if (hz > 0 && hz % g_gameHz != 0 && settings().refresh && !(e && !std::strcmp(e, "0"))) {
+        if (hz > 0 && hz % g_gameHz != 0 && (settings().refresh || settings().streaming) && !(e && !std::strcmp(e, "0"))) {
             const int want = e && std::atoi(e) > 0 ? std::atoi(e) : 120;
             if (host_set_refresh(want)) { LOG("[vblank] display switched from %d to %d Hz while the game runs\n", hz, want); hz = want; }
             else LOG("[vblank] the display has no %d Hz mode: staying at %d Hz\n", want, hz);
