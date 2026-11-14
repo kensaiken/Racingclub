@@ -541,10 +541,12 @@ static FpInfo translate_fp(uint32_t ea, uint32_t texDims, uint32_t control) {
     }
     h += "bool fcond1(float c, int lt, int eq, int gt) { return (lt != 0 && c < 0.0) || (eq != 0 && c == 0.0) || (gt != 0 && c > 0.0); }\n"
          "bool fcond(vec4 c, int lt, int eq, int gt) { return fcond1(c.x, lt, eq, gt) || fcond1(c.y, lt, eq, gt) || fcond1(c.z, lt, eq, gt) || fcond1(c.w, lt, eq, gt); }\n"
+         // depth compare like GL_TEXTURE_COMPARE_FUNC: reference OP stored depth (it was the other way round: the
+         // whole road came out in shadow and the shadows of the trees as bright patches)
          "float shcmp(sampler2D t, vec3 p, float f) {\n"
          "  vec4 d = textureGather(t, p.xy, 0); vec4 r = vec4(p.z); vec4 c;\n"
-         "  if (f < 1.5) c = vec4(lessThan(d, r)); else if (f < 2.5) c = vec4(equal(d, r)); else if (f < 3.5) c = vec4(lessThanEqual(d, r));\n"
-         "  else if (f < 4.5) c = vec4(greaterThan(d, r)); else if (f < 5.5) c = vec4(notEqual(d, r)); else c = vec4(greaterThanEqual(d, r));\n"
+         "  if (f < 1.5) c = vec4(lessThan(r, d)); else if (f < 2.5) c = vec4(equal(r, d)); else if (f < 3.5) c = vec4(lessThanEqual(r, d));\n"
+         "  else if (f < 4.5) c = vec4(greaterThan(r, d)); else if (f < 5.5) c = vec4(notEqual(r, d)); else c = vec4(greaterThanEqual(r, d));\n"
          "  return dot(c, vec4(0.25));\n}\n"
          "vec4 flit(vec4 s) { float d = max(s.x, 0.0); float sp = s.x > 0.0 ? exp2(s.w * log2(max(s.y, 1e-30))) : 0.0; return vec4(1.0, d, sp, 1.0); }\n"
          "vec4 frefl(vec4 n, vec4 e) { return vec4(2.0 * dot(n.xyz, e.xyz) / dot(n.xyz, n.xyz) * n.xyz - e.xyz, 0.0); }\n"
