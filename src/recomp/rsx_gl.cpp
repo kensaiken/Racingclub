@@ -529,7 +529,7 @@ static FpInfo translate_fp(uint32_t ea, uint32_t texDims, uint32_t control) {
     while (!endAt.empty()) { b += "  }\n"; endAt.pop_back(); }
     fi.size = o;
     static const bool shDbg = std::getenv("SHDBG") != nullptr;   // debug: shadow-map results as the output colour
-    std::string h = std::string("#version 450\n") + (shDbg ? "#define SHDBG\nfloat g_shS = -1.0; vec2 g_shRD = vec2(0.0);\n" : "") +
+    std::string h = std::string("#version 450\n") + (shDbg ? "#define SHDBG\nfloat g_shS = -1.0; vec2 g_shRD = vec2(0.0);\n" : "") + "#define SHBIAS " + std::string(std::getenv("SHBIAS") ? std::getenv("SHBIAS") : "0.002") + "\n" +
                     "in vec4 v_col0, v_col1, v_bfc0, v_bfc1, v_fog;\nin vec4 v_tc[10];\n"
                     "uniform vec4 u_tsc[16];\nuniform vec4 u_alpha;\nuniform vec4 u_wpos;\n" + std::string("uniform vec4 fc[") + std::to_string(std::max(1u, fi.nConst)) + "];\n" +
                     "layout(location = 0) out vec4 o_c0;\nlayout(location = 1) out vec4 o_c1;\n"
@@ -542,12 +542,13 @@ static FpInfo translate_fp(uint32_t ea, uint32_t texDims, uint32_t control) {
     }
     h += "bool fcond1(float c, int lt, int eq, int gt) { return (lt != 0 && c < 0.0) || (eq != 0 && c == 0.0) || (gt != 0 && c > 0.0); }\n"
          "bool fcond(vec4 c, int lt, int eq, int gt) { return fcond1(c.x, lt, eq, gt) || fcond1(c.y, lt, eq, gt) || fcond1(c.z, lt, eq, gt) || fcond1(c.w, lt, eq, gt); }\n"
-         // depth compare like GL_TEXTURE_COMPARE_FUNC: reference OP stored depth (it was the other way round: the
-         // whole road came out in shadow and the shadows of the trees as bright patches)
+         // depth compare: stored depth OP reference (for GREATER the result is 1 where the surface is NOT behind an
+         // occluder; the game shades with it as "lit"). Checked against the car selection screen, where the cars'
+         // shadows are dark only this way. SHBIAS (default 0.002) moves the reference towards the light: no acne.
          "float shcmp(sampler2D t, vec3 p, float f) {\n"
-         "  vec4 d = textureGather(t, p.xy, 0); vec4 r = vec4(p.z); vec4 c;\n"
-         "  if (f < 1.5) c = vec4(lessThan(r, d)); else if (f < 2.5) c = vec4(equal(r, d)); else if (f < 3.5) c = vec4(lessThanEqual(r, d));\n"
-         "  else if (f < 4.5) c = vec4(greaterThan(r, d)); else if (f < 5.5) c = vec4(notEqual(r, d)); else c = vec4(greaterThanEqual(r, d));\n"
+         "  vec4 d = textureGather(t, p.xy, 0); vec4 r = vec4(p.z - SHBIAS); vec4 c;\n"
+         "  if (f < 1.5) c = vec4(lessThan(d, r)); else if (f < 2.5) c = vec4(equal(d, r)); else if (f < 3.5) c = vec4(lessThanEqual(d, r));\n"
+         "  else if (f < 4.5) c = vec4(greaterThan(d, r)); else if (f < 5.5) c = vec4(notEqual(d, r)); else c = vec4(greaterThanEqual(d, r));\n"
          // bilinear percentage-closer filtering like the hardware: the four results weighted by the position inside
          // the texel (an even average made the shadow edges blocky). textureGather order: (0,1) (1,1) (1,0) (0,0)
          "  vec2 fr = fract(p.xy * vec2(textureSize(t, 0)) - 0.5);\n"
@@ -979,7 +980,7 @@ static void bind_texture_impl(int i, float* tsc) {
         static std::set<uint64_t> seen;
         const bool hasDepth = surfaces.count((uint64_t(loc) << 33) | (uint64_t(1) << 32) | off), hasColor = surfaces.count((uint64_t(loc) << 33) | off);
         if (seen.size() < 40) RLOG("[shadow] border color register %08x\n", R[(base + 0x1c) >> 2]);
-        if (seen.insert(uint64_t(off) << 8 | uint64_t(i)).second && seen.size() < 40)
+        if (seen.insert(uint64_t(off) << 8 | uint64_t(i) | uint64_t((addr >> 28) & 7) << 40 | uint64_t(R[0x1d60 >> 2]) << 44).second && seen.size() < 40)
             RLOG("[shadow] unit %d: depth texture at %s 0x%x %ux%u fmt %02x func %u wrap %x: depth surface %s, color surface %s\n", i, loc ? "main" : "local", off, w, h, f, (addr >> 28) & 7, addr & 0xfff, hasDepth ? "found" : "missing", hasColor ? "found" : "missing");
     }
     // render target?
