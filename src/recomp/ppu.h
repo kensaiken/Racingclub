@@ -193,6 +193,9 @@ void rc_mark_hooked(uint32_t addr);   // calls to addr must go through g_hostHoo
 void rc_call(PPU& c, uint32_t addr);
 uint64_t rc_timebase();                    // PS3 time base counter (79.8 MHz)
 extern float g_frameStep;                  // game frames of 1/60 s per emulated frame (60 / vblank rate), see lv2.cpp
+extern uint32_t g_worldEa, g_physCalls;    // physics world last stepped and how often (set by patched game code)
+struct PPU;
+double rc_logic_acc(PPU& c, double dt, double acc);   // logic scheduler accumulator, see runtime.cpp
 using SyscallHook = void (*)(PPU&);
 extern SyscallHook g_syscallHook;          // lv2 syscalls (sc); unset = reported as unimplemented
 void rc_syscall(PPU& c);

@@ -110,8 +110,12 @@ def cond_branch(m, ops, nxt):
 # The game was written for 60 images per second; these make per-image steps follow the emulated vblank rate
 # (g_frameStep = 60 / rate, set by the runtime; 1.0 at 60 Hz, so the original behaviour is unchanged there).
 PATCHES = {
-    # car update: entity+100 = time step of the car's per-image logic (timers, effects), constant 1.0 per image
-    0x224be0: ('c.wrf32(ea_, (float)c.f[0]);', 'c.wrf32(ea_, (float)c.f[0] * g_frameStep);', 'car per-image step'),
+    # Logic scheduler (0xd4848): above 60 images per second the game ticked its 60 Hz logic once per image (countdown,
+    # menus and HUD 2.4 times too fast at 144). rc_logic_acc makes it tick exactly on the images where the physics
+    # world steps (real time, 60 Hz), or on its own 60 Hz clock where the world is not running (menus, pause).
+    0xd4a04: ('c.f[0] = (double)(float)(c.f[13] + c.f[0]);', 'c.f[0] = rc_logic_acc(c, c.f[13], c.f[0]);', 'logic ticks with the physics steps'),
+    # physics scheduler entry: remembers the world for rc_logic_acc
+    0x31b780: ('c.r[9] = (uint64_t)(uint32_t)c.rd32(ea_);', 'c.r[9] = (uint64_t)(uint32_t)c.rd32(ea_); g_worldEa = (uint32_t)c.r[3]; ++g_physCalls;', 'world seen by the logic scheduler'),
 }
 
 

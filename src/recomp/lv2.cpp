@@ -2503,14 +2503,16 @@ int lv2_run_main(Guest& g) {
             if (std::fabs(cur - expect) > 1e-6f) { LOG("[frame] constant at 0x%x is %g, not %g: logic step left alone\n", ea, cur, expect); return; }
             std::memcpy(&u, &v, 4); u = __builtin_bswap32(u); std::memcpy(g.mem + ea, &u, 4);
         };
-        // Written once the game shows images: its start-up also reads 1/60 there (done at boot, the countdown ran
-        // even faster). FRAMESTEPAT=n: after n images (debug).
-        if (g_frameStep != 1.0f) std::thread([setf] {
-            const unsigned long long at = std::getenv("FRAMESTEPAT") ? std::strtoull(std::getenv("FRAMESTEPAT"), nullptr, 10) : 1;
-            while (gcm::flips.load() < at) std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            setf(0xc6929c, 1.0f / 60.0f, g_frameStep / 60.0f);
-            setf(0xc692a8, 1.0f / 59.94f, g_frameStep / 59.94f);
-            LOG("[frame] logic step 1/%d s from image %llu (game written for 1/60)\n", gcm::g_gameHz, (unsigned long long)gcm::flips.load());
+        if (std::getenv("STEPLOG")) std::thread([gp] {   // STEPLOG=1: the scheduler's latched step, its flag, accumulator and mode every 5 s (debug)
+            const auto r32 = [gp](uint32_t a) { uint32_t u; std::memcpy(&u, gp->mem + a, 4); return __builtin_bswap32(u); };
+            const auto rf = [&](uint32_t a) { const uint32_t u = r32(a); float f; std::memcpy(&f, &u, 4); return double(f); };
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                const uint32_t r25 = r32(0xc6f210 - 24616), r23 = r32(0xc6f210 - 24416), r22 = r32(0xc6f210 - 24636);
+                const uint32_t g0 = r22 ? r32(r22) : 0, o144 = g0 ? r32(g0 + 144) : 0, o204 = g0 ? r32(g0 + 204) : 0;
+                LOG("[steplog] flips %llu: step(+712) %g, latched %u, mode %u, image dt(+188) %g, const %g\n", (unsigned long long)gcm::flips.load(),
+                    r25 ? rf(r25 + 712) : -1.0, r23 ? unsigned(gp->mem[r23]) : 99u, o144 ? r32(o144 + 536) : 99u, o204 ? rf(o204 + 188) : -1.0, rf(0xc6929c));
+            }
         }).detach();
     }
     // main thread, started like lv2 starts a process: r3 argc, r4 argv, r5 envp, r7 thread id, r8-r10 TLS image

@@ -2052,6 +2052,41 @@ void flip(uint32_t id) {
             glBlitFramebuffer(0, 0, it->second.w, it->second.h, dx, dy + dh, dx + dw, dy, GL_COLOR_BUFFER_BIT, GL_LINEAR);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, readFbo);   // the post passes bind GL_FRAMEBUFFER (the screenshots below read through readFbo)
+        {   // RSXBURST=seconds,n: n consecutive images from that second, kept in memory at 640x360 and written when the
+            // burst ends (rsxburst_NNN.bmp + their times in the log): shows motion image by image without slowing them
+            static double from = -1; static int want = 0; static bool parsed = false, done = false;
+            static std::vector<std::vector<uint8_t>> frames; static std::vector<double> times;
+            static GLuint smallFbo = 0, smallTex = 0;
+            if (!parsed) { parsed = true; if (const char* e = std::getenv("RSXBURST")) std::sscanf(e, "%lf,%d", &from, &want); }
+            if (want > 0 && !done && SDL_GetTicks() >= from * 1000) {
+                if (!smallFbo) {
+                    glGenFramebuffers(1, &smallFbo); glGenTextures(1, &smallTex);
+                    glBindTexture(GL_TEXTURE_2D, smallTex);
+                    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 640, 360, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, smallFbo);
+                    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, smallTex, 0);
+                    ++g_texGen;
+                }
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, smallFbo);
+                glBlitFramebuffer(0, 0, it->second.w, it->second.h, 0, 0, 640, 360, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, smallFbo);
+                frames.emplace_back(size_t(640) * 360 * 4);
+                glReadPixels(0, 0, 640, 360, GL_RGBA, GL_UNSIGNED_BYTE, frames.back().data());
+                times.push_back(SDL_GetTicksNS() / 1e6);
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, readFbo);
+                if (int(frames.size()) >= want) {
+                    done = true;
+                    for (size_t k = 0; k < frames.size(); ++k) {
+                        char fn[64]; std::snprintf(fn, sizeof fn, "rsxburst_%03zu.bmp", k);
+                        if (SDL_Surface* srf = SDL_CreateSurfaceFrom(640, 360, SDL_PIXELFORMAT_ABGR8888, frames[k].data(), 640 * 4)) { SDL_SaveBMP(srf, fn); SDL_DestroySurface(srf); }
+                        RLOG("[burst] %zu at %.2f ms\n", k, times[k] - times[0]);
+                    }
+                    frames.clear();
+                }
+            }
+        }
         static const int shotEvery = std::getenv("RSXSHOT") ? std::atoi(std::getenv("RSXSHOT")) : 0;
         static const double shotFrom = std::getenv("RSXSHOTFROM") ? std::atof(std::getenv("RSXSHOTFROM")) : 0, shotTo = std::getenv("RSXSHOTTO") ? std::atof(std::getenv("RSXSHOTTO")) : 1e9;   // seconds after launch
         if (shotEvery > 0 && frameNo % shotEvery == 0 && SDL_GetTicks() >= shotFrom * 1000 && SDL_GetTicks() <= shotTo * 1000) {   // RSXSHOT=N: save every color surface every N frames
