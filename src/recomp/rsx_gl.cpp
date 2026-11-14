@@ -528,7 +528,8 @@ static FpInfo translate_fp(uint32_t ea, uint32_t texDims, uint32_t control) {
     while (!elseAt.empty()) { b += "  } else {\n"; elseAt.pop_back(); }
     while (!endAt.empty()) { b += "  }\n"; endAt.pop_back(); }
     fi.size = o;
-    std::string h = "#version 450\n"
+    static const bool shDbg = std::getenv("SHDBG") != nullptr;   // debug: shadow-map results as the output colour
+    std::string h = std::string("#version 450\n") + (shDbg ? "#define SHDBG\nfloat g_shS = -1.0; vec2 g_shRD = vec2(0.0);\n" : "") +
                     "in vec4 v_col0, v_col1, v_bfc0, v_bfc1, v_fog;\nin vec4 v_tc[10];\n"
                     "uniform vec4 u_tsc[16];\nuniform vec4 u_alpha;\nuniform vec4 u_wpos;\n" + std::string("uniform vec4 fc[") + std::to_string(std::max(1u, fi.nConst)) + "];\n" +
                     "layout(location = 0) out vec4 o_c0;\nlayout(location = 1) out vec4 o_c1;\n"
@@ -547,7 +548,12 @@ static FpInfo translate_fp(uint32_t ea, uint32_t texDims, uint32_t control) {
          "  vec4 d = textureGather(t, p.xy, 0); vec4 r = vec4(p.z); vec4 c;\n"
          "  if (f < 1.5) c = vec4(lessThan(r, d)); else if (f < 2.5) c = vec4(equal(r, d)); else if (f < 3.5) c = vec4(lessThanEqual(r, d));\n"
          "  else if (f < 4.5) c = vec4(greaterThan(r, d)); else if (f < 5.5) c = vec4(notEqual(r, d)); else c = vec4(greaterThanEqual(r, d));\n"
-         "  return dot(c, vec4(0.25));\n}\n"
+         // bilinear percentage-closer filtering like the hardware: the four results weighted by the position inside
+         // the texel (an even average made the shadow edges blocky). textureGather order: (0,1) (1,1) (1,0) (0,0)
+         "  vec2 fr = fract(p.xy * vec2(textureSize(t, 0)) - 0.5);\n"
+         "  float s = mix(mix(c.w, c.z, fr.x), mix(c.x, c.y, fr.x), fr.y);\n"
+         "#ifdef SHDBG\n  g_shS = s; g_shRD = vec2(p.z, d.w);\n#endif\n"
+         "  return s;\n}\n"
          "vec4 flit(vec4 s) { float d = max(s.x, 0.0); float sp = s.x > 0.0 ? exp2(s.w * log2(max(s.y, 1e-30))) : 0.0; return vec4(1.0, d, sp, 1.0); }\n"
          "vec4 frefl(vec4 n, vec4 e) { return vec4(2.0 * dot(n.xyz, e.xyz) / dot(n.xyz, n.xyz) * n.xyz - e.xyz, 0.0); }\n"
          "vec4 col0() { return gl_FrontFacing ? v_col0 : v_col0; }\n"
@@ -568,7 +574,9 @@ static FpInfo translate_fp(uint32_t ea, uint32_t texDims, uint32_t control) {
             "    if (f == 0) pass = false; else if (f == 1) pass = a < r; else if (f == 2) pass = a == r; else if (f == 3) pass = a <= r;\n"
             "    else if (f == 4) pass = a > r; else if (f == 5) pass = a != r; else if (f == 6) pass = a >= r;\n"
             "    if (!pass) discard;\n  }\n";
-    if (std::getenv("RSXRED")) tail += "  o_c0 = v_col0;\n";    fi.glsl = h + b + tail + "}\n";
+    if (std::getenv("RSXRED")) tail += "  o_c0 = v_col0;\n";
+    if (shDbg) tail += std::getenv("SHDBG")[0] == '2' ? "  if (g_shS >= 0.0) o_c0 = vec4(g_shRD, g_shS, 1.0);\n" : "  if (g_shS >= 0.0) o_c0 = vec4(g_shS, 1.0 - g_shS, 0.0, 1.0);\n";   // red = shadow 1, green = 0
+    fi.glsl = h + b + tail + "}\n";
     return fi;
 }
 
@@ -970,6 +978,7 @@ static void bind_texture_impl(int i, float* tsc) {
     if (std::getenv("SHADOWLOG") && texDimsOf(i) == 3) {   // debug: shadow-map lookups
         static std::set<uint64_t> seen;
         const bool hasDepth = surfaces.count((uint64_t(loc) << 33) | (uint64_t(1) << 32) | off), hasColor = surfaces.count((uint64_t(loc) << 33) | off);
+        if (seen.size() < 40) RLOG("[shadow] border color register %08x\n", R[(base + 0x1c) >> 2]);
         if (seen.insert(uint64_t(off) << 8 | uint64_t(i)).second && seen.size() < 40)
             RLOG("[shadow] unit %d: depth texture at %s 0x%x %ux%u fmt %02x func %u wrap %x: depth surface %s, color surface %s\n", i, loc ? "main" : "local", off, w, h, f, (addr >> 28) & 7, addr & 0xfff, hasDepth ? "found" : "missing", hasColor ? "found" : "missing");
     }
@@ -1887,6 +1896,7 @@ void flip(uint32_t id) {
         if (!post_present(it->second.tex, int(it->second.w), int(it->second.h), dx, dy, dw, dh))
             glBlitFramebuffer(0, 0, it->second.w, it->second.h, dx, dy + dh, dx + dw, dy, GL_COLOR_BUFFER_BIT, GL_LINEAR);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, readFbo);   // the post passes bind GL_FRAMEBUFFER (the screenshots below read through readFbo)
         static const int shotEvery = std::getenv("RSXSHOT") ? std::atoi(std::getenv("RSXSHOT")) : 0;
         if (shotEvery > 0 && frameNo % shotEvery == 0) {   // RSXSHOT=N: save every color surface every N frames
             RLOG("[shot] frame %llu at %.2f s\n", (unsigned long long)frameNo, SDL_GetTicks() / 1000.0);
