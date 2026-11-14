@@ -429,6 +429,34 @@ void fifo_thread() {
             continue;
         }
         idle = 0;
+        {   // fast path: a run of plain method packets (no jumps, calls, returns, NOPs or holes) up to put, without the
+            // per-word debug bookkeeping below; get is published once per run (and before any method that may block or
+            // let the game look at it). ~1000 draws a frame of a few dozen register writes each go through here.
+            static const bool slowOnly = std::getenv("FIFOSLOW") || std::getenv("METHODHIST") || std::getenv("FIFODUMP");
+            if (!slowOnly) {
+                const uint8_t* m = G->mem + ioAddr;
+                uint32_t g = get;
+                bool any = false;
+                while (g != put) {
+                    uint32_t cmd; std::memcpy(&cmd, m + g, 4); cmd = __builtin_bswap32(cmd);
+                    if ((cmd & 0xA0000003) || cmd == 0 || cmd == 0x00020000) break;   // control flow / NOP: slow path
+                    const uint32_t count = (cmd >> 18) & 0x7ff, m0 = cmd & 0xfffc;
+                    if (put > g && g + 4 + 4 * count > put) break;   // not completely published yet
+                    const bool noInc = (cmd & 0x40000000) != 0;
+                    const uint8_t* a = m + g + 4;
+                    if (m0 == 0x1808 && count) { uint32_t w; std::memcpy(&w, a, 4); if (w) ++g_rsxBegins; }
+                    for (uint32_t i = 0; i < count; ++i) {
+                        uint32_t arg; std::memcpy(&arg, a + 4 * i, 4); arg = __builtin_bswap32(arg);
+                        const uint32_t mm = noInc ? m0 : m0 + 4 * i;
+                        if ((mm >= 0x100 && mm < 0x1d6c) || (mm > 0x1d74 && mm < 0x2000)) rsx::method(mm, arg);
+                        else { __atomic_store_n(reinterpret_cast<uint32_t*>(G->mem + ctrl + 4), __builtin_bswap32(g), __ATOMIC_RELEASE); method(mm, arg, semA, semB); }
+                    }
+                    g += 4 + 4 * count;
+                    any = true;
+                }
+                if (any) { __atomic_store_n(reinterpret_cast<uint32_t*>(G->mem + ctrl + 4), __builtin_bswap32(g), __ATOMIC_RELEASE); continue; }
+            }
+        }
         uint32_t g2 = get;
         const uint32_t cmd = rd(io2ea(g2));
         const bool selfJump = ((cmd & 0xE0000003) == 0x20000000 && (cmd & 0x1FFFFFFC) == g2) || ((cmd & 3) == 1 && (cmd & 0xFFFFFFFC) == g2);
@@ -1248,6 +1276,7 @@ void worker(int idx) {
     t_tid = 0x01000210 + idx;
     if (idx == 0) std::thread(ring_watchdog).detach();
     t_spuNum = idx;
+    { char nm[16]; std::snprintf(nm, sizeof nm, "spu%d", idx); ripprof_register_thread(nm); }
     for (;;) {
         JobDesc jd;
         {

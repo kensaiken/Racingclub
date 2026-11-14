@@ -18,6 +18,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <immintrin.h>
 
 namespace gti::recomp { bool host_menu_bitmap(const wchar_t* const* lines, int n, int sel, int w, int h, uint32_t* out); }   // host_win.cpp
 namespace gti::recomp::rsx {
@@ -73,7 +74,7 @@ enum : GLenum {
     X(void, glCopyTexSubImage2D, GLenum, GLint, GLint, GLint, GLint, GLint, GLsizei, GLsizei) \
     X(void, glBlitFramebuffer, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum) \
     X(void, glDeleteFramebuffers, GLsizei, const GLuint*) X(void, glGenBuffers, GLsizei, GLuint*) X(void, glBindBuffer, GLenum, GLuint) \
-    X(void, glBufferData, GLenum, GLsizeiptr, const void*, GLenum) X(void, glBindBufferBase, GLenum, GLuint, GLuint) \
+    X(void, glBufferData, GLenum, GLsizeiptr, const void*, GLenum) X(void, glBufferSubData, GLenum, GLintptr, GLsizeiptr, const void*) X(void, glBindBufferBase, GLenum, GLuint, GLuint) \
     X(void, glGenVertexArrays, GLsizei, GLuint*) X(void, glBindVertexArray, GLuint) \
     X(void, glVertexAttribPointer, GLuint, GLint, GLenum, GLboolean, GLsizei, const void*) X(void, glEnableVertexAttribArray, GLuint) \
     X(void, glDisableVertexAttribArray, GLuint) X(void, glVertexAttrib4f, GLuint, GLfloat, GLfloat, GLfloat, GLfloat) \
@@ -97,6 +98,7 @@ static uint32_t R[0x4000];                     // last value written to every NV
 static uint32_t vpCode[512 * 4];               // transform program memory
 static float vpConst[468 * 4];                 // transform constants
 static bool vpConstDirty = true;
+static uint32_t vpDirtyLo = 0, vpDirtyHi = 468 * 4;   // floats of vpConst changed since the last upload
 static uint32_t vpLoad = 0, cLoad = 0;         // load cursors (in words / constants)
 static uint32_t vpConstWord = 0;
 struct Range { uint32_t first, count; };
@@ -609,8 +611,21 @@ static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, u
     static uint64_t vpKeyGen = 0, vpKey = 0; static uint32_t vpKeyStart = ~0u;
     if (vpKeyGen != vpGen || vpKeyStart != vpStart) { vpKey = fnv(vpCode + vpStart * 4, n * 16); vpKeyGen = vpGen; vpKeyStart = vpStart; }
     uint64_t key = vpKey;
-    g_fpConsts.clear();
-    key = fp_walk(fpEa, key, &g_fpConsts);
+    {   // fragment program: hash of its instruction words + its inline constants. Memo per address: when the bytes
+        // are unchanged (one memcmp) the walk is skipped; the game patches constants in place, which only costs a re-walk.
+        struct FpMemo { std::vector<uint8_t> raw; uint64_t h = 0; std::vector<float> consts; };
+        static std::unordered_map<uint32_t, FpMemo> memo;
+        static const bool off = std::getenv("RSXNOFPMEMO") != nullptr;
+        FpMemo& fm = memo[fpEa];
+        if (off || fm.raw.empty() || std::memcmp(C.mem + fpEa, fm.raw.data(), fm.raw.size()) != 0) {
+            fm.consts.clear();
+            fm.h = fp_walk(fpEa, 0x51ed270b3c6f84d5ull, &fm.consts);
+            const uint32_t sz = fp_size(fpEa);
+            fm.raw.assign(C.mem + fpEa, C.mem + fpEa + sz);
+        }
+        g_fpConsts = fm.consts;
+        key = (key ^ fm.h) * 0x9E3779B97F4A7C15ull ^ fm.h;
+    }
     key ^= (uint64_t(texDims) << 1) ^ (uint64_t(control & 0x4e) << 40) ^ uint64_t(vpStart) * 0x9E3779B97F4A7C15ull;
     auto it = programs.find(key);
     if (it != programs.end()) return &it->second;
@@ -976,7 +991,8 @@ static void bind_texture_impl(int i, float* tsc) {
     const uint32_t pitch = ctl3 & 0xfffff;
     tsc[0] = un ? 1.f / w : 1.f; tsc[1] = un ? 1.f / h : 1.f; tsc[2] = float((addr >> 28) & 7); tsc[3] = 1.f;   // z: depth compare function (shcmp)
     glActiveTexture(GL_TEXTURE0 + i);
-    if (std::getenv("SHADOWLOG") && texDimsOf(i) == 3) {   // debug: shadow-map lookups
+    static const bool shadowLog = std::getenv("SHADOWLOG") != nullptr;   // (getenv per draw cost ~5% of the RSX thread)
+    if (shadowLog && texDimsOf(i) == 3) {   // debug: shadow-map lookups
         static std::set<uint64_t> seen;
         const bool hasDepth = surfaces.count((uint64_t(loc) << 33) | (uint64_t(1) << 32) | off), hasColor = surfaces.count((uint64_t(loc) << 33) | off);
         if (seen.size() < 40) RLOG("[shadow] border color register %08x\n", R[(base + 0x1c) >> 2]);
@@ -1069,7 +1085,7 @@ static void bind_texture_impl(int i, float* tsc) {
     // rewritten in place (render targets are handled apart), and this sampling was a third of the RSX thread.
     if (!tx.id || tx.regSig != regSig || frameNo - tx.checked >= 4 || tx.checked > frameNo) {
         sig = regSig;
-        const uint32_t step = std::max<uint32_t>(64, total / 512);
+        const uint32_t step = std::max<uint32_t>(64, total / 128);   // 128 samples: a texture streamed over another changes everywhere
         for (uint32_t k = 0; k + 8 <= total; k += step) sig = fnv(C.mem + ea + k, 8, sig);
         sig = fnv(C.mem + ea + total - std::min<uint32_t>(total, 8), std::min<uint32_t>(total, 8), sig);
         tx.checked = frameNo; tx.regSig = regSig;
@@ -1179,11 +1195,32 @@ static void bind_texture_impl(int i, float* tsc) {
 static std::vector<float> vtx;
 static std::vector<uint32_t> idx;
 
-static void convert_attr(int a, uint32_t first, uint32_t count, float* out) {
+// byte-swaps n big-endian 32-bit words (the float vertex arrays: Edge writes ~20 million positions a second)
+__attribute__((target("avx2"))) static void bswap32_block(uint32_t* dst, const uint8_t* src, size_t n) {
+    const __m256i sh = _mm256_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12, 3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 4 * i)), sh));
+    for (; i < n; ++i) { uint32_t w; std::memcpy(&w, src + 4 * i, 4); dst[i] = __builtin_bswap32(w); }
+}
+// Number of floats per vertex convert_attr writes for attribute a: float arrays keep their own size (byte swap only,
+// the missing components come from GL's defaults 0, 0, 1), everything else is expanded to 4.
+static uint32_t attr_comps(int a) {
+    const uint32_t fmt = R[(0x1740 + 4 * a) >> 2];
+    const uint32_t size = std::min<uint32_t>((fmt >> 4) & 0xf, 4);
+    static const bool off = std::getenv("RSXCOMPS4") != nullptr;   // RSXCOMPS4=1: old path (everything as 4 floats), for A/B checks
+    return !off && (fmt & 0xf) == 2 && ((fmt >> 8) & 0xff) && size ? size : 4;
+}
+static void convert_attr(int a, uint32_t first, uint32_t count, float* out, uint32_t comps = 4) {
     const uint32_t fmt = R[(0x1740 + 4 * a) >> 2], offReg = R[(0x1680 + 4 * a) >> 2];
     const uint32_t type = fmt & 0xf, size = std::min<uint32_t>((fmt >> 4) & 0xf, 4), stride = (fmt >> 8) & 0xff;
     const uint32_t base = ea_of(offReg & 0x7fffffff, offReg >> 31) + R[0x1738 >> 2];
     const uint8_t* p = C.mem + base + size_t(stride) * first;
+    if (type == 2 && comps == size && stride) {   // packed floats: byte swap only
+        uint32_t* o = reinterpret_cast<uint32_t*>(out);
+        if (stride == 4 * size) bswap32_block(o, p, size_t(count) * size);
+        else for (uint32_t v = 0; v < count; ++v, p += stride, o += size) bswap32_block(o, p, size);
+        return;
+    }
     // one tight loop per type (this runs for every vertex of every draw); missing components are 0, 0, 0, 1
     const auto r16 = [](const uint8_t* q) { uint16_t v; std::memcpy(&v, q, 2); return uint16_t(__builtin_bswap16(v)); };
     const auto r32 = [](const uint8_t* q) { uint32_t v; std::memcpy(&v, q, 4); return __builtin_bswap32(v); };
@@ -1332,7 +1369,13 @@ static void do_draw() {
     glUseProgram(p->prog);
     apply_state();
     // vertex program constants
-    if (vpConstDirty) { glBindBuffer(GL_UNIFORM_BUFFER, ubo); glBufferData(GL_UNIFORM_BUFFER, sizeof vpConst, vpConst, GL_STREAM_DRAW); vpConstDirty = false; }
+    if (vpConstDirty) {   // only the constants written since the last draw (usually a matrix or two of the 468 registers)
+        static bool allocated = false;
+        glBindBuffer(GL_UNIFORM_BUFFER, ubo);
+        if (!allocated) { glBufferData(GL_UNIFORM_BUFFER, sizeof vpConst, vpConst, GL_DYNAMIC_DRAW); allocated = true; }
+        else glBufferSubData(GL_UNIFORM_BUFFER, GLintptr(vpDirtyLo) * 4, GLsizeiptr(vpDirtyHi - vpDirtyLo) * 4, vpConst + vpDirtyLo);
+        vpConstDirty = false; vpDirtyLo = 468 * 4; vpDirtyHi = 0;
+    }
     glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo);
     float vs[4] = {rf(0xa30), rf(0xa34), rf(0xa38), rf(0xa3c)}, vo[4] = {rf(0xa20), rf(0xa24), rf(0xa28), rf(0xa2c)};
     glUniform4fv(p->uVs, 1, vs);
@@ -1405,7 +1448,22 @@ static void do_draw() {
     // A draw often uses a few vertices spread over a large buffer: convert only the referenced ones then.
     static std::vector<uint32_t> uniq, vmap;
     const uint32_t span = vmax - vmin + 1;
-    const bool sparse = rangesIndexed && span > 64 && span > idx.size() * 2;
+    // Edge-culled draws index a few scattered vertices of static buffers in local memory: when every attribute is
+    // such a buffer, the cached streams serve them with the original indices (no sort, conversion or remap per draw)
+    static const bool noSparseCache = std::getenv("RSXNOSPARSECACHE") != nullptr;
+    // The same holds when the only other attributes are float arrays in main memory (Edge-transformed positions): a
+    // byte swap of the whole span is cheaper than sorting the indices and converting the static attributes per draw.
+    bool allCacheable = !noSparseCache, mainFloats = false;
+    for (int a = 0; a < 16 && allCacheable; ++a) {
+        if (!(p->vpInputs & (1u << a))) continue;
+        const uint32_t fmt = R[(0x1740 + 4 * a) >> 2];
+        if (!((fmt >> 4) & 0xf)) continue;
+        if (!((fmt >> 8) & 0xff)) allCacheable = false;
+        else if (R[(0x1680 + 4 * a) >> 2] >> 31) { if ((fmt & 0xf) == 2) mainFloats = true; else allCacheable = false; }
+    }
+    static const long spanMul = std::getenv("RSXSPANMUL") ? std::atol(std::getenv("RSXSPANMUL")) : 12;
+    const bool dense = allCacheable && vmax < 1000000 && (!mainFloats || span <= idx.size() * size_t(spanMul));
+    const bool sparse = rangesIndexed && span > 64 && span > idx.size() * 2 && !dense;
     if (sparse) {
         uniq.clear();
         for (uint32_t v : idx) if (v != 0xffffffffu) uniq.push_back(v);
@@ -1424,19 +1482,43 @@ static void do_draw() {
             glVertexAttrib4f(a, rf(0x1c00 + 16 * a), rf(0x1c04 + 16 * a), rf(0x1c08 + 16 * a), rf(0x1c0c + 16 * a));
         }
     }
-    vtx.resize(size_t(na) * nv * 4);
     GLuint streamVbo[16] = {};
+    // where in vtx each attribute converted for this draw starts (in floats; -1 = cached stream), and its floats per vertex
+    long slot[16]; uint32_t comps[16]; size_t vtxFloats = 0;
+    for (int k = 0; k < na; ++k) {
+        comps[k] = 4;
+        if (!sparse && (streamVbo[k] = cached_stream(attrs[k], vmax + 1)) != 0) { slot[k] = -1; continue; }
+        const uint32_t fmt = R[(0x1740 + 4 * attrs[k]) >> 2];
+        comps[k] = ((fmt >> 8) & 0xff) ? attr_comps(attrs[k]) : 4;
+        slot[k] = long(vtxFloats);
+        vtxFloats += size_t(nv) * comps[k];
+    }
+    const bool nSlots = vtxFloats != 0;
+    vtx.resize(vtxFloats);
+    static const bool fmtStat = std::getenv("FMTSTAT") != nullptr;   // FMTSTAT=1: converted vertices per attribute format (debug)
+    static std::map<uint64_t, uint64_t> fmtHist;
     for (int k = 0; k < na; ++k) {
         const uint32_t fmt = R[(0x1740 + 4 * attrs[k]) >> 2];
         const uint32_t stride = (fmt >> 8) & 0xff;
-        if (!sparse && (streamVbo[k] = cached_stream(attrs[k], vmax + 1)) != 0) continue;
-        if (stride == 0) { convert_attr(attrs[k], 0, 1, vtx.data() + size_t(k) * nv * 4); for (uint32_t v = 1; v < nv; ++v) std::memcpy(&vtx[(size_t(k) * nv + v) * 4], &vtx[size_t(k) * nv * 4], 16); }
-        else if (!sparse) convert_attr(attrs[k], vmin, nv, vtx.data() + size_t(k) * nv * 4);
+        if (slot[k] < 0) continue;
+        const size_t so = size_t(slot[k]);   // first float of this attribute's slot
+        const uint32_t cc = comps[k];
+        if (fmtStat) {
+            fmtHist[uint64_t(fmt & 0xffff) | uint64_t(R[(0x1680 + 4 * attrs[k]) >> 2] >> 31) << 16 | uint64_t(sparse) << 17 | uint64_t(attrs[k]) << 20] += nv;
+            if (frameNo % 600 == 0 && drawsThisFrame == 1) {
+                std::vector<std::pair<uint64_t, uint64_t>> v(fmtHist.begin(), fmtHist.end());
+                std::sort(v.begin(), v.end(), [](auto& x, auto& y) { return x.second > y.second; });
+                for (size_t i = 0; i < v.size() && i < 12; ++i) RLOG("[fmt] attr %llu fmt %04llx %s%s: %llu k vertices\n", (unsigned long long)(v[i].first >> 20), (unsigned long long)(v[i].first & 0xffff), (v[i].first >> 16 & 1) ? "main" : "local", (v[i].first >> 17 & 1) ? " sparse" : "", (unsigned long long)(v[i].second / 1000));
+                fmtHist.clear();
+            }
+        }
+        if (stride == 0) { convert_attr(attrs[k], 0, 1, vtx.data() + so); for (uint32_t v = 1; v < nv; ++v) std::memcpy(&vtx[so + v * 4], &vtx[so], 16); }
+        else if (!sparse) convert_attr(attrs[k], vmin, nv, vtx.data() + so, cc);
         else
             for (uint32_t i = 0; i < nv;) {   // runs of consecutive vertices
                 uint32_t j = i + 1;
                 while (j < nv && uniq[j] == uniq[j - 1] + 1) ++j;
-                convert_attr(attrs[k], uniq[i], j - i, vtx.data() + (size_t(k) * nv + i) * 4);
+                convert_attr(attrs[k], uniq[i], j - i, vtx.data() + so + size_t(i) * cc, cc);
                 i = j;
             }
     }
@@ -1456,7 +1538,7 @@ static void do_draw() {
     mark();
     glBindVertexArray(vao);
     glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    glBufferData(GL_ARRAY_BUFFER, vtx.size() * 4, vtx.data(), GL_STREAM_DRAW);
+    if (nSlots) glBufferData(GL_ARRAY_BUFFER, vtx.size() * 4, vtx.data(), GL_STREAM_DRAW);
     for (int k = 0; k < na; ++k) {
         glEnableVertexAttribArray(attrs[k]);
         if (streamVbo[k]) {   // cached stream: holds every vertex from 0, the indices are relative to vmin
@@ -1464,7 +1546,7 @@ static void do_draw() {
             glVertexAttribPointer(attrs[k], 4, GL_FLOAT, 0, 16, reinterpret_cast<const void*>(size_t(vmin) * 16));
             glBindBuffer(GL_ARRAY_BUFFER, vbo);
         } else
-            glVertexAttribPointer(attrs[k], 4, GL_FLOAT, 0, 16, reinterpret_cast<const void*>(size_t(k) * nv * 16));
+            glVertexAttribPointer(attrs[k], GLint(comps[k]), GL_FLOAT, 0, GLsizei(4 * comps[k]), reinterpret_cast<const void*>(size_t(slot[k]) * 4));
     }
     if (sparse) {
         if (vmap.size() < span) vmap.resize(span);
@@ -1940,8 +2022,10 @@ void flip(uint32_t id) {
     pump_events();
     static uint64_t lastT = SDL_GetTicks(), lastF = 0;
     const uint64_t now = SDL_GetTicks();
-    if (now - lastT >= 2000 && !settings().showFps) { lastT = now; lastF = frameNo; }
+    if (now - lastT >= 2000 && !settings().showFps && !std::getenv("FPSLOG")) { lastT = now; lastF = frameNo; }
     if (now - lastT >= 2000) {
+        static const bool fpsLog = std::getenv("FPSLOG") != nullptr;   // FPSLOG=1: frame rate every 2 s in the log (benchmarks)
+        if (fpsLog) RLOG("[fps] %.1f s: %.1f\n", now / 1000.0, (frameNo - lastF) * 1000.0 / (now - lastT));
         char title[160];
         std::snprintf(title, sizeof title, "GTI Club - %.1f fps (F1: opciones)", (frameNo - lastF) * 1000.0 / (now - lastT),
                       (unsigned long long)drawsThisFrame, programs.size());
@@ -1964,7 +2048,7 @@ void method(uint32_t m, uint32_t arg) {
     }
     if (m >= 0x1f00 && m < 0x1f80) {   // transform constants
         const uint32_t i = cLoad * 4 + vpConstWord;
-        if (i < 468 * 4) { std::memcpy(&vpConst[i], &arg, 4); vpConstDirty = true; }
+        if (i < 468 * 4) { std::memcpy(&vpConst[i], &arg, 4); vpConstDirty = true; vpDirtyLo = std::min(vpDirtyLo, i); vpDirtyHi = std::max(vpDirtyHi, i + 1); }
         if (++vpConstWord == 4) { vpConstWord = 0; ++cLoad; }
         return;
     }

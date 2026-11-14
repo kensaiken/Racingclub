@@ -88,6 +88,8 @@ if(RECOMP_FULL_SRC)
   # whole game booted natively from its entry point (system layer: src/recomp/lv2.cpp)
   add_executable(recomp_boot src/tools/recomp_boot.cpp src/recomp/guest.cpp src/recomp/lv2.cpp src/recomp/spu.cpp src/recomp/rsx_gl.cpp src/recomp/ripprof.cpp src/recomp/host_win.cpp src/recomp/settings.cpp src/recomp/audio_out.cpp ${SPU_GEN_SRC})
   target_link_libraries(recomp_boot PRIVATE recomp_full gti_formats SDL3::SDL3-static opengl32)
+  # line tables (no effect on speed) so the RIPPROF samples of the system layer resolve to source lines
+  set_source_files_properties(src/recomp/lv2.cpp src/recomp/rsx_gl.cpp PROPERTIES COMPILE_OPTIONS "-gline-tables-only")
   if(WIN32)
     target_link_libraries(recomp_boot PRIVATE dwmapi)
   endif()
