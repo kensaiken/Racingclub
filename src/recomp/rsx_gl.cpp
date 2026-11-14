@@ -1588,7 +1588,7 @@ static void set_display_mode(int mode) {
 // ------------------------------------------------------------------ options menu (F1)
 static bool menuOpen = std::getenv("MENUTEST") != nullptr, menuDirty = true;   // MENUTEST=1 (debug): open from the start
 static int menuSel = 1;
-static const int kMenuLines = 13, kMenuFirst = 1, kMenuLast = 10;   // title, 10 options, 2 notes
+static const int kMenuLines = 15, kMenuFirst = 1, kMenuLast = 12;   // title, 12 options, 2 notes
 static void menu_change(int dir) {
     Settings& s = settings();
     switch (menuSel) {
@@ -1601,13 +1601,15 @@ static void menu_change(int dir) {
         case 7: s.vsync ^= 1; SDL_GL_SetSwapInterval(s.vsync); break;
         case 8: s.sound ^= 1; break;
         case 9: s.aniso = std::clamp(s.aniso + (dir ? dir : 1), 0, 4); ++g_texGen; break;
-        case 10: s.streaming ^= 1; break;   // the texture cache keeps sampler state: rebuild it
+        case 10: s.streaming ^= 1; break;
+        case 11: s.fxaa ^= 1; break;
+        case 12: s.sharpen = (s.sharpen + (dir ? dir : 1) + 4) % 4; break;   // the texture cache keeps sampler state: rebuild it
     }
     menuDirty = true;
 }
 static void draw_menu(int ww, int wh) {
     static GLuint tex = 0, fbo = 0;
-    const int W = 880, H = 700;
+    const int W = 880, H = 800;
     if (!tex) {
         glGenTextures(1, &tex); glGenFramebuffers(1, &fbo);
         glActiveTexture(GL_TEXTURE0 + 15); ++g_texGen;
@@ -1636,8 +1638,13 @@ static void draw_menu(int ww, int wh) {
             std::swprintf(l[9], 96, L"Filtrado anisótropo\t‹ %ls ›", an[std::clamp(s.aniso, 0, 4)]);
         }
         std::swprintf(l[10], 96, L"Modo directo (60 para OBS/Twitch) *\t‹ %ls ›", s.streaming ? L"Sí" : L"No");
-        std::swprintf(l[11], 96, L"* se aplica al reiniciar el juego");
-        std::swprintf(l[12], 96, L"Flechas: elegir y cambiar   ·   F1 o Esc: cerrar   ·   F11: ventana / pantalla completa");
+        std::swprintf(l[11], 96, L"Antialiasing (FXAA)\t‹ %ls ›", s.fxaa ? L"Sí" : L"No");
+        {
+            static const wchar_t* const sh[4] = {L"No", L"Baja", L"Media", L"Alta"};
+            std::swprintf(l[12], 96, L"Nitidez\t‹ %ls ›", sh[std::clamp(s.sharpen, 0, 3)]);
+        }
+        std::swprintf(l[13], 96, L"* se aplica al reiniciar el juego");
+        std::swprintf(l[14], 96, L"Flechas: elegir y cambiar   ·   F1 o Esc: cerrar   ·   F11: ventana / pantalla completa");
         const wchar_t* lines[kMenuLines];
         for (int i = 0; i < kMenuLines; ++i) lines[i] = l[i];
         static std::vector<uint32_t> px;
@@ -1728,6 +1735,118 @@ void set_display_buffer(uint32_t id, uint32_t offset, uint32_t pitch, uint32_t w
     RLOG("[rsx] display buffer %u: offset 0x%x pitch %u %ux%u\n", id, offset, pitch, w, h);
 }
 
+// ------------------------------------------------------------------ final image: antialiasing and sharpening
+// Optional passes between the game's display buffer and the window (menu F1). FXAA: luminance edges are blurred
+// along their direction (the classic "FXAA console" scheme), in the display buffer's own resolution.
+// Sharpening: contrast adaptive (strong where the neighbourhood is flat, weak near strong contrast so edges do not
+// ring), applied while scaling to the window. Without either the display buffer is just blitted.
+static const char* const kPostVs =
+    "#version 450 core\n"
+    "out vec2 uv;\n"
+    "void main() { vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2); uv = p; gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n";
+static const char* const kFxaaFs =
+    "#version 450 core\n"
+    "layout(binding = 15) uniform sampler2D src;\n"
+    "uniform vec4 u_p;\n"
+    "in vec2 uv; out vec4 o;\n"
+    "float lum(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }\n"
+    "void main() {\n"
+    "  vec2 rcp = u_p.xy;\n"
+    "  vec3 m = texture(src, uv).rgb;\n"
+    "  float lM = lum(m);\n"
+    "  float lNW = lum(texture(src, uv + vec2(-1.0, 1.0) * rcp).rgb), lNE = lum(texture(src, uv + vec2(1.0, 1.0) * rcp).rgb);\n"
+    "  float lSW = lum(texture(src, uv + vec2(-1.0, -1.0) * rcp).rgb), lSE = lum(texture(src, uv + vec2(1.0, -1.0) * rcp).rgb);\n"
+    "  float mn = min(lM, min(min(lNW, lNE), min(lSW, lSE))), mx = max(lM, max(max(lNW, lNE), max(lSW, lSE)));\n"
+    "  if (mx - mn < max(0.0312, mx * 0.125)) { o = vec4(m, 1.0); return; }\n"
+    "  vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)), (lNW + lSW) - (lNE + lSE));\n"
+    "  float reduce = max((lNW + lNE + lSW + lSE) * 0.03125, 1.0 / 128.0);\n"
+    "  dir = clamp(dir / (min(abs(dir.x), abs(dir.y)) + reduce), vec2(-8.0), vec2(8.0)) * rcp;\n"
+    "  vec3 a = 0.5 * (texture(src, uv + dir * (1.0 / 3.0 - 0.5)).rgb + texture(src, uv + dir * (2.0 / 3.0 - 0.5)).rgb);\n"
+    "  vec3 b = a * 0.5 + 0.25 * (texture(src, uv - dir * 0.5).rgb + texture(src, uv + dir * 0.5).rgb);\n"
+    "  float lB = lum(b);\n"
+    "  o = vec4((lB < mn || lB > mx) ? a : b, 1.0);\n"
+    "}\n";
+static const char* const kSharpFs =
+    "#version 450 core\n"
+    "layout(binding = 15) uniform sampler2D src;\n"
+    "uniform vec4 u_p;\n"
+    "in vec2 uv; out vec4 o;\n"
+    "void main() {\n"
+    "  vec2 rcp = u_p.xy; vec2 u = vec2(uv.x, 1.0 - uv.y);\n"   // display buffers are stored upside down
+    "  vec3 c = texture(src, u).rgb;\n"
+    "  if (u_p.z <= 0.0) { o = vec4(c, 1.0); return; }\n"
+    "  vec3 n = texture(src, u + vec2(0.0, rcp.y)).rgb, s = texture(src, u - vec2(0.0, rcp.y)).rgb;\n"
+    "  vec3 e = texture(src, u + vec2(rcp.x, 0.0)).rgb, w = texture(src, u - vec2(rcp.x, 0.0)).rgb;\n"
+    "  vec3 mn = min(c, min(min(n, s), min(e, w))), mx = max(c, max(max(n, s), max(e, w)));\n"
+    "  vec3 amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-5)), 0.0, 1.0));\n"
+    "  vec3 wgt = amp * (-1.0 / mix(8.0, 5.0, u_p.z));\n"
+    "  o = vec4(clamp((c + (n + s + e + w) * wgt) / (1.0 + 4.0 * wgt), 0.0, 1.0), 1.0);\n"
+    "}\n";
+static GLuint post_program(const char* fs) {
+    const GLuint p = glCreateProgram();
+    const GLuint v = compile(GL_VERTEX_SHADER, kPostVs, "post vertex"), f = compile(GL_FRAGMENT_SHADER, fs, "post fragment");
+    glAttachShader(p, v); glAttachShader(p, f); glLinkProgram(p);
+    glDeleteShader(v); glDeleteShader(f);
+    GLint ok = 0; glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) { RLOG("[rsx] post program failed to link\n"); return 0; }
+    return p;
+}
+// Draws the display buffer `src` (sw x sh) into the window rectangle; false when the passes are off or unusable
+static bool post_present(GLuint src, int sw, int sh, int dx, int dy, int dw, int dh) {
+    const Settings& st = settings();
+    if (!st.fxaa && !st.sharpen) return false;
+    static GLuint fxaaProg = 0, sharpProg = 0, mid = 0, midFbo = 0, pvao = 0;
+    static GLint fxaaP = -1, sharpP = -1;
+    static int midW = 0, midH = 0;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        fxaaProg = post_program(kFxaaFs); sharpProg = post_program(kSharpFs);
+        if (fxaaProg) fxaaP = glGetUniformLocation(fxaaProg, "u_p");
+        if (sharpProg) sharpP = glGetUniformLocation(sharpProg, "u_p");
+        glGenVertexArrays(1, &pvao); glGenFramebuffers(1, &midFbo);
+    }
+    if (!fxaaProg || !sharpProg) return false;
+    ++g_texGen;   // unit 15 is rebound here
+    glDisable(GL_BLEND); glDisable(GL_DEPTH_TEST); glDisable(GL_STENCIL_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST);
+    glBindVertexArray(pvao);
+    glActiveTexture(GL_TEXTURE0 + 15);
+    GLuint img = src;
+    if (st.fxaa) {
+        if (!mid || midW != sw || midH != sh) {
+            if (!mid) glGenTextures(1, &mid);
+            glBindTexture(GL_TEXTURE_2D, mid);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, sw, sh, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glBindFramebuffer(GL_FRAMEBUFFER, midFbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, mid, 0);
+            const GLenum b0 = GL_COLOR_ATTACHMENT0; glDrawBuffers(1, &b0);
+            midW = sw; midH = sh;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, midFbo);
+        glViewport(0, 0, sw, sh);
+        glBindTexture(GL_TEXTURE_2D, src);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glUseProgram(fxaaProg);
+        const float p[4] = {1.f / sw, 1.f / sh, 0, 0};
+        glUniform4fv(fxaaP, 1, p);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        img = mid;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(dx, dy, dw, dh);
+    glBindTexture(GL_TEXTURE_2D, img);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glUseProgram(sharpProg);
+    static const float amount[4] = {0.f, 0.3f, 0.6f, 1.f};
+    const float p[4] = {1.f / sw, 1.f / sh, amount[std::clamp(st.sharpen, 0, 3)], 0};
+    glUniform4fv(sharpP, 1, p);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glViewport(0, 0, dw, dh);
+    return true;
+}
+
 void flip(uint32_t id) {
     if (!enabled()) return;
     if (!initTried) init_gl();
@@ -1765,7 +1884,9 @@ void flip(uint32_t id) {
         int dw = ww, dh = wh;
         if (wa > sa) dw = int(wh * sa); else dh = int(ww / sa);
         const int dx = (ww - dw) / 2, dy = (wh - dh) / 2;
-        glBlitFramebuffer(0, 0, it->second.w, it->second.h, dx, dy + dh, dx + dw, dy, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        if (!post_present(it->second.tex, int(it->second.w), int(it->second.h), dx, dy, dw, dh))
+            glBlitFramebuffer(0, 0, it->second.w, it->second.h, dx, dy + dh, dx + dw, dy, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         static const int shotEvery = std::getenv("RSXSHOT") ? std::atoi(std::getenv("RSXSHOT")) : 0;
         if (shotEvery > 0 && frameNo % shotEvery == 0) {   // RSXSHOT=N: save every color surface every N frames
             RLOG("[shot] frame %llu at %.2f s\n", (unsigned long long)frameNo, SDL_GetTicks() / 1000.0);

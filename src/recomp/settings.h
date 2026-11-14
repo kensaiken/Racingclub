@@ -11,6 +11,8 @@ struct Settings {
     int vsync = 0;        // swap interval 1: no tearing in exclusive full screen, a little more latency
     int aniso = 4;        // anisotropic filtering at least 2^aniso (0 = only what the game asks for, 4 = 16x)
     int streaming = 0;    // live streaming / recording: 60 images per second and the display at 120 Hz, whatever gameHz says
+    int fxaa = 1;         // edge antialiasing pass on the final image
+    int sharpen = 1;      // contrast-adaptive sharpening of the final image: 0 off, 1 low, 2 medium, 3 high
     int sound = 1;        // sound effects (the game's MultiStream mixer runs on a host thread)
     int showFps = 1;      // frame rate in the window title
 };
