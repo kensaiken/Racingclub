@@ -2046,7 +2046,8 @@ void flip(uint32_t id) {
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         glBindFramebuffer(GL_READ_FRAMEBUFFER, readFbo);   // the post passes bind GL_FRAMEBUFFER (the screenshots below read through readFbo)
         static const int shotEvery = std::getenv("RSXSHOT") ? std::atoi(std::getenv("RSXSHOT")) : 0;
-        if (shotEvery > 0 && frameNo % shotEvery == 0) {   // RSXSHOT=N: save every color surface every N frames
+        static const double shotFrom = std::getenv("RSXSHOTFROM") ? std::atof(std::getenv("RSXSHOTFROM")) : 0, shotTo = std::getenv("RSXSHOTTO") ? std::atof(std::getenv("RSXSHOTTO")) : 1e9;   // seconds after launch
+        if (shotEvery > 0 && frameNo % shotEvery == 0 && SDL_GetTicks() >= shotFrom * 1000 && SDL_GetTicks() <= shotTo * 1000) {   // RSXSHOT=N: save every color surface every N frames
             RLOG("[shot] frame %llu at %.2f s\n", (unsigned long long)frameNo, SDL_GetTicks() / 1000.0);
             for (auto& sf : surfaces) {
                 if (sf.second.depth && std::getenv("RSXSHOTZ") && sf.second.w >= 512 && sf.second.w == sf.second.h) {   // RSXSHOTZ=1: square depth surfaces (shadow maps) as raw floats
