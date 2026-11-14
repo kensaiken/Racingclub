@@ -4,7 +4,10 @@
 #include "recomp/lv2.h"
 #include "recomp/hle.h"
 #include "recomp/rsx_gl.h"
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -37,6 +40,103 @@ int main(int argc, char** argv) {
     // the main thread runs on its own host thread so this one can stop the test after a while
     std::thread mt([] { const int rc = lv2_run_main(g); std::fprintf(stderr, "[boot] main finished (%d)\n", rc); });
     mt.detach();
+    if (const char* fc = std::getenv("FRAMECLOCKS")) {   // FRAMECLOCKS=t1,t2,t3 (with FPSCAP=t2,t3,ms): find floats of the heap
+        // that advance by +-1/60 per frame in both intervals (per-frame clocks), then watch who writes each (debug)
+        double t[3] = {};
+        std::sscanf(fc, "%lf,%lf,%lf", &t[0], &t[1], &t[2]);
+        std::thread([t] {
+            const auto t0 = std::chrono::steady_clock::now();
+            const uint32_t base = 0x30000000u, size = 0x0D500000u;
+            std::vector<uint8_t> s[3]; unsigned long long fl[3]; double ts[3];
+            for (int k = 0; k < 3; ++k) {
+                std::this_thread::sleep_until(t0 + std::chrono::microseconds(int64_t(t[k] * 1e6)));
+                fl[k] = lv2_flip_count(); ts[k] = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                s[k].assign(g.mem + base, g.mem + base + size);
+            }
+            static const bool perSec = std::getenv("FRAMECLOCKS_SEC") != nullptr;   // look for real-time clocks (+-1/s) instead
+            const double n1 = perSec ? ts[1] - ts[0] : double(fl[1] - fl[0]), n2 = perSec ? ts[2] - ts[1] : double(fl[2] - fl[1]);
+            std::vector<uint32_t> hits;
+            const auto f = [](const std::vector<uint8_t>& v, uint32_t o) { uint32_t u; std::memcpy(&u, v.data() + o, 4); u = __builtin_bswap32(u); float x; std::memcpy(&x, &u, 4); return x; };
+            static const bool ints = std::getenv("FRAMECLOCKS_INT") != nullptr;   // small int counters, +-1 per frame
+            const auto iv = [](const std::vector<uint8_t>& v, uint32_t o) { uint32_t u; std::memcpy(&u, v.data() + o, 4); return int64_t(int32_t(__builtin_bswap32(u))); };
+            for (uint32_t o = 0; ints && o < size; o += 4) {
+                const int64_t a = iv(s[0], o), b = iv(s[1], o), c = iv(s[2], o);
+                if (a < -5000 || a > 5000 || c < -5000 || c > 5000) continue;
+                for (const int k : {1, -1})
+                    if (std::llabs(b - a - k * int64_t(n1)) <= 1 && std::llabs(c - b - k * int64_t(n2)) <= 1) { hits.push_back(base + o); std::fprintf(stderr, "[clock] int 0x%x: %lld %lld %lld\n", base + o, (long long)a, (long long)b, (long long)c); }
+            }
+            for (uint32_t o = 0; !ints && o < size; o += 4) {
+                const float a = f(s[0], o), b = f(s[1], o), c = f(s[2], o);
+                if (!(std::fabs(a) < 1e5f && std::fabs(b) < 1e5f && std::fabs(c) < 1e5f)) continue;
+                const double p1 = (double(b) - a) / n1, p2 = (double(c) - b) / n2;
+                static const bool any = std::getenv("FRAMECLOCKS_ANY") != nullptr;   // any steady per-frame rate (no watch)
+                if (any) { if (std::fabs(a) < 1000 && p1 != 0 && std::fabs(p1 - p2) < 0.03 * std::fabs(p1)) { const double q1 = (double(b) - a) / (ts[1] - ts[0]), q2 = (double(c) - b) / (ts[2] - ts[1]); if (std::fabs(q1 - q2) > 0.3 * std::fabs(q1)) std::fprintf(stderr, "[anyclock] 0x%x: %g %g %g (%+.6f/frame)\n", base + o, a, b, c, p1); } continue; }
+                static const double rate = std::getenv("FRAMECLOCKS_RATE") ? std::atof(std::getenv("FRAMECLOCKS_RATE")) : 0;   // only this rate, value > 0
+                if (rate != 0) { if (a > -1e4f && std::fabs(p1 - rate) < std::fabs(rate) * 0.1 && std::fabs(p2 - rate) < std::fabs(rate) * 0.1) { hits.push_back(base + o); std::fprintf(stderr, "[clock] 0x%x: %g %g %g\n", base + o, a, b, c); } continue; }
+                for (const double w : {perSec ? 1.0 : 1.0 / 60, perSec ? -1.0 : -1.0 / 60})
+                    if (std::fabs(p1 - w) < std::fabs(w) * 0.02 && std::fabs(p2 - w) < std::fabs(w) * 0.02) { hits.push_back(base + o); std::fprintf(stderr, "[clock] 0x%x: %g %g %g (%+.5f/frame)\n", base + o, a, b, c, p1); }
+            }
+            std::fprintf(stderr, "[clock] %zu per-frame clocks (frames %g, %g)\n", hits.size(), n1, n2);
+            if (const char* pw = std::getenv("FRAMECLOCKS_DEREF")) {   // FRAMECLOCKS_DEREF=p,o: watch *(hit + p) + o instead (debug)
+                int p = 0, o = 0; std::sscanf(pw, "%d,%d", &p, &o);
+                std::vector<uint32_t> keep;
+                for (uint32_t h : hits) {
+                    uint32_t v; std::memcpy(&v, g.mem + h + p, 4); v = __builtin_bswap32(v);
+                    if (v < 0x30000000u || v >= 0x3D500000u) continue;
+                    if (std::find(keep.begin(), keep.end(), v + o) == keep.end()) { keep.push_back(v + o); std::fprintf(stderr, "[clock] watching 0x%x (from 0x%x)\n", v + o, h); }
+                }
+                hits = keep;
+            }
+            for (size_t i = 0; i < hits.size() && i < 8; ++i) {   // watch each for half a second
+                g_watchLo = hits[i]; g_watchHi = hits[i] + 4;
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                g_watchHi = 0; g_watchLo = 0;
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            std::fprintf(stderr, "[clock] done\n");
+        }).detach();
+    }
+    if (const char* pk = std::getenv("POKE")) {   // POKE=seconds:hexaddr=float,hexaddr=float...: write floats then (debug)
+        std::string spec(pk);
+        std::thread([spec] {
+            const double t = std::atof(spec.c_str());
+            std::this_thread::sleep_for(std::chrono::microseconds(int64_t(t * 1e6)));
+            size_t p = spec.find(':');
+            while (p != std::string::npos && p + 1 < spec.size()) {
+                unsigned a = 0; float v = 0;
+                if (std::sscanf(spec.c_str() + p + 1, "%x=%f", &a, &v) == 2) {
+                    uint32_t u; std::memcpy(&u, &v, 4); u = __builtin_bswap32(u); std::memcpy(g.mem + a, &u, 4);
+                    std::fprintf(stderr, "[poke] 0x%x = %g\n", a, v);
+                }
+                p = spec.find(',', p + 1);
+            }
+        }).detach();
+    }
+    if (const char* wa = std::getenv("WATCHAT")) {   // WATCHAT=seconds,hexaddr[,bytes]: start the write watch later (debug)
+        double t = 0; unsigned a = 0, n = 4;
+        std::sscanf(wa, "%lf,%x,%u", &t, &a, &n);
+        std::thread([t, a, n] { std::this_thread::sleep_for(std::chrono::microseconds(int64_t(t * 1e6))); g_watchLo = a; g_watchHi = a + n; std::fprintf(stderr, "[watch] armed at 0x%x\n", a); }).detach();
+    }
+    if (const char* ms = std::getenv("MEMSNAP")) {   // MEMSNAP=t1,t2,...: guest data + heap to memsnap_N.bin at those seconds (debug)
+        std::thread([ms] {
+            const auto t0 = std::chrono::steady_clock::now();
+            int n = 0;
+            for (const char* p = ms; *p; ++n) {
+                const double t = std::atof(p);
+                std::this_thread::sleep_until(t0 + std::chrono::microseconds(int64_t(t * 1e6)));
+                const unsigned long long f = lv2_flip_count();
+                const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                char fn[64]; std::snprintf(fn, sizeof fn, "memsnap_%d.bin", n);
+                if (FILE* o = std::fopen(fn, "wb")) {
+                    std::fwrite(g.mem + 0x00800000, 1, 0x01800000, o);   // 0x00800000..0x02000000: ELF data, statics
+                    std::fwrite(g.mem + 0x30000000, 1, 0x0D500000, o);   // 0x30000000..0x3D500000: game heap
+                    std::fclose(o);
+                }
+                std::fprintf(stderr, "[memsnap] %d: %.3f s, flip %llu\n", n, now, f);
+                const char* c = std::strchr(p, ','); if (!c) break; p = c + 1;
+            }
+        }).detach();
+    }
     if (std::getenv("SAMPLE")) {   // sample every thread's call chain twice a second
         for (int k = 0; k < seconds * 2; ++k) { std::this_thread::sleep_for(std::chrono::milliseconds(500)); rc_dump_all_shadows(); }
     } else if (seconds <= 0) {   // --seconds 0: play until the window is closed

@@ -2010,6 +2010,13 @@ void flip(uint32_t id) {
     if (!glOk) return;
     ++frameNo;
     stateValid = false;
+    {   // FPSCAP=from,to,ms: sleep ms per frame between those seconds (debug: tells per-frame from per-second clocks)
+        static double a = -1, b = -1, ms = 0;
+        static bool parsed = false;
+        if (!parsed) { parsed = true; if (const char* e = std::getenv("FPSCAP")) std::sscanf(e, "%lf,%lf,%lf", &a, &b, &ms); }
+        const double t = SDL_GetTicks() / 1000.0;
+        if (ms > 0 && t >= a && t < b) SDL_Delay(Uint32(ms));
+    }
     {   // frame pacing: longest gap between two flips, reported every 2 s (a hitch shows here, not in the average)
         static uint64_t lastFlip = 0, worst = 0, since = 0; static int over = 0;
         const uint64_t t = SDL_GetPerformanceCounter(), fq = SDL_GetPerformanceFrequency();

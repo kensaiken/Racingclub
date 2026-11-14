@@ -192,6 +192,7 @@ extern HostHook g_hostHook;
 void rc_mark_hooked(uint32_t addr);   // calls to addr must go through g_hostHook (system library stubs)
 void rc_call(PPU& c, uint32_t addr);
 uint64_t rc_timebase();                    // PS3 time base counter (79.8 MHz)
+extern float g_frameStep;                  // game frames of 1/60 s per emulated frame (60 / vblank rate), see lv2.cpp
 using SyscallHook = void (*)(PPU&);
 extern SyscallHook g_syscallHook;          // lv2 syscalls (sc); unset = reported as unimplemented
 void rc_syscall(PPU& c);

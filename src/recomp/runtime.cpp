@@ -6,18 +6,32 @@
 #include <vector>
 #include <mutex>
 #include <thread>
+#include <map>
+#include <cstring>
+extern "C" __declspec(dllimport) void* __stdcall GetModuleHandleW(const wchar_t*);
 
 namespace gti::recomp {
 
 HostHook g_hostHook = nullptr;
 uint64_t g_missLr = 0;
 
+float g_frameStep = 1.0f;
 uint64_t g_timebaseFixed = 0;   // >0: deterministic time base, advances this many ticks per read
 uint64_t rc_timebase() {
     if (g_timebaseFixed) { static uint64_t t = 1; t += g_timebaseFixed; return t; }
     using namespace std::chrono;
     static const auto t0 = steady_clock::now();
     const double s = duration<double>(steady_clock::now() - t0).count();
+    {   // TBPROF=a,b: host return addresses of the time base reads between those seconds, printed at b (debug)
+        static double a = -1, b = -1; static bool parsed = false, done = false;
+        static std::mutex m; static std::map<uintptr_t, uint64_t> hist;
+        if (!parsed) { parsed = true; if (const char* e = std::getenv("TBPROF")) std::sscanf(e, "%lf,%lf", &a, &b); }
+        if (a >= 0 && !done && s >= a) {
+            std::lock_guard<std::mutex> lk(m);
+            if (s < b) ++hist[reinterpret_cast<uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr))];
+            else if (!done) { done = true; for (auto& [k, v] : hist) std::fprintf(stderr, "[tbprof] %llx %llu\n", (unsigned long long)k, (unsigned long long)v); }
+        }
+    }
     return uint64_t(s * 79800000.0) + 1;
 }
 uint32_t g_watchLo = 0, g_watchHi = 0;
@@ -67,6 +81,27 @@ void rc_syscall(PPU& c) {
 // game goes through rc_call (tens of millions per second), and the map lookup of the host hook plus a binary search
 // over the ~30000 functions were a tenth of the main thread. Addresses with a host hook keep the slow path.
 static std::vector<uint32_t>& hooked_list() { static std::vector<uint32_t> v; return v; }
+// CALLERS=a1,a2,...[@seconds]: count the guest return addresses (lr) of calls to those functions, printed every 3 s
+// after the given second (debug: finds who calls a virtual or indirectly called function)
+static std::vector<uint32_t>& callers_list() {
+    static std::vector<uint32_t> v = [] {
+        std::vector<uint32_t> r;
+        if (const char* e = std::getenv("CALLERS")) for (const char* p = e; *p && *p != '@';) { r.push_back(uint32_t(std::strtoul(p, nullptr, 16))); const char* c = std::strpbrk(p, ",@"); if (!c || *c == '@') break; p = c + 1; }
+        return r;
+    }();
+    return v;
+}
+static void callers_note(uint32_t addr, uint32_t lr) {
+    static std::mutex m; static std::map<uint64_t, uint64_t> h;
+    static const double from = [] { const char* e = std::getenv("CALLERS"); const char* at = e ? std::strchr(e, '@') : nullptr; return at ? std::atof(at + 1) : 0.0; }();
+    static const auto t0 = std::chrono::steady_clock::now();
+    static double last = 0;
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (s < from) return;
+    std::lock_guard<std::mutex> lk(m);
+    ++h[uint64_t(addr) << 32 | lr];
+    if (s - last > 3) { last = s; for (auto& [k, v] : h) std::fprintf(stderr, "[callers] %.1f s: %x <- lr %x: %llu\n", s, uint32_t(k >> 32), uint32_t(k), (unsigned long long)v); h.clear(); }
+}
 void rc_mark_hooked(uint32_t addr) { hooked_list().push_back(addr); }
 namespace {
 struct FastTable {
@@ -79,6 +114,7 @@ struct FastTable {
         fn.assign((hi - lo) / 4, nullptr);
         for (size_t k = 0; k < kFuncCount; ++k) if (!(kFuncs[k].addr & 3)) fn[(kFuncs[k].addr - lo) / 4] = kFuncs[k].fn;
         for (uint32_t a : hooked_list()) if (a >= lo && a < hi) fn[(a - lo) / 4] = nullptr;
+        for (uint32_t a : callers_list()) if (a >= lo && a < hi) fn[(a - lo) / 4] = nullptr;
     }
 };
 }
@@ -94,6 +130,7 @@ void rc_call(PPU& c, uint32_t addr) {
     const FuncEntry* e = kFuncs + kFuncCount;
     const FuncEntry* it = std::lower_bound(b, e, addr, [](const FuncEntry& f, uint32_t a) { return f.addr < a; });
     if (it != e && it->addr == addr) {
+        if (!callers_list().empty() && std::find(callers_list().begin(), callers_list().end(), addr) != callers_list().end()) callers_note(addr, uint32_t(c.lr));
         if (g_traceCalls) std::printf("[fn] %x r3=%llx r4=%llx r5=%llx r6=%llx\n", addr, (unsigned long long)c.r[3], (unsigned long long)c.r[4], (unsigned long long)c.r[5], (unsigned long long)c.r[6]);
         const bool sh = g_shadowOn || g_watchHi > g_watchLo;
         if (sh) g_shadow.push_back(addr);

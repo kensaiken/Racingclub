@@ -558,6 +558,9 @@ void fifo_thread() {
 // GAMEHZ=n: rate of the emulated vblank (experiment: the console has 60)
 // streaming mode: 60 per second like the video (OBS, Twitch), so every game image is exactly one video frame
 const int g_gameHz = settings().streaming && !std::getenv("GAMEHZ") ? 60 : settings().gameHz;
+// The game was written for 60 images per second: parts of its logic advance a fixed step per image. Patched code
+// scales that step by g_frameStep (FRAMESTEP=0: off).
+const bool g_frameStepInit = (g_frameStep = std::getenv("FRAMESTEP") && std::getenv("FRAMESTEP")[0] == '0' ? 1.0f : 60.0f / float(g_gameHz), true);
 void vblank_thread() {
     t_tid = 0x01000201;
     // Pacing of the emulated 60 Hz vblank. When the display refreshes at a multiple of 60 the vblank follows the real
@@ -1845,7 +1848,7 @@ bool imports(PPU& c, const char* module, const char* name) {
     if (n == "sys_ppu_thread_exit") throw ThreadExit{c.r[3]};
     if (n == "sys_process_exit") throw ProcessExit{int(c.r[3])};
     if (n == "_sys_process_atexitspawn" || n == "_sys_process_at_Exitspawn" || n == "sys_prx_exitspawn_with_level") { ret(c, CELL_OK); return true; }
-    if (n == "sys_time_get_system_time") { ret(c, now_us()); return true; }
+    if (n == "sys_time_get_system_time") { static const bool lg = std::getenv("TBPROF") != nullptr; if (lg) { static std::mutex m; static std::map<uint32_t, int> h; static uint64_t t0 = now_us(); std::lock_guard<std::mutex> lk(m); ++h[uint32_t(c.lr)]; if (now_us() - t0 > 3000000) { for (auto& [k, v] : h) LOG("[systime] lr %x: %d\n", k, v); h.clear(); t0 = now_us(); } } ret(c, now_us()); return true; }
     if (n == "sys_lwmutex_create") {   // (sys_lwmutex_t*, attr*)
         const uint32_t m = a32(c, 0), attr = a32(c, 1);
         c.wr32(m, 0); c.wr32(m + 4, 0); c.wr32(m + 8, attr ? c.rd32(attr) : 0); c.wr32(m + 0xc, 0);
@@ -2487,6 +2490,29 @@ void lv2_dump_waits() {
 
 int lv2_run_main(Guest& g) {
     host_timer_init();
+    {   // The game's logic scheduler (0xd4848) clamps the image time to at least 1/60 s and steps the logic in 1/60 s
+        // steps (constants of its TOC: 1/60 at 0xc6929c, 1/59.94 at 0xc692a8 for the other video mode). Above 60
+        // images per second every image then advanced the game by 1/60 s: the countdown, menus and HUD animations ran
+        // 2.4 times too fast at 144. With 1/rate the logic takes one step of the real image time per image.
+        // Unchanged at 60 Hz. FRAMESTEP=0: off.
+        Guest* gp = &g;
+        const auto setf = [gp](uint32_t ea, float expect, float v) {
+            Guest& g = *gp;
+            uint32_t u; std::memcpy(&u, g.mem + ea, 4); u = __builtin_bswap32(u);
+            float cur; std::memcpy(&cur, &u, 4);
+            if (std::fabs(cur - expect) > 1e-6f) { LOG("[frame] constant at 0x%x is %g, not %g: logic step left alone\n", ea, cur, expect); return; }
+            std::memcpy(&u, &v, 4); u = __builtin_bswap32(u); std::memcpy(g.mem + ea, &u, 4);
+        };
+        // Written once the game shows images: its start-up also reads 1/60 there (done at boot, the countdown ran
+        // even faster). FRAMESTEPAT=n: after n images (debug).
+        if (g_frameStep != 1.0f) std::thread([setf] {
+            const unsigned long long at = std::getenv("FRAMESTEPAT") ? std::strtoull(std::getenv("FRAMESTEPAT"), nullptr, 10) : 1;
+            while (gcm::flips.load() < at) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            setf(0xc6929c, 1.0f / 60.0f, g_frameStep / 60.0f);
+            setf(0xc692a8, 1.0f / 59.94f, g_frameStep / 59.94f);
+            LOG("[frame] logic step 1/%d s from image %llu (game written for 1/60)\n", gcm::g_gameHz, (unsigned long long)gcm::flips.load());
+        }).detach();
+    }
     // main thread, started like lv2 starts a process: r3 argc, r4 argv, r5 envp, r7 thread id, r8-r10 TLS image
     auto t = std::make_shared<GThread>();
     t->id = g_nextTid++;

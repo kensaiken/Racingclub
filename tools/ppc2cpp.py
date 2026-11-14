@@ -106,6 +106,26 @@ def cond_branch(m, ops, nxt):
     return table[base], tgt, kind, link
 
 
+# Game code changes, applied to the C++ of one instruction: {address: (text to find, replacement, why)}.
+# The game was written for 60 images per second; these make per-image steps follow the emulated vblank rate
+# (g_frameStep = 60 / rate, set by the runtime; 1.0 at 60 Hz, so the original behaviour is unchanged there).
+PATCHES = {
+    # car update: entity+100 = time step of the car's per-image logic (timers, effects), constant 1.0 per image
+    0x224be0: ('c.wrf32(ea_, (float)c.f[0]);', 'c.wrf32(ea_, (float)c.f[0] * g_frameStep);', 'car per-image step'),
+}
+
+
+def tr_patched(a, m, o, fstart, fend, labels):
+    S = tr(a, m, o, fstart, fend, labels)
+    if a in PATCHES:
+        find, repl, why = PATCHES[a]
+        hit = [st for st in S if find in st]
+        if len(hit) != 1:
+            raise SystemExit('patch at %x (%s) does not apply: %r' % (a, why, S))
+        S = [st.replace(find, repl) + ('   // PATCH: %s' % why if find in st else '') for st in S]
+    return S
+
+
 def tr(a, m, o, fstart, fend, labels):
     """Translate one instruction to C++ statements."""
     ops = [x.strip() for x in o.split(',')] if o else []
@@ -490,7 +510,7 @@ def translate_function(fa, fend):
     for k, (a, m, o) in enumerate(body):
         if a in labels: out.append('L_%x:' % a)
         try:
-            for st in tr(a, m, o, fa, fend, labels):
+            for st in tr_patched(a, m, o, fa, fend, labels):
                 out.append('    ' + st)
         except (Unsupported, ValueError, AttributeError, KeyError, IndexError) as ex:
             unsupported.append('%x %s %s' % (a, m, o))
