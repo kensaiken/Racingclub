@@ -1,6 +1,7 @@
 #pragma once
 // Runtime for statically recompiled Cell PPU code (see tools/ppc2cpp.py).
 // Guest memory is a 4 GB big-endian address space; 32-bit effective addresses (PS3 ABI).
+#include <immintrin.h>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -127,50 +128,70 @@ inline float vf(const V128& v, int i) { uint32_t u = vw(v, i); float f; std::mem
 inline float vflush(float f) { return std::fpclassify(f) == FP_SUBNORMAL ? std::copysign(0.0f, f) : f; }   // VMX non-Java mode
 inline void vsetf(V128& v, int i, float f) { f = vflush(f); uint32_t u; std::memcpy(&u, &f, 4); vsetw(v, i, u); }
 
+// The VMX operations of the game code, on host vectors. V128 holds the 16 bytes in guest (big-endian) order: bitwise
+// operations, merges and splats work on them as they are, arithmetic swaps the bytes of each word first. Results are
+// bit for bit those of the per-lane versions these replace (inputs and results flushed to signed zero when
+// denormal, fused multiply-add), which the physics replay test checks against the emulator. The game's two main
+// threads spent 5-10 % of their time in the per-lane versions, which the compiler did not even inline.
+#define VXT __attribute__((target("avx2,fma")))
+VXT inline __m128i vx_ld(const V128& v) { return _mm_loadu_si128(reinterpret_cast<const __m128i*>(v.b)); }
+VXT inline V128 vx_mk(__m128i x) { V128 r; _mm_storeu_si128(reinterpret_cast<__m128i*>(r.b), x); return r; }
+VXT inline __m128i vx_swap(__m128i x) { return _mm_shuffle_epi8(x, _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12)); }
+// denormals -> zero with the same sign (VMX non-Java mode), everything else unchanged
+VXT inline __m128 vx_flush(__m128 x) {
+    const __m128 sign = _mm_castsi128_ps(_mm_set1_epi32(int(0x80000000u)));
+    const __m128 ax = _mm_andnot_ps(sign, x);
+    const __m128 den = _mm_and_ps(_mm_cmplt_ps(ax, _mm_set1_ps(1.17549435e-38f)), _mm_cmpneq_ps(ax, _mm_setzero_ps()));
+    return _mm_andnot_ps(_mm_andnot_ps(sign, den), x);   // clears everything but the sign where denormal
+}
+VXT inline __m128 vx_ldf(const V128& v) { return vx_flush(_mm_castsi128_ps(vx_swap(vx_ld(v)))); }
+VXT inline V128 vx_mkf(__m128 x) { return vx_mk(vx_swap(_mm_castps_si128(vx_flush(x)))); }
+VXT inline V128 vx_vaddfp(const V128& a, const V128& b) { return vx_mkf(_mm_add_ps(vx_ldf(a), vx_ldf(b))); }
+VXT inline V128 vx_vsubfp(const V128& a, const V128& b) { return vx_mkf(_mm_sub_ps(vx_ldf(a), vx_ldf(b))); }
 #define VX_F2(name, expr) inline V128 vx_##name(const V128& a, const V128& b) { V128 r; for (int i = 0; i < 4; ++i) { float x = vflush(vf(a, i)), y = vflush(vf(b, i)); vsetf(r, i, (expr)); } return r; }
-VX_F2(vaddfp, x + y)
-VX_F2(vsubfp, x - y)
 VX_F2(vminfp, std::fmin(x, y))
 VX_F2(vmaxfp, std::fmax(x, y))
 #undef VX_F2
-#define VX_W2(name, expr) inline V128 vx_##name(const V128& a, const V128& b) { V128 r; for (int i = 0; i < 4; ++i) { uint32_t x = vw(a, i), y = vw(b, i); vsetw(r, i, (expr)); } return r; }
-VX_W2(vxor, x ^ y)
-VX_W2(vor, x | y)
-VX_W2(vand, x & y)
-VX_W2(vandc, x & ~y)
-VX_W2(vnor, ~(x | y))
-VX_W2(vadduwm, x + y)
-VX_W2(vsubuwm, x - y)
-VX_W2(vslw, x << (y & 31))
-VX_W2(vsrw, x >> (y & 31))
-VX_W2(vsraw, uint32_t(int32_t(x) >> (y & 31)))
-VX_W2(vcmpequw, x == y ? 0xffffffffu : 0u)
-#undef VX_W2
-#define VX_C2(name, op) inline V128 vx_##name(const V128& a, const V128& b) { V128 r; for (int i = 0; i < 4; ++i) vsetw(r, i, (vflush(vf(a, i)) op vflush(vf(b, i))) ? 0xffffffffu : 0u); return r; }
-VX_C2(vcmpeqfp, ==)
-VX_C2(vcmpgefp, >=)
-VX_C2(vcmpgtfp, >)
-#undef VX_C2
-inline uint32_t vx_cr6(const V128& r) {
-    bool all = true, none = true;
-    for (int i = 0; i < 4; ++i) { if (vw(r, i)) none = false; else all = false; }
-    return (all ? 8u : 0u) | (none ? 2u : 0u);
+VXT inline V128 vx_vxor(const V128& a, const V128& b) { return vx_mk(_mm_xor_si128(vx_ld(a), vx_ld(b))); }
+VXT inline V128 vx_vor(const V128& a, const V128& b) { return vx_mk(_mm_or_si128(vx_ld(a), vx_ld(b))); }
+VXT inline V128 vx_vand(const V128& a, const V128& b) { return vx_mk(_mm_and_si128(vx_ld(a), vx_ld(b))); }
+VXT inline V128 vx_vandc(const V128& a, const V128& b) { return vx_mk(_mm_andnot_si128(vx_ld(b), vx_ld(a))); }
+VXT inline V128 vx_vnor(const V128& a, const V128& b) { return vx_mk(_mm_xor_si128(_mm_or_si128(vx_ld(a), vx_ld(b)), _mm_set1_epi32(-1))); }
+VXT inline V128 vx_vadduwm(const V128& a, const V128& b) { return vx_mk(vx_swap(_mm_add_epi32(vx_swap(vx_ld(a)), vx_swap(vx_ld(b))))); }
+VXT inline V128 vx_vsubuwm(const V128& a, const V128& b) { return vx_mk(vx_swap(_mm_sub_epi32(vx_swap(vx_ld(a)), vx_swap(vx_ld(b))))); }
+VXT inline V128 vx_vslw(const V128& a, const V128& b) { return vx_mk(vx_swap(_mm_sllv_epi32(vx_swap(vx_ld(a)), _mm_and_si128(vx_swap(vx_ld(b)), _mm_set1_epi32(31))))); }
+VXT inline V128 vx_vsrw(const V128& a, const V128& b) { return vx_mk(vx_swap(_mm_srlv_epi32(vx_swap(vx_ld(a)), _mm_and_si128(vx_swap(vx_ld(b)), _mm_set1_epi32(31))))); }
+VXT inline V128 vx_vsraw(const V128& a, const V128& b) { return vx_mk(vx_swap(_mm_srav_epi32(vx_swap(vx_ld(a)), _mm_and_si128(vx_swap(vx_ld(b)), _mm_set1_epi32(31))))); }
+VXT inline V128 vx_vcmpequw(const V128& a, const V128& b) { return vx_mk(_mm_cmpeq_epi32(vx_ld(a), vx_ld(b))); }
+VXT inline V128 vx_vcmpeqfp(const V128& a, const V128& b) { return vx_mk(_mm_castps_si128(_mm_cmpeq_ps(vx_ldf(a), vx_ldf(b)))); }
+VXT inline V128 vx_vcmpgefp(const V128& a, const V128& b) { return vx_mk(_mm_castps_si128(_mm_cmpge_ps(vx_ldf(a), vx_ldf(b)))); }
+VXT inline V128 vx_vcmpgtfp(const V128& a, const V128& b) { return vx_mk(_mm_castps_si128(_mm_cmpgt_ps(vx_ldf(a), vx_ldf(b)))); }
+VXT inline uint32_t vx_cr6(const V128& r) {
+    const int zero = _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(vx_ld(r), _mm_setzero_si128())));   // bit i: word i is zero
+    return (zero == 0 ? 8u : 0u) | (zero == 15 ? 2u : 0u);
 }
-inline V128 vx_vmrghw(const V128& a, const V128& b) { V128 r; vsetw(r, 0, vw(a, 0)); vsetw(r, 1, vw(b, 0)); vsetw(r, 2, vw(a, 1)); vsetw(r, 3, vw(b, 1)); return r; }
-inline V128 vx_vmrglw(const V128& a, const V128& b) { V128 r; vsetw(r, 0, vw(a, 2)); vsetw(r, 1, vw(b, 2)); vsetw(r, 2, vw(a, 3)); vsetw(r, 3, vw(b, 3)); return r; }
-inline V128 vx_vmaddfp(const V128& a, const V128& c, const V128& b) { V128 r; for (int i = 0; i < 4; ++i) vsetf(r, i, std::fmaf(vflush(vf(a, i)), vflush(vf(c, i)), vflush(vf(b, i)))); return r; }
-inline V128 vx_vnmsubfp(const V128& a, const V128& c, const V128& b) { V128 r; for (int i = 0; i < 4; ++i) vsetf(r, i, -std::fmaf(vflush(vf(a, i)), vflush(vf(c, i)), -vflush(vf(b, i)))); return r; }
-inline V128 vx_vperm(const V128& a, const V128& b, const V128& c) {
-    V128 r;
-    for (int i = 0; i < 16; ++i) { const int s = c.b[i] & 31; r.b[i] = s < 16 ? a.b[s] : b.b[s - 16]; }
-    return r;
+VXT inline V128 vx_vmrghw(const V128& a, const V128& b) { return vx_mk(_mm_unpacklo_epi32(vx_ld(a), vx_ld(b))); }
+VXT inline V128 vx_vmrglw(const V128& a, const V128& b) { return vx_mk(_mm_unpackhi_epi32(vx_ld(a), vx_ld(b))); }
+VXT inline V128 vx_vmaddfp(const V128& a, const V128& c, const V128& b) { return vx_mkf(_mm_fmadd_ps(vx_ldf(a), vx_ldf(c), vx_ldf(b))); }
+// -(a * c - b), fused; the sign flip after the rounding keeps the sign of an exact zero as before
+VXT inline V128 vx_vnmsubfp(const V128& a, const V128& c, const V128& b) {
+    return vx_mkf(_mm_xor_ps(_mm_fmsub_ps(vx_ldf(a), vx_ldf(c), vx_ldf(b)), _mm_castsi128_ps(_mm_set1_epi32(int(0x80000000u)))));
 }
-inline V128 vx_vsel(const V128& a, const V128& b, const V128& c) { V128 r; for (int i = 0; i < 16; ++i) r.b[i] = uint8_t((a.b[i] & ~c.b[i]) | (b.b[i] & c.b[i])); return r; }
-inline V128 vx_vsldoi(const V128& a, const V128& b, int sh) { V128 r; for (int i = 0; i < 16; ++i) { const int s = i + sh; r.b[i] = s < 16 ? a.b[s] : b.b[s - 16]; } return r; }
-inline V128 vx_vspltw(const V128& a, int i) { V128 r; const uint32_t w = vw(a, i & 3); for (int k = 0; k < 4; ++k) vsetw(r, k, w); return r; }
+VXT inline V128 vx_vperm(const V128& a, const V128& b, const V128& c) {
+    const __m128i idx = _mm_and_si128(vx_ld(c), _mm_set1_epi8(31));
+    const __m128i lo = _mm_and_si128(idx, _mm_set1_epi8(15));
+    const __m128i fromB = _mm_cmpgt_epi8(idx, _mm_set1_epi8(15));
+    return vx_mk(_mm_blendv_epi8(_mm_shuffle_epi8(vx_ld(a), lo), _mm_shuffle_epi8(vx_ld(b), lo), fromB));
+}
+VXT inline V128 vx_vsel(const V128& a, const V128& b, const V128& c) {
+    const __m128i m = vx_ld(c);
+    return vx_mk(_mm_or_si128(_mm_andnot_si128(m, vx_ld(a)), _mm_and_si128(m, vx_ld(b))));
+}
+inline V128 vx_vsldoi(const V128& a, const V128& b, int sh) { uint8_t t[32]; std::memcpy(t, a.b, 16); std::memcpy(t + 16, b.b, 16); V128 r; std::memcpy(r.b, t + (sh & 15), 16); return r; }
+VXT inline V128 vx_vspltw(const V128& a, int i) { const __m128i x = vx_ld(a); switch (i & 3) { case 0: return vx_mk(_mm_shuffle_epi32(x, 0x00)); case 1: return vx_mk(_mm_shuffle_epi32(x, 0x55)); case 2: return vx_mk(_mm_shuffle_epi32(x, 0xAA)); default: return vx_mk(_mm_shuffle_epi32(x, 0xFF)); } }
 inline V128 vx_vspltisw(int imm) { V128 r; for (int k = 0; k < 4; ++k) vsetw(r, k, uint32_t(int32_t(imm))); return r; }
-inline V128 vx_vrsqrtefp(const V128& a) { V128 r; for (int i = 0; i < 4; ++i) vsetf(r, i, 1.0f / std::sqrt(vflush(vf(a, i)))); return r; }
-inline V128 vx_vrefp(const V128& a) { V128 r; for (int i = 0; i < 4; ++i) vsetf(r, i, 1.0f / vflush(vf(a, i))); return r; }
+VXT inline V128 vx_vrsqrtefp(const V128& a) { return vx_mkf(_mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(vx_ldf(a)))); }
+VXT inline V128 vx_vrefp(const V128& a) { return vx_mkf(_mm_div_ps(_mm_set1_ps(1.0f), vx_ldf(a))); }
 inline V128 vx_vctsxs(const V128& a, int sh) {
     V128 r;
     for (int i = 0; i < 4; ++i) {

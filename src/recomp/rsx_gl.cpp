@@ -950,9 +950,9 @@ static void bind_texture(int i, float* tsc) {
     static const bool off = std::getenv("RSXNOTEXMEMO") != nullptr;
     if (boundGen != g_texGen) { std::memset(boundOn, 0, sizeof boundOn); boundGen = g_texGen; }
     const uint32_t base = i < 8 ? 0x1a00 + 0x20 * i : 0x1b00 + 0x20 * (i - 8);
-    uint32_t regs[9];
+    uint32_t regs[10];   // 40 bytes: whole 8-byte rounds in fnv
     for (int k = 0; k < 8; ++k) regs[k] = R[(base >> 2) + k];
-    regs[8] = R[(0x1840 + 4 * i) >> 2];
+    regs[8] = R[(0x1840 + 4 * i) >> 2]; regs[9] = 0;
     const uint64_t h = fnv(regs, sizeof regs);
     if (!off) {
         auto it = fast.find(h);
@@ -1324,7 +1324,7 @@ static void apply_state() {
 // (positions, in main memory) is new every frame and goes through the per-draw path. The content of a cached
 // stream is sampled once per frame, so a level change that reuses the address is noticed.
 struct Stream { GLuint vbo = 0; uint32_t count = 0; uint64_t sig = 0, checked = ~0ull; };
-static std::map<uint64_t, Stream> streams;
+static std::unordered_map<uint64_t, Stream> streams;
 static uint64_t stream_sig(const uint8_t* p, uint32_t stride, uint32_t count) {
     uint64_t h = fnv(&count, 4);
     const uint32_t step = std::max<uint32_t>(1, count / 24);
@@ -2155,7 +2155,15 @@ void method_block(uint32_t m0, const uint8_t* args, uint32_t count, bool noInc) 
         }
         return;
     }
-    for (uint32_t i = 0; i < count; ++i) { uint32_t w; std::memcpy(&w, args + 4 * i, 4); method(noInc ? m0 : m0 + 4 * i, __builtin_bswap32(w)); }
+    // plain register writes (most of a draw's state) go straight to R; only the methods with side effects take the
+    // full path. This loop runs for every word of the command stream.
+    if (!glOk || !enabled() || rsxTrace) { for (uint32_t i = 0; i < count; ++i) { uint32_t w; std::memcpy(&w, args + 4 * i, 4); method(noInc ? m0 : m0 + 4 * i, __builtin_bswap32(w)); } return; }
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t w; std::memcpy(&w, args + 4 * i, 4); w = __builtin_bswap32(w);
+        const uint32_t m = noInc ? m0 : m0 + 4 * i;
+        if ((m >= 0x0b80 && m < 0x0c00) || (m >= 0x1f00 && m < 0x1f80) || m == 0x1e9c || m == 0x1efc || m == 0x1808 || m == 0x1814 || m == 0x1824 || m == 0x1d94 || m >= 0x10000) method(m, w);
+        else R[m >> 2] = w;
+    }
 }
 
 void method(uint32_t m, uint32_t arg) {

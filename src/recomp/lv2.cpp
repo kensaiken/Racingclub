@@ -892,7 +892,7 @@ uint32_t op(PPU& c, bool isSave) {
 namespace jobs {
 constexpr uint32_t LS_STUB = 0x100, LS_CTX = 0x2c00, LS_JOB = 0x2d00, LS_BIN = 0x3000, LS_STACK = 0x3fff0;
 constexpr uint32_t EVENTFLAG_JOB = 0xbad880;   // job binary that sets a SPURS event flag (done on the host)
-const int g_workers = std::getenv("SPUS") ? std::max(1, std::atoi(std::getenv("SPUS"))) : 6;   // host threads running jobs. The game only describes Edge output buffers for SPUs 0-2; run_job creates those of workers 3-5 (more than 6 have none and would drop their geometry)
+const int g_workers = std::getenv("SPUS") ? std::max(1, std::atoi(std::getenv("SPUS"))) : 8;   // host threads running jobs. The game only describes Edge output buffers for SPUs 0-2; run_job creates those of workers 3-5 (more than 6 have none and would drop their geometry)
 
 uint32_t list = 0;
 std::thread th;
@@ -1265,7 +1265,7 @@ void ring_watchdog() {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         if (!gcm::ctrl || !gcm::labels || gcm::rd(gcm::ctrl) != gcm::rd(gcm::ctrl + 4)) continue;
         const uint64_t now = now_us();
-        for (int w = 0; w < std::min(g_workers, 6); ++w) {
+        for (int w = 0; w < std::min(g_workers, 8); ++w) {
             if (!g_workerJob[w].load() || now - g_workerSince[w].load() < 150000) continue;
             const uint32_t e = 0x01061980u + 0x80u * uint32_t(w);   // that SPU's output buffer info
             const uint32_t cur = gcm::rd(e + 12), label = gcm::rd(e + 20) & 0xff0;
@@ -1287,7 +1287,7 @@ void worker(int idx) {
         {
             std::unique_lock<std::mutex> lk(qmx);
             qcv.wait(lk, [] { return !queue.empty(); });
-            jd = queue.front(); queue.pop_front(); ++busy;
+            jd = std::move(queue.front()); queue.pop_front(); ++busy;
         }
         run_job(jd);
         { std::lock_guard<std::mutex> lk(qmx); --busy; }
@@ -1310,19 +1310,31 @@ void submit(uint32_t jea) {
         for (uint32_t k = 0; k < sizeCacheDma / 8 && k < 4; ++k) { const uint32_t sz = jd32(jd, 0x30 + sizeDma + 8 * k) & 0x7fff; std::memcpy(jd.in.data() + pos, G->mem + jd32(jd, 0x34 + sizeDma + 8 * k), sz); pos += sz; }
     }
     if (g_workers == 1) { run_job(jd); return; }
-    { std::lock_guard<std::mutex> lk(qmx); queue.push_back(jd); }
+    { std::lock_guard<std::mutex> lk(qmx); queue.push_back(std::move(jd)); }
     qcv.notify_one();
 }
-void wait_idle() {
+// MGRSTAT=1: per 4 s, how often and how long the manager waited for the workers, by reason (0 sync, 1 lwsync,
+// 2 guard, 3 end, 4 event flag job), and the jobs it handed out
+std::atomic<uint64_t> g_wiN[5], g_wiUs[5], g_mgrJobs{0}, g_mgrEndUs{0}, g_mgrGuardUs{0};
+const bool g_mgrStat = std::getenv("MGRSTAT") != nullptr;
+void wait_idle(int why = 0) {
     if (g_workers == 1) return;
-    std::unique_lock<std::mutex> lk(qmx);
-    idlecv.wait(lk, [] { return queue.empty() && busy == 0; });
+    const uint64_t t0 = g_mgrStat ? now_us() : 0;
+    {
+        std::unique_lock<std::mutex> lk(qmx);
+        idlecv.wait(lk, [] { return queue.empty() && busy == 0; });
+    }
+    if (g_mgrStat) { ++g_wiN[why]; g_wiUs[why] += now_us() - t0; }
 }
 
 std::atomic<uint32_t> g_mgrPc{0}, g_mgrWhat{0};   // diagnostics: command list position and what the manager waits for (1 guard, 2 end, 3 sync)
+// how long the manager keeps yielding before it sleeps: a sleep is 1 ms or more on Windows, and the next kick then starts
+// the image's geometry jobs late (at 144 Hz every other image missed its vblank at the start grid). MGRSPIN=us.
+const uint64_t g_mgrSpinUs = std::getenv("MGRSPIN") ? std::strtoull(std::getenv("MGRSPIN"), nullptr, 10) : 50000;
 uint32_t g_mgrHist[64][3]; unsigned g_mgrHistN = 0;   // diagnostics: last commands read (pc, low word, time us)
 void manager() {
     t_tid = 0x01000202;
+    ripprof_register_thread("jobmgr");
     if (g_workers > 1) for (int k = 0; k < g_workers; ++k) std::thread(worker, k).detach();
     uint32_t pc = list;
     std::vector<uint32_t> calls;
@@ -1347,12 +1359,12 @@ void manager() {
             pc += 8; continue;
         }
         if (op == 0) {
-            if ((rd32m(ea + 4) & ~0xFu) == EVENTFLAG_JOB) { wait_idle(); pendingEf.push_back(ea); pc += 8; continue; }
-            flushEf(); submit(ea); pc += 8; continue;
+            if ((rd32m(ea + 4) & ~0xFu) == EVENTFLAG_JOB) { wait_idle(4); pendingEf.push_back(ea); pc += 8; continue; }
+            flushEf(); submit(ea); ++g_mgrJobs; pc += 8; continue;
         }
         switch (op) {
             case 1: pc = ea; continue;                                  // RESET_PC
-            case 2: case 5: g_mgrWhat = 3; wait_idle(); pc += 8; continue;             // SYNC / LWSYNC / labels / FLUSH
+            case 2: case 5: g_mgrWhat = 3; wait_idle(op == 2 ? 0 : 1); pc += 8; continue;             // SYNC / LWSYNC / labels / FLUSH
             case 3: pc = ea; continue;                                  // NEXT
             case 4: calls.push_back(pc + 8); pc = ea; continue;         // CALL
             case 6: {                                                   // JOBLIST {u32 numJobs, u32 sizeOfJob, u64 eaJobList}
@@ -1366,17 +1378,33 @@ void manager() {
         if (sub == 1) {                                                 // GUARD: wait for cellSpursJobGuardNotify
             g_mgrWhat = 1;
             flushEf();
-            wait_idle();
+            wait_idle(2);
+            const uint64_t tg0 = g_mgrStat ? now_us() : 0;
             auto g = guard_of(uint32_t(w) & ~0x7fu);
-            for (const uint64_t t0 = now_us(); g->remaining.load() > 0;) { if (now_us() - t0 < 3000) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(50)); }
+            for (const uint64_t t0 = now_us(); g->remaining.load() > 0;) { if (now_us() - t0 < g_mgrSpinUs) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(50)); }
             if (g->autoReset) g->remaining = g->count;
+            if (g_mgrStat) g_mgrGuardUs += now_us() - tg0;
             pc += 8; continue;
         }
         if (sub == 14) { if (!calls.empty()) { pc = calls.back(); calls.pop_back(); } else pc += 8; continue; }   // RET
         if (sub == 15 || sub == 0) {                                    // END / ABORT: idle until the command is rewritten
             g_mgrWhat = 2;
             flushEf();
-            wait_idle();
+            wait_idle(3);
+            const uint64_t te0 = g_mgrStat ? now_us() : 0;
+            struct EndT { uint64_t t; ~EndT() { if (g_mgrStat) g_mgrEndUs += now_us() - t; } } endT{te0};
+            if (g_mgrStat) {
+                static uint64_t last = 0;
+                if (te0 - last > 4000000) {
+                    if (last) {
+                        const double k = 1000.0 / double(te0 - last);
+                        LOG("[mgrstat] per ms: jobs %.2f | waits n/ms-per-s: sync %.2f/%.0f lwsync %.2f/%.0f guard %.2f/%.0f end %.2f/%.0f ef %.2f/%.0f | idle at guard %.0f, at end %.0f ms/s\n",
+                            g_mgrJobs * k, g_wiN[0] * k, g_wiUs[0] * k, g_wiN[1] * k, g_wiUs[1] * k, g_wiN[2] * k, g_wiUs[2] * k, g_wiN[3] * k, g_wiUs[3] * k, g_wiN[4] * k, g_wiUs[4] * k, g_mgrGuardUs * k, g_mgrEndUs * k);
+                    }
+                    last = te0; g_mgrJobs = 0; g_mgrGuardUs = 0; g_mgrEndUs = 0;
+                    for (int i = 0; i < 5; ++i) { g_wiN[i] = 0; g_wiUs[i] = 0; }
+                }
+            }
             // Like the SPURS kernel: an idle chain reads its list again only when the game kicks it (cellSpursRunJobChain,
             // or a guard notify that opens the guard), i.e. after the game finished rewriting it. Resuming as soon as the
             // END word changed raced with those rewrites (a NEXT half written -> stale END -> game frozen). A changed word
@@ -1385,7 +1413,7 @@ void manager() {
             uint64_t changedAt = 0;
             for (const uint64_t t0 = now_us(); kicks.load() == k0;) {
                 if (rd64m(pc) != w) { if (!changedAt) changedAt = now_us(); else if (now_us() - changedAt > 20000) break; }
-                if (now_us() - t0 < 3000) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(50));
+                if (now_us() - t0 < g_mgrSpinUs) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(50));
             }
             continue;
         }
