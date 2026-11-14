@@ -1316,6 +1316,8 @@ void wait_idle() {
     idlecv.wait(lk, [] { return queue.empty() && busy == 0; });
 }
 
+std::atomic<uint32_t> g_mgrPc{0}, g_mgrWhat{0};   // diagnostics: command list position and what the manager waits for (1 guard, 2 end, 3 sync)
+uint32_t g_mgrHist[64][3]; unsigned g_mgrHistN = 0;   // diagnostics: last commands read (pc, low word, time us)
 void manager() {
     t_tid = 0x01000202;
     if (g_workers > 1) for (int k = 0; k < g_workers; ++k) std::thread(worker, k).detach();
@@ -1323,13 +1325,21 @@ void manager() {
     std::vector<uint32_t> calls;
     for (;;) {
         const uint64_t w = rd64m(pc);
+        g_mgrPc = pc; g_mgrWhat = 0;
+        { const unsigned h = g_mgrHistN++ % 64; g_mgrHist[h][0] = pc; g_mgrHist[h][1] = uint32_t(w); g_mgrHist[h][2] = uint32_t(now_us()); }
         const uint32_t ea = uint32_t(w) & ~7u;
         const uint32_t op = uint32_t(w) & 7, sub = (uint32_t(w) >> 3) & 0xf;
-        if (w == 0) { pc += 8; continue; }
+        if (w == 0) {   // a zero may be a slot the game is rewriting right now: give it a moment before skipping it
+                        // (skipping a NEXT being written left the manager on a stale END for good, ~1 run in 2 at 144 Hz)
+            bool changed = false;
+            for (const uint64_t t0 = now_us(); now_us() - t0 < 2000;) { if (rd64m(pc) != 0) { changed = true; break; } std::this_thread::yield(); }
+            if (changed) continue;
+            pc += 8; continue;
+        }
         if (op == 0) { submit(ea); pc += 8; continue; }
         switch (op) {
             case 1: pc = ea; continue;                                  // RESET_PC
-            case 2: case 5: wait_idle(); pc += 8; continue;             // SYNC / LWSYNC / labels / FLUSH
+            case 2: case 5: g_mgrWhat = 3; wait_idle(); pc += 8; continue;             // SYNC / LWSYNC / labels / FLUSH
             case 3: pc = ea; continue;                                  // NEXT
             case 4: calls.push_back(pc + 8); pc = ea; continue;         // CALL
             case 6: {                                                   // JOBLIST {u32 numJobs, u32 sizeOfJob, u64 eaJobList}
@@ -1340,14 +1350,16 @@ void manager() {
             default: break;
         }
         if (sub == 1) {                                                 // GUARD: wait for cellSpursJobGuardNotify
+            g_mgrWhat = 1;
             wait_idle();
             auto g = guard_of(uint32_t(w) & ~0x7fu);
             for (const uint64_t t0 = now_us(); g->remaining.load() > 0;) { if (now_us() - t0 < 3000) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(50)); }
-            if (g->autoReset) g->remaining += g->count;
+            if (g->autoReset) g->remaining = g->count;
             pc += 8; continue;
         }
         if (sub == 14) { if (!calls.empty()) { pc = calls.back(); calls.pop_back(); } else pc += 8; continue; }   // RET
         if (sub == 15 || sub == 0) {                                    // END / ABORT: idle until the command is rewritten
+            g_mgrWhat = 2;
             wait_idle();
             const uint64_t k0 = kicks.load();
             for (const uint64_t t0 = now_us(); rd64m(pc) == w && kicks.load() == k0;) { if (now_us() - t0 < 3000) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(50)); }
@@ -1906,7 +1918,13 @@ bool imports(PPU& c, const char* module, const char* name) {
         }
         if (g_jobsOn) {
             if (n == "cellSpursRunJobChain") { jobs::start(g_jobChainEntry); ++jobs::kicks; }
-            else { auto g = jobs::guard_of(a32(c, 0)); --g->remaining; }
+            else {   // like SPURS: a notify on a guard that is already open is dropped (it used to go negative and let the
+                     // chain pass the next guard early, ahead of the render thread: a deadlock every minute or two at 144 Hz)
+                auto g = jobs::guard_of(a32(c, 0));
+                int32_t r = g->remaining.load();
+                while (r > 0 && !g->remaining.compare_exchange_weak(r, r - 1)) {}
+                if (r == 1) { ++jobs::kicks; jobs::kicks.notify_all(); }
+            }
         }
         ret(c, CELL_OK); return true;
     }
@@ -2404,6 +2422,16 @@ void lv2_dump_waits() {
         LOG("[wait] Edge output buffer %d: start %08x end %08x current %08x word6 %08x label word %08x\n", n, jobs::rd32m(e), jobs::rd32m(e + 8), jobs::rd32m(e + 12), jobs::rd32m(e + 24), jobs::rd32m(e + 20));
     }
     if (gcm::labels) LOG("[wait] RSX labels 0x400 %08x, 0x410 %08x, 0x420 %08x\n", gcm::rd(gcm::labels + 0x400), gcm::rd(gcm::labels + 0x410), gcm::rd(gcm::labels + 0x420));
+    {
+        std::lock_guard<std::mutex> lk(jobs::qmx);
+        const uint32_t pc = jobs::g_mgrPc.load();
+        LOG("[wait] job manager: pc %x word %016llx, waits for %u (1 guard, 2 end, 3 sync), queue %zu, busy %d, kicks %llu, jobs run %llu\n", pc, pc ? (unsigned long long)jobs::rd64m(pc) : 0ull,
+            jobs::g_mgrWhat.load(), jobs::queue.size(), jobs::busy, (unsigned long long)jobs::kicks.load(), (unsigned long long)jobs::jobsRun.load());
+        if (pc) for (int k = -4; k <= 4; ++k) LOG("[wait]   %x: %016llx\n", pc + 8 * k, (unsigned long long)jobs::rd64m(pc + 8 * k));
+        std::string s; char b[48];
+        for (unsigned k = jobs::g_mgrHistN - std::min(jobs::g_mgrHistN, 64u); k != jobs::g_mgrHistN; ++k) { const auto& h = jobs::g_mgrHist[k % 64]; std::snprintf(b, sizeof b, " %x:%x@%u", h[0], h[1], h[2] % 10000000u); s += b; }
+        LOG("[wait] job manager history (pc:word@us):%s\n", s.c_str());
+    }
     for (int w = 0; w < 16; ++w)   // jobs still running (exact pc only with NOSPUREC=1)
         if (const uint32_t j = jobs::g_workerJob[w].load()) {
             const Spu& sp = *jobs::g_workerSpu[w];
