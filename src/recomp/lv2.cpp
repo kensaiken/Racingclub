@@ -1323,7 +1323,14 @@ void manager() {
     if (g_workers > 1) for (int k = 0; k < g_workers; ++k) std::thread(worker, k).detach();
     uint32_t pc = list;
     std::vector<uint32_t> calls;
+    // The event flag job wakes the render thread, which then rewrites this command list for the next frame. The SPURS
+    // kernel has grabbed the following commands by then; here the job is held back until the manager has read on to
+    // the next job or wait point (guard, end), or it could follow the new list from the middle and end up on a stale
+    // END: the game froze every minute or two at 144 Hz.
+    std::vector<uint32_t> pendingEf;
+    const auto flushEf = [&] { for (uint32_t j : pendingEf) submit(j); pendingEf.clear(); };
     for (;;) {
+        const uint64_t kRead = kicks.load();   // kicks seen before this command was read (END waits for a newer one)
         const uint64_t w = rd64m(pc);
         g_mgrPc = pc; g_mgrWhat = 0;
         { const unsigned h = g_mgrHistN++ % 64; g_mgrHist[h][0] = pc; g_mgrHist[h][1] = uint32_t(w); g_mgrHist[h][2] = uint32_t(now_us()); }
@@ -1336,13 +1343,17 @@ void manager() {
             if (changed) continue;
             pc += 8; continue;
         }
-        if (op == 0) { submit(ea); pc += 8; continue; }
+        if (op == 0) {
+            if ((rd32m(ea + 4) & ~0xFu) == EVENTFLAG_JOB) { wait_idle(); pendingEf.push_back(ea); pc += 8; continue; }
+            flushEf(); submit(ea); pc += 8; continue;
+        }
         switch (op) {
             case 1: pc = ea; continue;                                  // RESET_PC
             case 2: case 5: g_mgrWhat = 3; wait_idle(); pc += 8; continue;             // SYNC / LWSYNC / labels / FLUSH
             case 3: pc = ea; continue;                                  // NEXT
             case 4: calls.push_back(pc + 8); pc = ea; continue;         // CALL
             case 6: {                                                   // JOBLIST {u32 numJobs, u32 sizeOfJob, u64 eaJobList}
+                flushEf();
                 const uint32_t n = rd32m(ea), sz = rd32m(ea + 4), lst = uint32_t(rd64m(ea + 8));
                 for (uint32_t k = 0; k < n; ++k) submit(lst + k * sz);
                 pc += 8; continue;
@@ -1351,6 +1362,7 @@ void manager() {
         }
         if (sub == 1) {                                                 // GUARD: wait for cellSpursJobGuardNotify
             g_mgrWhat = 1;
+            flushEf();
             wait_idle();
             auto g = guard_of(uint32_t(w) & ~0x7fu);
             for (const uint64_t t0 = now_us(); g->remaining.load() > 0;) { if (now_us() - t0 < 3000) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(50)); }
@@ -1360,10 +1372,18 @@ void manager() {
         if (sub == 14) { if (!calls.empty()) { pc = calls.back(); calls.pop_back(); } else pc += 8; continue; }   // RET
         if (sub == 15 || sub == 0) {                                    // END / ABORT: idle until the command is rewritten
             g_mgrWhat = 2;
+            flushEf();
             wait_idle();
-            const uint64_t k0 = kicks.load();
-            for (const uint64_t t0 = now_us(); rd64m(pc) == w && kicks.load() == k0;) { if (now_us() - t0 < 3000) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(50)); }
-            if (rd64m(pc) == w) std::this_thread::yield();
+            // Like the SPURS kernel: an idle chain reads its list again only when the game kicks it (cellSpursRunJobChain,
+            // or a guard notify that opens the guard), i.e. after the game finished rewriting it. Resuming as soon as the
+            // END word changed raced with those rewrites (a NEXT half written -> stale END -> game frozen). A changed word
+            // without any kick is still followed after 20 ms.
+            const uint64_t k0 = kRead;
+            uint64_t changedAt = 0;
+            for (const uint64_t t0 = now_us(); kicks.load() == k0;) {
+                if (rd64m(pc) != w) { if (!changedAt) changedAt = now_us(); else if (now_us() - changedAt > 20000) break; }
+                if (now_us() - t0 < 3000) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
             continue;
         }
         pc += 8;                                                        // SET_LABEL and the rest
@@ -2416,6 +2436,7 @@ void lv2_install(Guest& g, const Lv2Config& cfg) {
     };
 }
 
+unsigned long long lv2_flip_count() { return gcm::flips.load(); }
 void lv2_dump_waits() {
     for (int n = 0; n < 4; ++n) {   // Edge geometry output buffers: shared, then one per SPU (start, offset, end, current, location, label cmd, ?)
         const uint32_t e = 0x01061900u + 0x80u * n;

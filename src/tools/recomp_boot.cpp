@@ -40,7 +40,14 @@ int main(int argc, char** argv) {
     if (std::getenv("SAMPLE")) {   // sample every thread's call chain twice a second
         for (int k = 0; k < seconds * 2; ++k) { std::this_thread::sleep_for(std::chrono::milliseconds(500)); rc_dump_all_shadows(); }
     } else if (seconds <= 0) {   // --seconds 0: play until the window is closed
-        while (!rsx::quit_requested()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // a game that shows no new image for 10 s is stuck: write what every thread waits for to the log (once)
+        unsigned long long lastFlips = 0; int still = 0; bool dumped = false;
+        while (!rsx::quit_requested()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            const unsigned long long f = lv2_flip_count();
+            if (f != lastFlips) { lastFlips = f; still = 0; continue; }
+            if (f && ++still == 100 && !dumped) { dumped = true; std::fprintf(stderr, "[boot] no image for 10 s: state dump\n"); lv2_dump_waits(); std::fflush(stderr); }
+        }
         gti::recomp::host_restore_refresh(); std::_Exit(0);
     } else
         for (int k = 0; k < seconds * 10 && !rsx::quit_requested(); ++k) std::this_thread::sleep_for(std::chrono::milliseconds(100));
