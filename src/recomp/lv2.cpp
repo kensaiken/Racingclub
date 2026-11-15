@@ -5,6 +5,7 @@
 #include "recomp/spu_rt.h"
 #include "recomp/hle.h"
 #include "recomp/spu.h"
+#include "recomp/atrac3.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -1481,6 +1482,83 @@ std::atomic<uint64_t> g_signals{0}, g_passes{0};
 std::atomic<uint64_t> g_waits{0}, g_busySum{0}, g_busyMax{0}, g_wake{0}, g_slow{0};   // mixer pass statistics
 std::vector<Task*> g_tasks;
 uint32_t be32(uint32_t a) { uint32_t x; std::memcpy(&x, G->mem + a, 4); return __builtin_bswap32(x); }
+
+// Our ATRAC3 decoder in place of the system software's module (flashATRAC.pic). The mixer calls the module's decode
+// function with r3 = LS of the compressed frame (2 sound units of 0x98 bytes), r4 = LS of the output (channel c at
+// r4 + c * 0x1000), r6 = 0x400, r7 = LS of the voice's context (+0x20: flags, top byte 2 when the voice starts a new
+// sound, 1 otherwise; +0x34: the context's address in main memory, used here as the voice's identity).
+// Per voice the module alternates: on a start it decodes nothing and asks for a frame (returns 0x200); then one call
+// decodes the frame it is given (returns 0) and the next one hands out the rest (returns 0x200, a new frame please).
+// Each call writes 1024 big-endian 16-bit samples per channel (inverted polarity, x * -32768) and 4 more samples
+// extrapolated from the last two: after a decode, the second half of the previous frame and the first half of the
+// new one; on the next call, the whole new frame. Returns r3 = {0 or 0x200, 2, 0x98, 0}.
+// Matches the module's output to +-1 in the 16-bit samples (FFmpeg-exact decoding; see NOTAS_NOCHE.md).
+struct AtracVoice {
+    atrac3::Decoder dec{2, 0x98};
+    float cur[2][1024] = {}, prevHalf[2][512] = {};
+    int stage = 0;   // 0 start (next call asks for a frame), 1 a frame comes now, 2 second half
+};
+std::map<uint32_t, std::unique_ptr<AtracVoice>> g_atracVoices;   // only the mixer task thread uses it
+std::atomic<uint64_t> g_atracFrames{0}, g_atracBad{0};
+// one call: the 2 x 1028 samples to write; returns the value for r3
+uint32_t atrac_compute(const uint8_t* frame, uint32_t key, uint32_t flags, int16_t (&s)[2][1028]) {
+    auto& slot = g_atracVoices[key];
+    if (!slot) slot = std::make_unique<AtracVoice>();
+    AtracVoice& v = *slot;
+    if ((flags >> 24) == 2) { v.dec.reset(); std::memset(v.cur, 0, sizeof v.cur); std::memset(v.prevHalf, 0, sizeof v.prevHalf); v.stage = 0; }
+    float win[2][1024];
+    uint32_t ret;
+    if (v.stage == 1) {
+        for (int c = 0; c < 2; ++c) std::memcpy(v.prevHalf[c], v.cur[c] + 512, sizeof v.prevHalf[c]);
+        if (frame) {
+            float* o[2] = {v.cur[0], v.cur[1]};
+            if (!v.dec.decode(frame, o)) ++g_atracBad;
+            ++g_atracFrames;
+        }
+        for (int c = 0; c < 2; ++c) { std::memcpy(win[c], v.prevHalf[c], 512 * 4); std::memcpy(win[c] + 512, v.cur[c], 512 * 4); }
+        v.stage = 2; ret = 0;
+    } else {
+        if (v.stage == 0 && frame && (frame[0] >> 2) == 0x28) {   // start: the first frame primes the decoder; out goes
+            float* o[2] = {v.cur[0], v.cur[1]};                     // (silence) + the first half of that frame
+            if (!v.dec.decode(frame, o)) ++g_atracBad;
+            for (int c = 0; c < 2; ++c) { std::memset(win[c], 0, 512 * 4); std::memcpy(win[c] + 512, v.cur[c], 512 * 4); }
+        } else for (int c = 0; c < 2; ++c) std::memcpy(win[c], v.cur[c], 1024 * 4);
+        v.stage = 1; ret = 0x200;
+    }
+    for (int c = 0; c < 2; ++c) {
+        for (int i = 0; i < 1024; ++i) s[c][i] = int16_t(std::clamp(std::lrintf(win[c][i] * -32768.0f), -32768L, 32767L));
+        for (int i = 0; i < 4; ++i)   // 16-bit wrap-around like the module (no clamping)
+            s[c][1024 + i] = int16_t(uint16_t(int(s[c][1023]) + (i + 1) * (int(s[c][1023]) - int(s[c][1022]))));
+    }
+    return ret;
+}
+bool atrac_decode_call(Spu& sp) {
+    const uint32_t in = sp.r[3].w(0) & 0x3ffff, out = sp.r[4].w(0) & 0x3ffff, ctx = sp.r[7].w(0) & 0x3ffff;
+    int16_t s[2][1028];
+    const uint32_t ret = atrac_compute(in + 0x130 <= Spu::LS_SIZE ? sp.ls + in : nullptr, sp.lsw(ctx + 0x34), sp.lsw(ctx + 0x20), s);
+    for (int c = 0; c < 2; ++c) {
+        uint32_t a = out + uint32_t(c) * 0x1000;
+        if (a + 1028 * 2 > Spu::LS_SIZE) continue;
+        for (int i = 0; i < 1028; ++i, a += 2) { sp.ls[a] = uint8_t(uint16_t(s[c][i]) >> 8); sp.ls[a + 1] = uint8_t(s[c][i]); }
+    }
+    sp.r[3].sw(0, ret); sp.r[3].sw(1, 2); sp.r[3].sw(2, 0x98); sp.r[3].sw(3, 0);
+    sp.pc = sp.r[0].w(0) & 0x3fffc;
+    static uint64_t calls = 0, starts = 0, last = 0;
+    ++calls; if ((sp.lsw(ctx + 0x20) >> 24) == 2) ++starts;
+    static const uint64_t delayUs = std::getenv("ATRACDELAY") ? std::strtoull(std::getenv("ATRACDELAY"), nullptr, 10) : 0;   // debug: busy wait per call
+    if (delayUs) for (const uint64_t t0 = now_us(); now_us() - t0 < delayUs;) {}
+    if (std::getenv("ATRACSTAT") && now_us() - last > 4000000) {   // debug: ATRACSTAT=1
+        last = now_us();
+        LOG("[atrac] built-in: %llu calls, %llu frames, %llu starts, %zu voices, bad %llu%c", (unsigned long long)calls, (unsigned long long)g_atracFrames.load(), (unsigned long long)starts, g_atracVoices.size(), (unsigned long long)g_atracBad.load(), 10);
+    }
+    return true;
+}
+// ATRACCHECK=1 (debug): the system's module decodes as usual; after each decode call ours computes the same call and
+// the outputs are compared ([atrac] lines every 4 s: calls, samples off by more than 2, worst difference)
+std::atomic<uint64_t> g_chkCalls{0}, g_chkBadSamples{0}, g_chkWorst{0}, g_chkRet{0};
+uint32_t g_chkCtx[32], g_chkRegs[3], g_chkIn[128][4];
+std::vector<uint8_t> g_chkLs(Spu::LS_SIZE);   // LS at the entry of the call (ATRACUNDO)
+
 void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, uint32_t spurs) {
     ripprof_register_thread("sndtask");
     if (!std::getenv("SNDNOPRIO")) host_thread_priority_high();
@@ -1510,6 +1588,120 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
     const spurt::Compiled* cpMod = std::getenv("NOSPUREC") ? nullptr : spurt::find_compiled(0xbce880);   // mstream_dsp_reverb.pic
     if (cpMain && !std::memcmp(s.ls + cpMain->lsBase, G->mem + cpMain->eaBin, cpMain->size)) { s.compiled = cpMain->fn; s.compiledLo = cpMain->lsBase; s.compiledHi = cpMain->lsBase + cpMain->size; }
     if (std::getenv("SNDTRACE")) s.mfcTrace = 4000;
+    if (std::getenv("ATRACHLE")) {   // debug: ATRACHLE=1 uses our decoder even when the system's module is loaded (A/B tests)
+        s.region3Lo = 0x32980; s.region3Hi = 0x32980 + 0x7d40;
+        s.onRegion3 = [](Spu& sp, bool enter) { return enter && sp.pc == 0x36c58 && atrac_decode_call(sp); };
+    }
+    if (std::getenv("ATRACCHECK")) {
+        s.region3Lo = 0x32980; s.region3Hi = 0x32980 + 0x7d40;
+        s.onRegion3 = [](Spu& sp, bool enter) {
+            static uint32_t out = 0, key = 0, phase = 0; static bool decoding = false; static uint8_t frame[0x130];
+            if (enter) {
+                decoding = sp.pc == 0x36c58;
+                static const bool noPut = std::getenv("ATRACNOPUT") != nullptr;   // debug: the module's writes to main memory are dropped
+                sp.dropPuts = noPut && decoding;
+                const uint32_t in = sp.r[3].w(0) & 0x3ffff;
+                out = sp.r[4].w(0) & 0x3ffff; key = sp.lsw((sp.r[7].w(0) & 0x3ffff) + 0x34); phase = sp.lsw((sp.r[9].w(0) & 0x3ffff) + 0x10);
+                if (in + 0x130 <= Spu::LS_SIZE) std::memcpy(frame, sp.ls + in, 0x130);
+                for (int i = 0; i < 32; ++i) g_chkCtx[i] = sp.lsw((sp.r[7].w(0) & 0x3ffff) + 4 * i);
+                g_chkRegs[0] = in; g_chkRegs[1] = out; g_chkRegs[2] = sp.r[5].w(0);
+                for (int r = 0; r < 128; ++r) for (int w = 0; w < 4; ++w) g_chkIn[r][w] = sp.r[r].w(w);
+                if (std::getenv("ATRACUNDO")) std::memcpy(g_chkLs.data(), sp.ls, Spu::LS_SIZE);
+                return false;
+            }
+            sp.dropPuts = false;
+            if (!decoding) return false;
+            decoding = false;
+            int16_t s[2][1028];
+            const uint32_t ourRet = atrac_compute(frame, key, g_chkCtx[8], s);
+            if (sp.r[3].w(0) != ourRet) ++g_chkRet;
+            uint64_t bad = 0, worst = 0;
+            for (int c = 0; c < 2; ++c)
+                for (int i = 0; i < 1028; ++i) {
+                    const uint32_t a = (out + uint32_t(c) * 0x1000 + uint32_t(i) * 2) & (Spu::LS_SIZE - 2);
+                    const int16_t sony = int16_t(uint16_t(sp.ls[a]) << 8 | sp.ls[a + 1]);
+                    const uint64_t d = uint64_t(std::abs(int(sony) - int(s[c][i])));
+                    if (d > 2) ++bad;
+                    if (d > worst) worst = d;
+                }
+            {   // where Sony's decoder restarts a voice (0x200 twice in a row): the context words of that call
+                static std::map<uint32_t, uint32_t> lastRet; static int shownRestart = 0;
+                const uint32_t r = sp.r[3].w(0);
+                auto it = lastRet.find(key);
+                const bool restart = r == 0x200 && (it == lastRet.end() || it->second == 0x200);
+                static std::map<uint32_t, int> follow;   // calls still to show after a start flag (ctx word 8, top byte 2)
+                if ((g_chkCtx[8] >> 24) == 2 && shownRestart < 6) { ++shownRestart; follow[key] = 7; }
+                if (follow[key] > 0) {
+                    --follow[key];
+                    LOG("[atrac] seq voice %08x w8 %08x phase %u sony r3 %x %x %x %x, frame %02x%02x, ours bad %llu, regs r3 %05x r4 %05x r5 %05x%c", key, g_chkCtx[8], phase,
+                        sp.r[3].w(0), sp.r[3].w(1), sp.r[3].w(2), sp.r[3].w(3), frame[0], frame[1], (unsigned long long)bad, g_chkRegs[0], g_chkRegs[1], g_chkRegs[2], 10);
+                }
+                (void)restart;
+                lastRet[key] = r;
+            }
+            {   // registers the module changes besides r3 (the first calls): the mixer may read more than r3
+                static int shownRegs = 0;
+                if (shownRegs < 6) {
+                    ++shownRegs;
+                    LOG("[atrac] regs changed by the module (call %llu):", (unsigned long long)g_chkCalls.load());
+                    for (int r = 1; r < 128; ++r)
+                        for (int w = 0; w < 4; ++w)
+                            if (sp.r[r].w(w) != g_chkIn[r][w] && r != 3) { LOG(" r%d.%d %08x->%08x", r, w, g_chkIn[r][w], sp.r[r].w(w)); break; }
+                    LOG("%c", 10);
+                }
+            }
+            static int shownBig = 0;
+            if (worst > 1000 && shownBig++ < 8) {
+                int at = 0, cc = 0, so = 0, us = 0;
+                for (int c = 0; c < 2; ++c)
+                    for (int i = 0; i < 1028; ++i) {
+                        const uint32_t a = (out + uint32_t(c) * 0x1000 + uint32_t(i) * 2) & (Spu::LS_SIZE - 2);
+                        const int sv = int(int16_t(uint16_t(sp.ls[a]) << 8 | sp.ls[a + 1]));
+                        if (std::abs(sv - int(s[c][i])) == int(worst)) { at = i; cc = c; so = sv; us = s[c][i]; }
+                    }
+                LOG("[atrac] big diff %llu voice %08x flags %08x sony ret %x ours %x, ch %d sample %d sony %d ours %d, bad %llu, frame %02x%02x%c", (unsigned long long)worst, key, g_chkCtx[8],
+                    sp.r[3].w(0), ourRet, cc, at, so, us, (unsigned long long)bad, frame[0], frame[1], 10);
+            }
+            static int shownDetail = 0;
+            if (bad > 100 && (g_chkCtx[8] >> 24) == 2 && shownDetail++ < 2) {   // a start call that differs: both outputs, sampled
+                LOG("[atrac] start detail voice %08x:", key);
+                for (int c = 0; c < 2; ++c)
+                    for (int i = 0; i < 1028; i += 64) {
+                        const uint32_t a = (out + uint32_t(c) * 0x1000 + uint32_t(i) * 2) & (Spu::LS_SIZE - 2);
+                        LOG(" c%d[%d] %d/%d", c, i, int(int16_t(uint16_t(sp.ls[a]) << 8 | sp.ls[a + 1])), int(s[c][i]));
+                    }
+                LOG("%c", 10);
+            }
+            static int shownBad = 0;
+            if ((bad > 100 || sp.r[3].w(0) != ourRet) && shownBad++ < 16)
+                LOG("[atrac] mismatch: voice %08x phase %u sony r3 %08x %08x %08x %08x, bad %llu, frame %02x%02x%02x%02x, regs r4 %05x r5 %05x r6 %x r8 %05x%c", key, phase,
+                    sp.r[3].w(0), sp.r[3].w(1), sp.r[3].w(2), sp.r[3].w(3), (unsigned long long)bad, frame[0], frame[1], frame[2], frame[3], sp.r[4].w(0), sp.r[5].w(0), sp.r[6].w(0), sp.r[8].w(0), 10);
+            {   // ATRACUNDO=lo-hi (hex LS range): put back what that range held before Sony's call (which of its writes matter)
+                static uint32_t ulo = 0, uhi = 0;
+                static bool parsed = false;
+                if (!parsed) { parsed = true; if (const char* u = std::getenv("ATRACUNDO")) std::sscanf(u, "%x-%x", &ulo, &uhi); }
+                if (uhi > ulo && uhi <= Spu::LS_SIZE) std::memcpy(sp.ls + ulo, g_chkLs.data() + ulo, uhi - ulo);
+            }
+            if (std::getenv("ATRACREGS"))   // debug: registers back to their entry values except r3 (does the mixer read others?)
+                for (int r = 2; r < 128; ++r) if (r != 3) for (int w = 0; w < 4; ++w) sp.r[r].sw(w, g_chkIn[r][w]);
+            static const bool overwrite = std::getenv("ATRACCHECK")[0] == '2';   // ATRACCHECK=2: then replace Sony's output by ours
+            if (overwrite)
+                for (int c = 0; c < 2; ++c)
+                    for (int i = 0; i < 1028; ++i) {
+                        const uint32_t a = (out + uint32_t(c) * 0x1000 + uint32_t(i) * 2) & (Spu::LS_SIZE - 2);
+                        sp.ls[a] = uint8_t(uint16_t(s[c][i]) >> 8); sp.ls[a + 1] = uint8_t(s[c][i]);
+                    }
+            ++g_chkCalls; g_chkBadSamples += bad;
+            if (worst > g_chkWorst) g_chkWorst = worst;
+            static uint64_t last = 0;
+            if (now_us() - last > 4000000) {
+                last = now_us();
+                LOG("[atrac] check: %llu calls, %llu samples off by more than 2, worst %llu, wrong return %llu, voices %zu, bad frames %llu%c", (unsigned long long)g_chkCalls.load(),
+                    (unsigned long long)g_chkBadSamples.load(), (unsigned long long)g_chkWorst.load(), (unsigned long long)g_chkRet.load(), g_atracVoices.size(), (unsigned long long)g_atracBad.load(), 10);
+            }
+            return false;
+        };
+    }
     if (const char* cl = std::getenv("CODECLOG")) {   // debug: CODECLOG=n: the first n calls into the music decoder (LS 0x32980..), arguments and result
         static int left = std::atoi(cl);
         s.region3Lo = 0x32980; s.region3Hi = 0x32980 + 0x7d40;
@@ -1545,12 +1737,16 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
         const uint32_t nr = sp.r[3].w(0), lr = sp.r[0].w(0);
         { static std::set<uint64_t> seen; if (seen.size() < 24 && seen.insert(uint64_t(tg) << 40 | uint64_t(lr) << 8 | (nr & 0xff)).second) LOG("[snd] task %u: first call of LS 0x%x from %05x with r3 %08x%c", t->id, tg, lr, nr, 10); }
         if (trace && shown++ < 200) LOG("[snd] task %u: call LS 0x%x r3 %08x r4 %08x r5 %08x lr %05x\n", t->id, tg, nr, sp.r[4].w(0), sp.r[5].w(0), lr);
-        if (tg == 0) {   // codec module that was never loaded (flashATRAC.pic missing): the stream stays silent
+        if (tg == 0) {   // codec module that was never loaded (no flashATRAC.pic): our own ATRAC3 decoder answers the calls
             static bool told = false;
-            if (!told) { told = true; LOG("[snd] no ATRAC decoder (dev_flash/sys/external/flashATRAC.pic): music streams are silent%c", 10); }
+            if (!told) { told = true; LOG("[snd] no flashATRAC.pic: music and ambience streams use the built-in ATRAC3 decoder%c", 10); }
             ++g_passes;
-            std::memset(sp.ls + 0x12a00, 0, 0x18000);   // the three work buffers the decoder is given: compressed data must not be mixed as PCM
             { const uint64_t d = now_us() - g_wake; g_busySum += d; ++g_waits; if (d > g_busyMax) g_busyMax = d; if (d > 8000) ++g_slow; }   // debug: time since the last signal
+            if (sp.r[6].w(0) == 0x400) {   // decode
+                atrac_decode_call(sp);
+                if (cpMod && !sp.compiled2 && !std::memcmp(sp.ls + cpMod->lsBase, G->mem + cpMod->eaBin, cpMod->size)) { sp.compiled2 = cpMod->fn; sp.compiled2Lo = cpMod->lsBase; sp.compiled2Hi = cpMod->lsBase + cpMod->size; }
+                return true;
+            }
             if (cpMod && !sp.compiled2 && !std::memcmp(sp.ls + cpMod->lsBase, G->mem + cpMod->eaBin, cpMod->size)) { sp.compiled2 = cpMod->fn; sp.compiled2Lo = cpMod->lsBase; sp.compiled2Hi = cpMod->lsBase + cpMod->size; }
             sp.r[3].sw(0, 0); sp.pc = lr & 0x3fffc;
             return true;
