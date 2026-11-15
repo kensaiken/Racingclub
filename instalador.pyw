@@ -2,8 +2,8 @@
 
 Started by "Instalar Racing Club+.exe" (src/tools/instalador_launcher.c) with the Python bundled in toolchain/python,
 or directly: pythonw instalador.pyw
-Two steps only: the user's game files (.pkg and .rap, chosen together and sorted here) and the RPCS3 folder.
-The installer's language is also the game's language.
+Four sections, each saying which of the user's files go there: the game (.pkg + .rap), update 1.02 (.pkg), the car pack
+(optional, .pkg + .rap) and the RPCS3 folder. The installer's language is also the game's language.
 """
 import ctypes, json, os, queue, re, struct, subprocess, sys, threading
 import tkinter as tk
@@ -17,30 +17,41 @@ TITLE_ID, APP_VER = 'NPEB00060', '01.02'
 
 T = {
  'sub':     ['PC installer', 'Installateur PC', 'Instalador para PC', 'PC-Installation', 'Installazione per PC'],
- 'step1':   ['Your game files', 'Les fichiers de votre jeu', 'Los ficheros de tu juego', 'Deine Spieldateien', 'I file del tuo gioco'],
- 'pick1':   ['Choose .pkg and .rap files…', 'Choisir les .pkg et .rap…', 'Elegir los .pkg y .rap…', '.pkg- und .rap-Dateien wählen…', 'Scegli i file .pkg e .rap…'],
- 'step2':   ['RPCS3 folder', 'Dossier de RPCS3', 'Carpeta de RPCS3', 'RPCS3-Ordner', 'Cartella di RPCS3'],
- 'pick2':   ['Choose folder…', 'Choisir le dossier…', 'Elegir carpeta…', 'Ordner wählen…', 'Scegli cartella…'],
+ 's_game':  ['Game', 'Jeu', 'Juego', 'Spiel', 'Gioco'],
+ 'h_game':  ['The game\'s .pkg and its .rap licence', 'Le .pkg du jeu et sa licence .rap', 'El .pkg del juego y su licencia .rap',
+             'Die .pkg des Spiels und ihre .rap-Lizenz', 'Il .pkg del gioco e la sua licenza .rap'],
+ 's_upd':   ['Update 1.02', 'Mise à jour 1.02', 'Actualización 1.02', 'Update 1.02', 'Aggiornamento 1.02'],
+ 'h_upd':   ['The update\'s .pkg (it has no licence)', 'Le .pkg de la mise à jour (sans licence)', 'El .pkg de la actualización (no lleva licencia)',
+             'Die .pkg des Updates (ohne Lizenz)', 'Il .pkg dell\'aggiornamento (senza licenza)'],
+ 's_pack':  ['Car pack (optional)', 'Pack de voitures (facultatif)', 'Pack de coches (opcional)', 'Autopaket (optional)', 'Pacchetto auto (opzionale)'],
+ 'h_pack':  ['The DLC\'s .pkg and its .rap licence', 'Le .pkg du DLC et sa licence .rap', 'El .pkg del DLC y su licencia .rap',
+             'Die .pkg des DLC und ihre .rap-Lizenz', 'Il .pkg del DLC e la sua licenza .rap'],
+ 's_rpcs3': ['RPCS3', 'RPCS3', 'RPCS3', 'RPCS3', 'RPCS3'],
+ 'h_rpcs3': ['The folder where rpcs3.exe is. It is only used to decrypt your game.', 'Le dossier de rpcs3.exe. Il sert uniquement à déchiffrer votre jeu.',
+             'La carpeta donde está rpcs3.exe. Solo se usa para descifrar tu juego.', 'Der Ordner mit rpcs3.exe. Nur zum Entschlüsseln.',
+             'La cartella di rpcs3.exe. Serve solo a decifrare il gioco.'],
+ 'pickf':   ['Choose files…', 'Choisir…', 'Elegir ficheros…', 'Dateien wählen…', 'Scegli file…'],
+ 'pick1':   ['Choose file…', 'Choisir…', 'Elegir fichero…', 'Datei wählen…', 'Scegli file…'],
+ 'pickd':   ['Choose folder…', 'Choisir…', 'Elegir carpeta…', 'Ordner wählen…', 'Scegli cartella…'],
  'dl':      ['Download RPCS3 (free)', 'Télécharger RPCS3 (gratuit)', 'Descargar RPCS3 (gratis)', 'RPCS3 herunterladen (kostenlos)', 'Scarica RPCS3 (gratis)'],
- 'note':    ['European version NPEB00060 with update 1.02. RPCS3 is only used to decrypt your game. No game file is included.',
-             'Version européenne NPEB00060 avec la mise à jour 1.02. RPCS3 sert uniquement à déchiffrer votre jeu. Aucun fichier du jeu inclus.',
-             'Versión europea NPEB00060 con la actualización 1.02. RPCS3 solo se usa para descifrar tu juego. No incluye ningún fichero del juego.',
-             'Europäische Version NPEB00060 mit Update 1.02. RPCS3 dient nur zum Entschlüsseln. Keine Spieldateien enthalten.',
-             'Versione europea NPEB00060 con aggiornamento 1.02. RPCS3 serve solo a decifrare il gioco. Nessun file del gioco incluso.'],
+ 'note':    ['European version NPEB00060 with update 1.02. No game file is included in this installer.',
+             'Version européenne NPEB00060 avec la mise à jour 1.02. Aucun fichier du jeu n\'est inclus.',
+             'Versión europea NPEB00060 con la actualización 1.02. Este instalador no incluye ningún fichero del juego.',
+             'Europäische Version NPEB00060 mit Update 1.02. Keine Spieldateien enthalten.',
+             'Versione europea NPEB00060 con aggiornamento 1.02. Nessun file del gioco incluso.'],
  'install': ['INSTALL', 'INSTALLER', 'INSTALAR', 'INSTALLIEREN', 'INSTALLA'],
  'play':    ['PLAY', 'JOUER', 'JUGAR', 'SPIELEN', 'GIOCA'],
  'where':   ['Install to', 'Installer dans', 'Instalar en', 'Installieren nach', 'Installa in'],
  'change':  ['change', 'modifier', 'cambiar', 'ändern', 'cambia'],
  'details': ['details', 'détails', 'detalles', 'Details', 'dettagli'],
- 'game':    ['Game', 'Jeu', 'Juego', 'Spiel', 'Gioco'],
- 'update':  ['Update 1.02', 'Mise à jour 1.02', 'Actualización 1.02', 'Update 1.02', 'Aggiornamento 1.02'],
- 'pack':    ['Car pack', 'Pack voitures', 'Pack de coches', 'Autopaket', 'Pacchetto auto'],
- 'raps':    ['licences', 'licences', 'licencias', 'Lizenzen', 'licenze'],
- 'inrpcs3': ['Game already installed in RPCS3 (version %s)', 'Jeu déjà installé dans RPCS3 (version %s)', 'Juego ya instalado en RPCS3 (versión %s)',
-             'Spiel bereits in RPCS3 installiert (Version %s)', 'Gioco già installato in RPCS3 (versione %s)'],
- 'needpkg': ['Missing: the game and update .pkg files and the .rap licence', 'Manquent : les .pkg du jeu et de la mise à jour et la licence .rap',
-             'Faltan: los .pkg del juego y de la actualización y la licencia .rap', 'Fehlen: die .pkg von Spiel und Update und die .rap-Lizenz',
-             'Mancano: i .pkg del gioco e dell\'aggiornamento e la licenza .rap'],
+ 'licence': ['licence', 'licence', 'licencia', 'Lizenz', 'licenza'],
+ 'nolic':   ['the .rap licence is missing', 'il manque la licence .rap', 'falta la licencia .rap', 'die .rap-Lizenz fehlt', 'manca la licenza .rap'],
+ 'nopkg':   ['the .pkg is missing', 'il manque le .pkg', 'falta el .pkg', 'die .pkg fehlt', 'manca il .pkg'],
+ 'wrong':   ['this is not the right file for this section', 'ce fichier ne va pas ici', 'este fichero no es el de este apartado',
+             'diese Datei gehört nicht hierher', 'questo file non va qui'],
+ 'inrpcs3': ['Not needed: the game is already installed in RPCS3 (version %s)', 'Inutile : le jeu est déjà installé dans RPCS3 (version %s)',
+             'No hace falta: el juego ya está instalado en RPCS3 (versión %s)', 'Nicht nötig: das Spiel ist schon in RPCS3 installiert (Version %s)',
+             'Non serve: il gioco è già installato in RPCS3 (versione %s)'],
  'rpcs3ok': ['RPCS3 found', 'RPCS3 trouvé', 'RPCS3 encontrado', 'RPCS3 gefunden', 'RPCS3 trovato'],
  'norpcs3': ['rpcs3.exe is not in this folder', 'rpcs3.exe n\'est pas dans ce dossier', 'rpcs3.exe no está en esta carpeta',
              'rpcs3.exe ist nicht in diesem Ordner', 'rpcs3.exe non è in questa cartella'],
@@ -75,12 +86,10 @@ def hexrgb(c): return '#%02x%02x%02x' % c
 def mix(a, b, t): return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 
-def gradient(canvas, x0, y0, x1, y1, a=BLUE_A, b=BLUE_B, vertical=False, tag='grad'):
-    n = (y1 - y0) if vertical else (x1 - x0)
+def gradient(canvas, x0, y0, x1, y1, a=BLUE_A, b=BLUE_B):
+    n = x1 - x0
     for i in range(max(n, 1)):
-        c = hexrgb(mix(a, b, i / max(n - 1, 1)))
-        if vertical: canvas.create_line(x0, y0 + i, x1, y0 + i, fill=c, tags=tag)
-        else: canvas.create_line(x0 + i, y0, x0 + i, y1, fill=c, tags=tag)
+        canvas.create_line(x0 + i, y0, x0 + i, y1, fill=hexrgb(mix(a, b, i / max(n - 1, 1))))
 
 
 def windows_lang():
@@ -104,19 +113,16 @@ def sfo_version(path):
     return '?'
 
 
-def sort_files(paths):
-    """.pkg files -> (game, update, car pack) by content id and size; .rap files kept apart."""
-    pkgs, raps = [], []
-    for p in paths:
-        if p.lower().endswith('.rap'): raps.append(p); continue
-        try:
-            with open(p, 'rb') as f: h = f.read(0x60)
-            if h[:4] != b'\x7fPKG': continue
-            pkgs.append((h[0x30:0x54].split(b'\0')[0].decode('ascii', 'replace'), os.path.getsize(p), p))
-        except OSError: pass
-    game = sorted([x for x in pkgs if 'CARPACK' not in x[0]], key=lambda x: -x[1])
-    pack = [x[2] for x in pkgs if 'CARPACK' in x[0]]
-    return (game[0][2] if game else ''), (game[1][2] if len(game) > 1 else ''), (pack[0] if pack else ''), raps
+def pkg_id(p):
+    """content id of a .pkg ('' if it is not a PS3 package)"""
+    try:
+        with open(p, 'rb') as f: h = f.read(0x60)
+        return h[0x30:0x54].split(b'\0')[0].decode('ascii', 'replace') if h[:4] == b'\x7fPKG' else ''
+    except OSError: return ''
+
+
+# what each section accepts: the content id of its .pkg and the name of its licence must contain this
+KIND = {'game': 'NPEB00060_00-GTICLUB1', 'update': 'NPEB00060_00-GTICLUB1', 'pack': 'CARPACK'}
 
 
 class App:
@@ -125,7 +131,7 @@ class App:
         p = load_prefs()
         self.li = p.get('lang', windows_lang())
         self.rpcs3 = p.get('rpcs3', '')
-        self.files = p.get('files', [])
+        self.sel = {k: list(p.get('sel', {}).get(k, [])) for k in ('game', 'update', 'pack')}
         self.out = p.get('out', os.path.join(ROOT, 'Racing Club+'))
         self.proc, self.q, self.step, self.ok, self.log_shown = None, queue.Queue(), 0, False, False
         root.title('Racing Club+')
@@ -145,70 +151,66 @@ class App:
     def build(self):
         for w in self.root.winfo_children(): w.destroy()
         r = self.root
-        head = tk.Canvas(r, width=W, height=132, highlightthickness=0, bd=0)
+        head = tk.Canvas(r, width=W, height=120, highlightthickness=0, bd=0)
         head.pack()
-        gradient(head, 0, 0, W, 132)
+        gradient(head, 0, 0, W, 120)
         logo = os.path.join(ROOT, 'assets', 'racing_club_logo.png')
         if os.path.exists(logo):
             self.logo = tk.PhotoImage(file=logo)
-            head.create_image(26, 66, image=self.logo, anchor='w')
-        head.create_text(146, 52, text='Racing Club+', anchor='w', fill='white', font=('Arial Black', 26))
-        head.create_text(149, 90, text='%s  ·  v%s' % (self.t('sub'), VERSION), anchor='w', fill='#DCEBFF', font=('Segoe UI', 11))
+            head.create_image(22, 60, image=self.logo, anchor='w')
+        head.create_text(142, 48, text='Racing Club+', anchor='w', fill='white', font=('Arial Black', 26))
+        head.create_text(145, 84, text='%s  ·  v%s' % (self.t('sub'), VERSION), anchor='w', fill='#DCEBFF', font=('Segoe UI', 11))
         lang = tk.Label(head, text='🌐 ' + LANGS[self.li] + ' ▾', bg=hexrgb(BLUE_B), fg='white', font=('Segoe UI', 10), cursor='hand2')
-        head.create_window(W - 18, 18, window=lang, anchor='ne')
+        head.create_window(W - 16, 16, window=lang, anchor='ne')
         lang.bind('<Button-1>', self.lang_menu)
 
         body = tk.Frame(r, bg=WHITE)
-        body.pack(fill='x', padx=28, pady=(18, 0))
-        self.section(body, '1', self.t('step1'))
-        row = tk.Frame(body, bg=WHITE); row.pack(fill='x', pady=(6, 0))
-        self.flat_button(row, self.t('pick1'), self.pick_files).pack(side='left')
-        self.files_lbl = tk.Label(body, text='', bg=WHITE, font=('Segoe UI', 9), anchor='w', justify='left', wraplength=W - 60)
-        self.files_lbl.pack(fill='x', pady=(6, 0))
+        body.pack(fill='x', padx=26, pady=(12, 0))
+        self.status = {}
+        for n, key, files in (('1', 'game', True), ('2', 'update', True), ('3', 'pack', True), ('4', 'rpcs3', False)):
+            self.section(body, n, key, files)
+        tk.Label(body, text=self.t('note'), bg=WHITE, fg=GREY, font=('Segoe UI', 8), justify='left', wraplength=W - 56).pack(anchor='w', pady=(10, 0))
 
-        self.section(body, '2', self.t('step2'), top=16)
-        row = tk.Frame(body, bg=WHITE); row.pack(fill='x', pady=(6, 0))
-        self.flat_button(row, self.t('pick2'), self.pick_rpcs3).pack(side='left')
-        dl = tk.Label(row, text=self.t('dl') + ' ↗', bg=WHITE, fg=hexrgb(BLUE_B), font=('Segoe UI', 9, 'underline'), cursor='hand2')
-        dl.pack(side='right')
-        dl.bind('<Button-1>', lambda e: os.startfile('https://rpcs3.net/download'))
-        self.rpcs3_lbl = tk.Label(body, text='', bg=WHITE, font=('Segoe UI', 9), anchor='w', justify='left', wraplength=W - 60)
-        self.rpcs3_lbl.pack(fill='x', pady=(6, 0))
-
-        tk.Label(body, text=self.t('note'), bg=WHITE, fg=GREY, font=('Segoe UI', 8), justify='left', wraplength=W - 60).pack(anchor='w', pady=(16, 0))
-
-        self.btn = tk.Canvas(r, width=W - 56, height=54, highlightthickness=0, bd=0, bg=WHITE, cursor='hand2')
-        self.btn.pack(pady=(14, 0))
+        self.btn = tk.Canvas(r, width=W - 52, height=52, highlightthickness=0, bd=0, bg=WHITE, cursor='hand2')
+        self.btn.pack(pady=(12, 0))
         self.btn.bind('<Button-1>', lambda e: self.play() if self.ok else self.start())
-        self.prog = tk.Canvas(r, width=W - 56, height=6, highlightthickness=0, bd=0, bg=SOFT)
+        self.prog = tk.Canvas(r, width=W - 52, height=6, highlightthickness=0, bd=0, bg=SOFT)
         self.prog.pack(pady=(10, 0))
-        self.msg = tk.Label(r, text='', bg=WHITE, fg=GREY, font=('Segoe UI', 9), wraplength=W - 56, justify='center')
+        self.msg = tk.Label(r, text='', bg=WHITE, fg=GREY, font=('Segoe UI', 9), wraplength=W - 52, justify='center')
         self.msg.pack(pady=(6, 0))
-
         foot = tk.Frame(r, bg=WHITE)
-        foot.pack(fill='x', padx=28, pady=(6, 14))
+        foot.pack(fill='x', padx=26, pady=(4, 12))
         self.where_lbl = tk.Label(foot, text='', bg=WHITE, fg=GREY, font=('Segoe UI', 8), anchor='w')
         self.where_lbl.pack(side='left')
-        ch = tk.Label(foot, text=self.t('change'), bg=WHITE, fg=hexrgb(BLUE_B), font=('Segoe UI', 8, 'underline'), cursor='hand2')
-        ch.pack(side='left', padx=(6, 0))
-        ch.bind('<Button-1>', lambda e: self.pick_out())
-        det = tk.Label(foot, text=self.t('details'), bg=WHITE, fg=GREY, font=('Segoe UI', 8, 'underline'), cursor='hand2')
-        det.pack(side='right')
-        det.bind('<Button-1>', lambda e: self.toggle_log())
+        self.link(foot, self.t('change'), self.pick_out, hexrgb(BLUE_B)).pack(side='left', padx=(6, 0))
+        self.link(foot, self.t('details'), self.toggle_log, GREY).pack(side='right')
         self.logbox = tk.Text(r, height=8, font=('Consolas', 8), bg=SOFT, fg=INK, relief='flat', wrap='none')
         self.refresh()
 
-    def section(self, parent, num, text, top=0):
-        f = tk.Frame(parent, bg=WHITE); f.pack(fill='x', pady=(top, 0))
-        c = tk.Canvas(f, width=24, height=24, highlightthickness=0, bd=0, bg=WHITE)
-        c.create_oval(1, 1, 23, 23, fill=hexrgb(mix(BLUE_A, BLUE_B, 0.5)), outline='')
-        c.create_text(12, 12, text=num, fill='white', font=('Segoe UI Semibold', 10))
-        c.pack(side='left')
-        tk.Label(f, text=text, bg=WHITE, fg=INK, font=('Segoe UI Semibold', 12)).pack(side='left', padx=(8, 0))
+    def link(self, parent, text, cmd, color, size=8):
+        l = tk.Label(parent, text=text, bg=WHITE, fg=color, font=('Segoe UI', size, 'underline'), cursor='hand2')
+        l.bind('<Button-1>', lambda e: cmd())
+        return l
 
-    def flat_button(self, parent, text, cmd):
-        return tk.Button(parent, text=text, command=cmd, font=('Segoe UI', 10), relief='flat', bd=0, cursor='hand2', padx=16, pady=6,
-                         bg=SOFT, fg=INK, activebackground=LINE, activeforeground=INK)
+    def section(self, parent, num, key, files):
+        box = tk.Frame(parent, bg=WHITE); box.pack(fill='x', pady=(8, 0))
+        top = tk.Frame(box, bg=WHITE); top.pack(fill='x')
+        c = tk.Canvas(top, width=22, height=22, highlightthickness=0, bd=0, bg=WHITE)
+        c.create_oval(1, 1, 21, 21, fill=hexrgb(mix(BLUE_A, BLUE_B, 0.5)), outline='')
+        c.create_text(11, 11, text=num, fill='white', font=('Segoe UI Semibold', 9))
+        c.pack(side='left')
+        names = {'game': 's_game', 'update': 's_upd', 'pack': 's_pack', 'rpcs3': 's_rpcs3'}
+        hints = {'game': 'h_game', 'update': 'h_upd', 'pack': 'h_pack', 'rpcs3': 'h_rpcs3'}
+        tk.Label(top, text=self.t(names[key]), bg=WHITE, fg=INK, font=('Segoe UI Semibold', 11)).pack(side='left', padx=(8, 0))
+        if key == 'rpcs3': self.link(top, self.t('dl') + ' ↗', lambda: os.startfile('https://rpcs3.net/download'), hexrgb(BLUE_B), 9).pack(side='right')
+        tk.Label(box, text=self.t(hints[key]), bg=WHITE, fg=GREY, font=('Segoe UI', 9), anchor='w').pack(fill='x', padx=(30, 0))
+        row = tk.Frame(box, bg=WHITE); row.pack(fill='x', padx=(30, 0), pady=(3, 0))
+        label = self.t('pickd') if key == 'rpcs3' else (self.t('pick1') if key == 'update' else self.t('pickf'))
+        tk.Button(row, text=label, command=lambda: self.pick(key), font=('Segoe UI', 9), relief='flat', bd=0, cursor='hand2', padx=12, pady=4,
+                  bg=SOFT, fg=INK, activebackground=LINE, activeforeground=INK).pack(side='left')
+        st = tk.Label(row, text='', bg=WHITE, font=('Segoe UI', 9), anchor='w', justify='left')
+        st.pack(side='left', padx=(10, 0))
+        self.status[key] = st
 
     def draw_button(self, text, enabled):
         c = self.btn; c.delete('all')
@@ -234,56 +236,83 @@ class App:
 
     def toggle_log(self):
         self.log_shown = not self.log_shown
-        if self.log_shown: self.logbox.pack(fill='both', padx=28, pady=(0, 14)); self.logbox.see('end')
+        if self.log_shown: self.logbox.pack(fill='both', padx=26, pady=(0, 12)); self.logbox.see('end')
         else: self.logbox.pack_forget()
 
     # ------------------------------------------------------------ state
-    def sorted(self): return sort_files(self.files)
+    def parts(self, key):
+        """(pkg, rap, problem) of a section"""
+        fs = self.sel[key]
+        pkgs = [f for f in fs if f.lower().endswith('.pkg')]
+        raps = [f for f in fs if f.lower().endswith('.rap')]
+        pkg = pkgs[0] if pkgs else ''
+        rap = raps[0] if raps else ''
+        bad = (pkg and KIND[key] not in pkg_id(pkg)) or (rap and KIND[key] not in os.path.basename(rap).upper())
+        if key in ('game', 'update') and pkg and not bad:   # game and update share their id: the game's .pkg is the big one
+            other = self.sel['update' if key == 'game' else 'game']
+            op = next((f for f in other if f.lower().endswith('.pkg')), '')
+            if op and os.path.exists(op) and os.path.exists(pkg) and KIND['game'] in pkg_id(op):
+                big = os.path.getsize(pkg) > os.path.getsize(op)
+                bad = big if key == 'update' else not big
+        return pkg, rap, bad
 
     def game_in_rpcs3(self):
         sfo = os.path.join(self.rpcs3, 'dev_hdd0', 'game', TITLE_ID, 'PARAM.SFO')
         return sfo_version(sfo) if self.rpcs3 and os.path.exists(sfo) else None
 
+    def section_ok(self, key):
+        pkg, rap, bad = self.parts(key)
+        if key == 'game': return bool(pkg and rap and not bad)
+        if key == 'update': return bool(pkg and not bad)
+        return not bad and (not pkg or bool(rap))   # the car pack is optional, but with its licence
+
     def ready(self):
         if not os.path.exists(os.path.join(self.rpcs3, 'rpcs3.exe')): return False
-        game, upd, pack, raps = self.sorted()
-        return bool(game and upd and raps) or self.game_in_rpcs3() == APP_VER
+        if self.game_in_rpcs3() == APP_VER and not any(self.sel.values()): return True
+        return all(self.section_ok(k) for k in ('game', 'update', 'pack'))
 
     def refresh(self):
-        game, upd, pack, raps = self.sorted()
-        if self.files:
-            parts = [('✓ ' if game else '✗ ') + self.t('game'), ('✓ ' if upd else '✗ ') + self.t('update'),
-                     ('✓ ' if pack else '– ') + self.t('pack'), '%d %s' % (len(raps), self.t('raps'))]
-            good = game and upd and raps
-            self.files_lbl.config(text='   '.join(parts) + ('' if good else '\n' + self.t('needpkg')), fg=OK if good else WARN)
-        else:
-            v = self.game_in_rpcs3()
-            self.files_lbl.config(text=('✓ ' + self.t('inrpcs3') % v) if v else '', fg=OK if v == APP_VER else WARN)
-        if not self.rpcs3: self.rpcs3_lbl.config(text='')
-        elif os.path.exists(os.path.join(self.rpcs3, 'rpcs3.exe')): self.rpcs3_lbl.config(text='✓ %s  —  %s' % (self.t('rpcs3ok'), self.rpcs3), fg=OK)
-        else: self.rpcs3_lbl.config(text='✗ ' + self.t('norpcs3'), fg=ERR)
+        inst = self.game_in_rpcs3() if not any(self.sel.values()) else None
+        for key in ('game', 'update', 'pack'):
+            pkg, rap, bad = self.parts(key)
+            if inst and key != 'pack':
+                txt, col = self.t('inrpcs3') % inst, OK if inst == APP_VER else WARN
+            elif not pkg and not rap:
+                txt, col = '', GREY
+            elif bad:
+                txt, col = '✗ ' + self.t('wrong'), ERR
+            else:
+                bits = ['✓ ' + os.path.basename(pkg)] if pkg else ['✗ ' + self.t('nopkg')]
+                if key != 'update': bits.append(('✓ ' + self.t('licence')) if rap else ('✗ ' + self.t('nolic')))
+                txt, col = '   '.join(bits), OK if self.section_ok(key) and pkg else WARN
+            self.status[key].config(text=txt, fg=col)
+        if not self.rpcs3: self.status['rpcs3'].config(text='')
+        elif os.path.exists(os.path.join(self.rpcs3, 'rpcs3.exe')): self.status['rpcs3'].config(text='✓ ' + self.t('rpcs3ok'), fg=OK)
+        else: self.status['rpcs3'].config(text='✗ ' + self.t('norpcs3'), fg=ERR)
         o = self.out if len(self.out) <= 52 else self.out[:22] + '…' + self.out[-29:]   # keeps the window at its width
         self.where_lbl.config(text='%s: %s' % (self.t('where'), o))
         if self.ok: self.draw_button(self.t('play'), True)
         elif not self.proc: self.draw_button(self.t('install'), self.ready())
         if not self.proc and not self.ok:
-            self.set_progress(0, self.t('pkghelp') if (self.ready() and game) else '')
+            self.set_progress(0, self.t('pkghelp') if (self.ready() and any(self.sel.values())) else '')
 
-    def pick_files(self):
-        fs = filedialog.askopenfilenames(title=self.t('pick1'), filetypes=[('PS3', '*.pkg *.rap'), ('*', '*.*')],
-                                         initialdir=os.path.dirname(self.files[0]) if self.files else None)
-        if fs: self.files = [os.path.normpath(f) for f in fs]; self.save(); self.refresh()
-
-    def pick_rpcs3(self):
-        d = filedialog.askdirectory(title=self.t('step2'), initialdir=self.rpcs3 or None)
-        if d: self.rpcs3 = os.path.normpath(d); self.save(); self.refresh()
+    def pick(self, key):
+        if key == 'rpcs3':
+            d = filedialog.askdirectory(title='RPCS3', initialdir=self.rpcs3 or None)
+            if d: self.rpcs3 = os.path.normpath(d)
+        else:
+            start = next((os.path.dirname(f) for v in self.sel.values() for f in v), None)
+            types = [('PS3 .pkg', '*.pkg')] if key == 'update' else [('PS3 .pkg / .rap', '*.pkg *.rap')]
+            fs = filedialog.askopenfilenames(title=self.t({'game': 's_game', 'update': 's_upd', 'pack': 's_pack'}[key]), filetypes=types + [('*', '*.*')], initialdir=start)
+            if fs: self.sel[key] = [os.path.normpath(f) for f in fs]
+        self.save(); self.refresh()
 
     def pick_out(self):
         d = filedialog.askdirectory(title=self.t('where'), initialdir=os.path.dirname(self.out) or None)
         if d: self.out = os.path.join(os.path.normpath(d), 'Racing Club+'); self.save(); self.refresh()
 
     def save(self):
-        try: json.dump({'lang': self.li, 'rpcs3': self.rpcs3, 'files': self.files, 'out': self.out}, open(PREFS, 'w', encoding='utf-8'), indent=1)
+        try: json.dump({'lang': self.li, 'rpcs3': self.rpcs3, 'sel': self.sel, 'out': self.out}, open(PREFS, 'w', encoding='utf-8'), indent=1)
         except Exception: pass
 
     # ------------------------------------------------------------ run
@@ -308,9 +337,10 @@ class App:
             self.q.put(('msg', self.t('pip')))
             r = subprocess.run([py, '-m', 'pip', 'install', 'capstone==5.0.7'], creationflags=flags, capture_output=True, text=True)
             self.q.put(('log', r.stdout + r.stderr))
-        game, upd, pack, raps = self.sorted()
         cmd = [py, '-u', os.path.join(ROOT, 'instalar.py'), '--rpcs3', self.rpcs3, '--out', self.out, '--idioma', str(self.li + 1)]
-        if game and upd: cmd += ['--pkg'] + [p for p in (game, upd, pack) if p] + ['--rap'] + raps
+        if any(self.sel.values()):
+            (g, gr, _), (u, _, _), (p, pr, _) = self.parts('game'), self.parts('update'), self.parts('pack')
+            cmd += ['--pkg'] + [x for x in (g, u, p) if x] + ['--rap'] + [x for x in (gr, pr) if x]
         self.proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=flags, text=True, encoding='utf-8', errors='replace')
         for line in self.proc.stdout: self.q.put(('line', line.rstrip()))
         rc = self.proc.wait()
