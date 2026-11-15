@@ -284,6 +284,7 @@ bool Decoder::decode(const uint8_t* frame, float* const* out) {
     for (int i = 0; i < nch; ++i) {
         Bits b{frame + i * unit, unit * 8};
         if (!decode_unit(b, ch[i], out[i])) { ok = false; std::memset(out[i], 0, sizeof(float) * kFrame); }
+        if (i < 8) used[i] = b.pos < b.size ? b.pos : b.size;
         float* p1 = out[i];
         float* p2 = p1 + 256;
         float* p3 = p2 + 256;

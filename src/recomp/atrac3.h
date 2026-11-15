@@ -23,8 +23,11 @@ public:
     // returns false (and outputs silence) when a sound unit is not valid
     bool decode(const uint8_t* frame, float* const* out);
     int channels() const { return nch; }
+    // bits of channel c's sound unit read by the last decode (the module reports those of the last channel)
+    int bitsUsed(int c) const { return c >= 0 && c < nch && c < 8 ? used[c] : 0; }
 private:
     int nch, unit;
+    int used[8] = {};
     Channel* ch;
 };
 

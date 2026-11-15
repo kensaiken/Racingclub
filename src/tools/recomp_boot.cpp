@@ -45,7 +45,8 @@ int main(int argc, char** argv) {
             std::printf("usage: recomp_boot EBOOT.elf USRDIR [--trace] [--seconds N]\n");
             return 1;
         }
-        std::freopen("recomp_log.txt", "w", stderr);
+        std::freopen(std::getenv("RECOMPLOG") ? std::getenv("RECOMPLOG") : "recomp_log.txt", "w", stderr);
+        std::setvbuf(stderr, nullptr, _IONBF, 0);   // the log survives however the game ends
         seconds = 0;
 #ifdef _WIN32
         FreeConsole();
