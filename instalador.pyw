@@ -8,6 +8,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+VERSION = '2.0'
 PREFS = os.path.join(ROOT, 'instalador.json')
 LANGS = ['English', 'Français', 'Español', 'Deutsch', 'Italiano']   # same order and numbers (1-5) as the game's menu
 
@@ -204,7 +205,7 @@ class App:
         title = tk.Frame(head, bg=BG)
         title.pack(side='left', padx=(18, 0), fill='y')
         tk.Label(title, text='Racing Club+', font=('Arial Black', 26), fg=BLUE, bg=BG).pack(anchor='w', pady=(14, 0))
-        tk.Label(title, text=self.t('sub'), font=('Segoe UI', 12), fg=GREY, bg=BG).pack(anchor='w')
+        tk.Label(title, text=self.t('sub') + '   ·   v' + VERSION, font=('Segoe UI', 12), fg=GREY, bg=BG).pack(anchor='w')
         lf = tk.Frame(head, bg=BG)
         lf.pack(side='right', anchor='n', pady=(6, 0))
         tk.Label(lf, text=self.t('lang'), font=('Segoe UI', 9), fg=GREY, bg=BG).pack(anchor='e')
