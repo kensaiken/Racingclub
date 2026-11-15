@@ -1525,6 +1525,16 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
                 char name[64]; std::snprintf(name, sizeof name, "codec_%03d_%s.bin", k, enter ? "in" : "out");
                 if (FILE* f = std::fopen(name, "wb")) { std::fwrite(sp.ls, 1, Spu::LS_SIZE, f); std::fclose(f); }
             }
+            // CODECMFC=first,n: the DMA commands the decoder issues during those calls, with its stream context words
+            static int mf = -1, mn = 0;
+            if (mf < 0) { mf = 1 << 30; if (const char* d = std::getenv("CODECMFC")) std::sscanf(d, "%d,%d", &mf, &mn); }
+            if (k >= mf && k < mf + mn) {
+                if (enter) {
+                    LOG("[codec] call %d ctx r7:", k); for (int i = 0; i < 24; ++i) LOG(" %08x", sp.lsw(0x2eb80 + 4 * i)); LOG("%c", 10);
+                    LOG("[codec] call %d r9:", k); for (int i = 0; i < 24; ++i) LOG(" %08x", sp.lsw(0x2ea80 + 4 * i)); LOG("%c", 10);
+                    sp.mfcTrace = 200;
+                } else sp.mfcTrace = 0;
+            }
             if (!enter) ++k;
             return false;
         };
