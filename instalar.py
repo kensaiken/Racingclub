@@ -3,7 +3,7 @@
 usage: python instalar.py --rpcs3 <RPCS3 folder> [--out <folder>] [--toolchain <folder>] [--jobs N] [--no-copy]
 
 Needs, inside the RPCS3 folder:
-  - the game installed: GTI Club+ Rally Cote d'Azur, EUROPEAN version NPEB00060 with update 1.04 (and, optionally,
+  - the game installed: GTI Club+ Rally Cote d'Azur, EUROPEAN version NPEB00060 with update 1.02 (and, optionally,
     the car pack) with its licences (.rap) -> dev_hdd0/game/NPEB00060
   - the PS3 system software installed -> dev_flash/sys/external/flashATRAC.pic (music decoder; without it the game
     has no music)
@@ -15,8 +15,8 @@ C++, compile, and put the result in the output folder (executable + a copy of th
 import argparse, hashlib, os, shutil, struct, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-TITLE_ID, APP_VER = 'NPEB00060', '01.04'
-ELF_SHA1 = 'e9faf331b52770164be0c19f427c10aef747776d'   # decrypted EBOOT of NPEB00060 1.04
+TITLE_ID, APP_VER = 'NPEB00060', '01.02'
+ELF_SHA1 = 'e9faf331b52770164be0c19f427c10aef747776d'   # decrypted EBOOT of NPEB00060 1.02
 SPU_SPECS = ['ba3680:0xa200', 'baea80:0x14c00', '0xbd0b00:0xd560:0x3000', '0xbce880:0x2000:0x2f080']
 ATRAC_SPEC = 'file:re/spu_atrac_32980.bin:0:0x7d40:32980:a7ac00'
 
@@ -51,7 +51,7 @@ def sfo(path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description='GTI Club+ para PC a partir de tu copia del juego (NPEB00060, 1.04)')
+    ap = argparse.ArgumentParser(description='GTI Club+ para PC a partir de tu copia del juego (NPEB00060, 1.02)')
     ap.add_argument('--rpcs3', required=True, help='carpeta de RPCS3 con el juego y el firmware instalados')
     ap.add_argument('--out', default=os.path.join(ROOT, 'GTI Club+'), help='carpeta de salida')
     ap.add_argument('--toolchain', default=os.environ.get('GTI_TOOLCHAIN', ''), help='carpeta del compilador (bin/, deps/)')

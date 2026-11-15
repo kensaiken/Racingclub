@@ -15,7 +15,7 @@ import os, pickle, shutil, struct, sys
 # tools/dis.py would shadow the standard library's dis module (capstone imports inspect, which imports dis)
 sys.path[:] = [p for p in sys.path if os.path.abspath(p or '.') != os.path.dirname(os.path.abspath(__file__))]
 
-TOCS = (0xc6f210, 0xc7f068, 0xc8f064)   # the three TOC bases of NPEB00060 1.04
+TOCS = (0xc6f210, 0xc7f068, 0xc8f064)   # the three TOC bases of NPEB00060 1.02
 CODE_END = 0xbb3000                      # entry points lie below this address
 DIS_END = 0xbc3000                       # the disassembly stops here (code, then the embedded SPU programs)
 
