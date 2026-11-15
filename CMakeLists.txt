@@ -49,11 +49,13 @@ if(MINGW)
 endif()
 
 # statically recompiled original PPU code (generated locally by tools/ppc2cpp.py from the user's own EBOOT)
-add_executable(recomp_test src/tools/recomp_test.cpp src/recomp/runtime.cpp src/recomp/guest.cpp src/recomp/gen/physics.cpp)
-target_link_libraries(recomp_test PRIVATE gti_formats)
-target_compile_options(recomp_test PRIVATE -Wno-unused-label -Wno-unused-variable -ffp-contract=off)
-if(MINGW)
-  target_link_options(recomp_test PRIVATE -static)
+if(EXISTS ${CMAKE_SOURCE_DIR}/src/recomp/gen/physics.cpp)
+  add_executable(recomp_test src/tools/recomp_test.cpp src/recomp/runtime.cpp src/recomp/guest.cpp src/recomp/gen/physics.cpp)
+  target_link_libraries(recomp_test PRIVATE gti_formats)
+  target_compile_options(recomp_test PRIVATE -Wno-unused-label -Wno-unused-variable -ffp-contract=off)
+  if(MINGW)
+    target_link_options(recomp_test PRIVATE -static)
+  endif()
 endif()
 
 # whole game recompiled (generated locally by tools/ppc2cpp.py, SPLIT=48) — large; built only on demand
