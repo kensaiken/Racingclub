@@ -20,7 +20,7 @@
 #include <vector>
 #include <immintrin.h>
 
-namespace gti::recomp { bool host_menu_bitmap(const wchar_t* const* lines, int n, int sel, int w, int h, uint32_t* out); void host_restart(); }   // host_win.cpp
+namespace gti::recomp { bool host_menu_bitmap(const wchar_t* const* lines, int n, int sel, int w, int h, uint32_t* out); void host_restart(); void host_report(const char* gpu); }   // host_win.cpp
 namespace gti::recomp::rsx {
 
 // ------------------------------------------------------------------ OpenGL loader (only what this file uses)
@@ -1757,7 +1757,7 @@ static void set_display_mode(int mode) {
 // ------------------------------------------------------------------ options menu (F1)
 static bool menuOpen = std::getenv("MENUTEST") != nullptr, menuDirty = true;   // MENUTEST=1 (debug): open from the start
 static int menuSel = 1;
-static const int kMenuLines = 17, kMenuFirst = 1, kMenuLast = 14;   // title, 12 options, "apply" (restarts the game), "quit", 2 notes
+static const int kMenuLines = 18, kMenuFirst = 1, kMenuLast = 15;   // title, 12 options, "apply" (restarts the game), problem report, "quit", 2 notes
 static void menu_change(int dir) {
     Settings& s = settings();
     switch (menuSel) {
@@ -1773,7 +1773,8 @@ static void menu_change(int dir) {
         case 10: s.streaming ^= 1; break;
         case 11: s.fxaa ^= 1; break;
         case 13: if (dir >= 0) { settings_save(); host_restart(); } break;
-        case 14: if (dir >= 0) { settings_save(); SDL_Event q{}; q.type = SDL_EVENT_QUIT; SDL_PushEvent(&q); } break;   // same as closing the window   // the options marked * are read once at start
+        case 14: if (dir >= 0) { settings_save(); host_report(reinterpret_cast<const char*>(glGetString(0x1F01 /* GL_RENDERER */))); } break;
+        case 15: if (dir >= 0) { settings_save(); SDL_Event q{}; q.type = SDL_EVENT_QUIT; SDL_PushEvent(&q); } break;   // same as closing the window   // the options marked * are read once at start
         case 12: s.sharpen = (s.sharpen + (dir ? dir : 1) + 4) % 4; break;   // the texture cache keeps sampler state: rebuild it
     }
     menuDirty = true;
@@ -1815,9 +1816,10 @@ static void draw_menu(int ww, int wh) {
             std::swprintf(l[12], 96, L"Nitidez\t‹ %ls ›", sh[std::clamp(s.sharpen, 0, 3)]);
         }
         std::swprintf(l[13], 96, L"Aplicar cambios\t‹ Reiniciar el juego ›");
-        std::swprintf(l[14], 96, L"Salir del juego\t‹ Salir ›");
-        std::swprintf(l[15], 96, L"* se aplica al reiniciar el juego (Aplicar cambios + Intro)");
-        std::swprintf(l[16], 96, L"Teclado: flechas, Intro, F1 o Esc   ·   Mando: panel táctil o botón PS, cruceta, cruz, círculo");
+        std::swprintf(l[14], 96, L"Informe de problemas\t‹ Crear y abrir GitHub ›");
+        std::swprintf(l[15], 96, L"Salir del juego\t‹ Salir ›");
+        std::swprintf(l[16], 96, L"* se aplica al reiniciar el juego (Aplicar cambios + Intro)");
+        std::swprintf(l[17], 96, L"Teclado: flechas, Intro, F1 o Esc   ·   Mando: panel táctil o botón PS, cruceta, cruz, círculo");
         const wchar_t* lines[kMenuLines];
         for (int i = 0; i < kMenuLines; ++i) lines[i] = l[i];
         static std::vector<uint32_t> px;

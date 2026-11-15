@@ -12,6 +12,7 @@
 #include <chrono>
 #ifdef _WIN32
 #include <windows.h>
+#include <shellapi.h>
 // kernel-mode-thunk vblank wait (gdi32): blocks until the next real vertical blank of the primary display
 extern "C" {
 struct KmtOpenAdapterFromHdc { HDC hDc; UINT hAdapter; LUID luid; UINT vidPnSourceId; };
@@ -165,6 +166,43 @@ void host_restart() {
     std::fflush(nullptr);
     TerminateProcess(GetCurrentProcess(), 0);
 }
+// "Informe de problemas" in the options menu: writes informe_problema.txt next to the executable (processor, memory,
+// graphics card, settings and the end of the log, with the Windows user name taken out of the paths), shows it in
+// Explorer and opens the project's "new issue" page, where the user can attach it.
+void host_report(const char* gpu) {
+    std::fflush(nullptr);
+    auto slurp = [](const char* name, size_t tail) {
+        std::string s;
+        if (FILE* f = std::fopen(name, "rb")) {
+            std::fseek(f, 0, SEEK_END); const long n = std::ftell(f);
+            const long from = n > long(tail) ? n - long(tail) : 0;
+            std::fseek(f, from, SEEK_SET);
+            s.resize(size_t(n - from)); s.resize(std::fread(s.data(), 1, s.size(), f)); std::fclose(f);
+        }
+        return s;
+    };
+    char cpu[128] = "?"; DWORD cb = sizeof cpu;
+    RegGetValueA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString", RRF_RT_REG_SZ, nullptr, cpu, &cb);
+    MEMORYSTATUSEX ms{}; ms.dwLength = sizeof ms; GlobalMemoryStatusEx(&ms);
+    SYSTEMTIME t; GetLocalTime(&t);
+    char head[512];
+    std::snprintf(head, sizeof head, "GTI Club+ - informe de problemas\r\nFecha: %04d-%02d-%02d %02d:%02d\r\nProcesador: %s (%u hilos)\r\nMemoria: %llu MB\r\nGrafica: %s\r\nPantalla: %d Hz\r\n\r\n--- gtiport.ini ---\r\n",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, cpu, std::thread::hardware_concurrency(), (unsigned long long)(ms.ullTotalPhys >> 20), gpu ? gpu : "?", host_display_hz());
+    std::string out = head + slurp("gtiport.ini", 1 << 16) + "\r\n--- final de recomp_log.txt ---\r\n" + slurp("recomp_log.txt", 300000);
+    char user[256]; DWORD un = sizeof user;
+    if (GetUserNameA(user, &un) && un > 3) {   // paths in the log carry the Windows user name
+        const std::string u = user;
+        for (size_t p = 0; (p = out.find(u, p)) != std::string::npos;) out.replace(p, u.size(), "USUARIO");
+    }
+    wchar_t exe[1024]; std::wstring path = L"informe_problema.txt";
+    if (const DWORD n = GetModuleFileNameW(nullptr, exe, 1024); n > 0 && n < 1024) { path.assign(exe, n); path = path.substr(0, path.find_last_of(L"\\/") + 1) + L"informe_problema.txt"; }
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    if (!f) return;
+    std::fwrite(out.data(), 1, out.size(), f); std::fclose(f);
+    const std::wstring sel = L"/select,\"" + path + L"\"";
+    ShellExecuteW(nullptr, L"open", L"explorer.exe", sel.c_str(), nullptr, SW_SHOWNORMAL);
+    ShellExecuteW(nullptr, L"open", L"https://github.com/kensaiken/Racingclub/issues/new", nullptr, nullptr, SW_SHOWNORMAL);
+}
 bool host_menu_bitmap(const wchar_t* const* lines, int n, int sel, int w, int h, uint32_t* out) {
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -208,6 +246,7 @@ void host_restore_refresh() {}
 bool host_wait_refresh() { return false; }
 bool host_menu_bitmap(const wchar_t* const*, int, int, int, int, uint32_t*) { return false; }
 void host_restart() {}
+void host_report(const char*) {}
 void host_sleep_us(uint64_t us) { std::this_thread::sleep_for(std::chrono::microseconds(us)); }
 void host_thread_priority_high() {}
 void host_thread_core(bool) {}
