@@ -116,3 +116,13 @@ if(RECOMP_FULL_SRC)
     target_link_options(recomp_probe PRIVATE -static)
   endif()
 endif()
+
+# "Instalar Racing Club+.exe": opens the graphical installer (instalador.pyw) without a console window
+if(WIN32)
+  add_executable(instalador WIN32 src/tools/instalador_launcher.c)
+  set_target_properties(instalador PROPERTIES OUTPUT_NAME "Instalar Racing Club+")
+  target_link_options(instalador PRIVATE -municode -static)
+  if(EXISTS ${CMAKE_SOURCE_DIR}/assets/racing_club.ico)
+    target_sources(instalador PRIVATE src/tools/instalador_launcher.rc)
+  endif()
+endif()

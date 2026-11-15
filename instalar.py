@@ -57,6 +57,8 @@ def main():
     ap.add_argument('--toolchain', default=os.environ.get('GTI_TOOLCHAIN', ''), help='carpeta del compilador (bin/, deps/)')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
     ap.add_argument('--no-copy', action='store_true', help='no copiar los datos del juego a la salida')
+    ap.add_argument('--keep', action='store_true', help='conservar los ficheros intermedios (re/, codigo traducido, build-inst/) para recompilar mas rapido')
+    ap.add_argument('--idioma', type=int, choices=range(1, 6), help='idioma del juego: 1 English, 2 Francais, 3 Espanol, 4 Deutsch, 5 Italiano')
     a = ap.parse_args()
     t0 = time.time()
 
@@ -136,6 +138,15 @@ def main():
     if not a.no_copy:
         print('  copiando los datos del juego...', flush=True)
         shutil.copytree(usrdir, os.path.join(out, 'juego', 'USRDIR'), dirs_exist_ok=True, ignore=shutil.ignore_patterns('EBOOT.BIN'))
+    # the decrypted executable and the translated code stay out of the installer's folder, so it can be shared;
+    # never in a development checkout (.git), where re/ also holds analysis files that cannot be regenerated
+    if not a.keep and not os.path.exists(os.path.join(ROOT, '.git')):
+        for d in ('re', os.path.join('src', 'recomp', 'full'), os.path.join('src', 'recomp', 'spu_gen'), 'build-inst'):
+            shutil.rmtree(os.path.join(ROOT, d), ignore_errors=True)
+    if a.idioma:   # the game's language, in the settings file the game reads next to its executable
+        ini = os.path.join(out, 'gtiport.ini')
+        lines = [l for l in (open(ini, encoding='utf-8').read().splitlines() if os.path.exists(ini) else []) if not l.startswith('idioma=')]
+        open(ini, 'w', encoding='utf-8').write('\n'.join(lines + ['idioma=%d' % a.idioma]) + '\n')
     print('\nHecho en %d min. Para jugar: "%s"' % ((time.time() - t0) / 60, os.path.join(out, 'Racing Club+.exe')))
     print('Esa carpeta contiene tu copia del juego: es para tu uso, no la repartas.')
 

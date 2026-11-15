@@ -16,7 +16,7 @@ Este instalador **no contiene ningún fichero del juego**. Fabrica la versión d
 
 ## Cómo se usa
 
-Haz doble clic en `instalar.bat`, arrastra la carpeta de RPCS3 a la ventana y pulsa Intro. O desde una consola:
+Haz doble clic en **`Instalar Racing Club+.exe`**: se abre el instalador, eliges la carpeta de RPCS3, dónde instalar y el idioma del juego, y pulsas «Instalar». También hay una versión de consola (`instalar.bat`) o:
 
 ```
 python instalar.py --rpcs3 "C:\ruta\a\RPCS3"
