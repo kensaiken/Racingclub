@@ -111,6 +111,16 @@ void host_timer_init() {
 }
 // time-critical work (sound mixing): the calling thread goes ahead of the normal ones
 // also puts the whole process above normal programs once, like most games: OBS or a browser then cannot take its time slices
+// Sleeps of well under a millisecond: a high-resolution waitable timer (Windows 10 1803+) wakes up about 0.5 ms
+// late at most, where Sleep() rounds up to the timer period. Threads of the game that poll with short sleeps then
+// really sleep instead of burning a core.
+void host_sleep_us(uint64_t us) {
+    static thread_local HANDLE t = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /*HIGH_RESOLUTION*/, TIMER_ALL_ACCESS);
+    if (!t) { std::this_thread::sleep_for(std::chrono::microseconds(us)); return; }
+    LARGE_INTEGER due; due.QuadPart = -int64_t(us) * 10;
+    if (!SetWaitableTimer(t, &due, 0, nullptr, nullptr, FALSE)) { std::this_thread::sleep_for(std::chrono::microseconds(us)); return; }
+    WaitForSingleObject(t, INFINITE);
+}
 void host_thread_priority_high() {
     if (std::getenv("NOPRIO")) return;
     static const bool cls = SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) != 0; (void)cls;
@@ -184,6 +194,7 @@ bool host_set_refresh(int) { return false; }
 void host_restore_refresh() {}
 bool host_wait_refresh() { return false; }
 bool host_menu_bitmap(const wchar_t* const*, int, int, int, int, uint32_t*) { return false; }
+void host_sleep_us(uint64_t us) { std::this_thread::sleep_for(std::chrono::microseconds(us)); }
 void host_thread_priority_high() {}
 void host_thread_core(bool) {}
 void host_timer_init() {}

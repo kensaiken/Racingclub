@@ -53,6 +53,21 @@ double rc_logic_acc(PPU& c, double dtClamped, double acc) {
     }
     if (n < 0) n = 0;
     if (n > 6) n = 6;
+    // SPEEDSTAT=1: every 5 s of real time, how much game time went by (must stay at 60 logic ticks, 1.00 s of image
+    // time and 1.00 s of world time per second whatever the image rate)
+    static const bool speedStat = std::getenv("SPEEDSTAT") != nullptr;
+    if (speedStat) {
+        static auto t0 = std::chrono::steady_clock::now();
+        static int ticks = 0, images = 0; static double dts = 0, world = 0; static uint32_t pc0 = 0;
+        ticks += n; ++images; dts += dt;
+        if (g_worldEa) world += double(g_physCalls - pc0) * c.rdf32(g_worldEa + 156) * c.rdf32(tm + 224);
+        pc0 = g_physCalls;
+        const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (el >= 5) {
+            std::fprintf(stderr, "[speed] per second: %.1f images, %.1f logic ticks, %.3f s image time, %.3f s world time (step %.5f)%c", images / el, ticks / el, dts / el, world / el, g_worldEa ? c.rdf32(g_worldEa + 156) : 0.0f, 10);
+            t0 = std::chrono::steady_clock::now(); ticks = images = 0; dts = world = 0;
+        }
+    }
     return n > 0 ? double((float(n) - 0.5f) * S) : double(-0.5f * (S > 0 ? S : 1.0f / 60.0f));
 }
 uint64_t g_timebaseFixed = 0;   // >0: deterministic time base, advances this many ticks per read

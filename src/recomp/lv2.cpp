@@ -23,7 +23,7 @@
 #include <thread>
 #include <vector>
 
-namespace gti::recomp { void ripprof_register_thread(const char* name); void host_thread_priority_high(); void host_thread_core(bool own); void host_timer_init(); int host_display_hz(); bool host_set_refresh(int hz); void host_restore_refresh(); bool host_wait_refresh(); }   // ripprof.cpp, host_win.cpp   // ripprof.cpp
+namespace gti::recomp { void ripprof_register_thread(const char* name); void host_sleep_us(uint64_t us); void host_thread_priority_high(); void host_thread_core(bool own); void host_timer_init(); int host_display_hz(); bool host_set_refresh(int hz); void host_restore_refresh(); bool host_wait_refresh(); }   // ripprof.cpp, host_win.cpp   // ripprof.cpp
 namespace gti::recomp {
 
 extern uint64_t g_missLr;
@@ -910,6 +910,9 @@ uint32_t list = 0;
 std::thread th;
 std::atomic<bool> started{false};
 std::atomic<uint64_t> jobDraws{0};   // Edge jobs whose command block contains a draw
+// kick(): the game restarted the job chain or opened a guard. The manager spins for a moment and then sleeps on
+// kickCv (it used to yield for 50 ms: a whole core burnt whenever the chain was idle).
+std::mutex kickMx; std::condition_variable kickCv; std::atomic<bool> mgrSleeping{false};
 std::atomic<uint64_t> kicks{0}, jobsRun{0}, spuSteps{0}, spuNs{0}, interpTot{0}, callsTot{0};
 struct Guard { int32_t count = 1; bool autoReset = true; std::atomic<int32_t> remaining{1}; };
 std::mutex gmx;
@@ -1343,7 +1346,16 @@ void wait_idle(int why = 0) {
 std::atomic<uint32_t> g_mgrPc{0}, g_mgrWhat{0};   // diagnostics: command list position and what the manager waits for (1 guard, 2 end, 3 sync)
 // how long the manager keeps yielding before it sleeps: a sleep is 1 ms or more on Windows, and the next kick then starts
 // the image's geometry jobs late (at 144 Hz every other image missed its vblank at the start grid). MGRSPIN=us.
-const uint64_t g_mgrSpinUs = std::getenv("MGRSPIN") ? std::strtoull(std::getenv("MGRSPIN"), nullptr, 10) : 50000;
+const uint64_t g_mgrSpinUs = std::getenv("MGRSPIN") ? std::strtoull(std::getenv("MGRSPIN"), nullptr, 10) : 300;
+void kick() { ++kicks; if (mgrSleeping.load()) { std::lock_guard<std::mutex> lk(kickMx); kickCv.notify_all(); } }
+// one round of the manager's idle wait: yields at first, then sleeps until a kick newer than k (or 2 ms)
+void mgr_idle(uint64_t t0, uint64_t k) {
+    if (now_us() - t0 < g_mgrSpinUs) { std::this_thread::yield(); return; }
+    std::unique_lock<std::mutex> lk(kickMx);
+    mgrSleeping = true;
+    if (kicks.load() == k) kickCv.wait_for(lk, std::chrono::milliseconds(2));
+    mgrSleeping = false;
+}
 uint32_t g_mgrHist[64][3]; unsigned g_mgrHistN = 0;   // diagnostics: last commands read (pc, low word, time us)
 void manager() {
     t_tid = 0x01000202;
@@ -1394,7 +1406,7 @@ void manager() {
             wait_idle(2);
             const uint64_t tg0 = g_mgrStat ? now_us() : 0;
             auto g = guard_of(uint32_t(w) & ~0x7fu);
-            for (const uint64_t t0 = now_us(); g->remaining.load() > 0;) { if (now_us() - t0 < g_mgrSpinUs) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(50)); }
+            for (const uint64_t t0 = now_us();;) { const uint64_t k = kicks.load(); if (g->remaining.load() <= 0) break; mgr_idle(t0, k); }
             if (g->autoReset) g->remaining = g->count;
             if (g_mgrStat) g_mgrGuardUs += now_us() - tg0;
             pc += 8; continue;
@@ -1426,7 +1438,7 @@ void manager() {
             uint64_t changedAt = 0;
             for (const uint64_t t0 = now_us(); kicks.load() == k0;) {
                 if (rd64m(pc) != w) { if (!changedAt) changedAt = now_us(); else if (now_us() - changedAt > 20000) break; }
-                if (now_us() - t0 < g_mgrSpinUs) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(50));
+                mgr_idle(t0, k0);
             }
             continue;
         }
@@ -1724,7 +1736,7 @@ bool imports(PPU& c, const char* module, const char* name) {
             ret(c, CELL_OK); return true;
         }
         if (name == g_hotName[3] && g_jobsOn && !g_jobDump) {                                   // cellSpursRunJobChain
-            jobs::start(g_jobChainEntry); ++jobs::kicks; jobs::kicks.notify_all();
+            jobs::start(g_jobChainEntry); jobs::kick();
             ret(c, CELL_OK); return true;
         }
         if (!g_hotName[0] && !std::strcmp(name, "sys_ppu_thread_get_id")) g_hotName[0] = name;
@@ -1981,13 +1993,13 @@ bool imports(PPU& c, const char* module, const char* name) {
             }
         }
         if (g_jobsOn) {
-            if (n == "cellSpursRunJobChain") { jobs::start(g_jobChainEntry); ++jobs::kicks; }
+            if (n == "cellSpursRunJobChain") { jobs::start(g_jobChainEntry); jobs::kick(); }
             else {   // like SPURS: a notify on a guard that is already open is dropped (it used to go negative and let the
                      // chain pass the next guard early, ahead of the render thread: a deadlock every minute or two at 144 Hz)
                 auto g = jobs::guard_of(a32(c, 0));
                 int32_t r = g->remaining.load();
                 while (r > 0 && !g->remaining.compare_exchange_weak(r, r - 1)) {}
-                if (r == 1) { ++jobs::kicks; jobs::kicks.notify_all(); }
+                if (r == 1) jobs::kick();
             }
         }
         ret(c, CELL_OK); return true;
@@ -2427,7 +2439,8 @@ void syscall(PPU& c) {
             // polls a label every 30 us right after each flip) are done by yielding until the time has passed.
             const uint64_t us = c.r[3];
             if (g_loadLog && us >= 50000) LOG("[load] thread %x: usleep %llu us (lr %llx, flip %llu)%c", t_tid, (unsigned long long)us, (unsigned long long)c.lr, (unsigned long long)gcm::flips.load(), 10);
-            if (us >= 1500) std::this_thread::sleep_for(std::chrono::microseconds(us));
+            static const uint64_t spinBelow = std::getenv("USLEEPSPIN") ? std::strtoull(std::getenv("USLEEPSPIN"), nullptr, 10) : 100;
+            if (us >= spinBelow) host_sleep_us(us);
             else { const uint64_t until = now_us() + us; while (now_us() < until) std::this_thread::yield(); }
             ret(c, CELL_OK); return;
         }
