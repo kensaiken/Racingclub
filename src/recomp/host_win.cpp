@@ -203,6 +203,55 @@ void host_report(const char* gpu) {
     ShellExecuteW(nullptr, L"open", L"explorer.exe", sel.c_str(), nullptr, SW_SHOWNORMAL);
     ShellExecuteW(nullptr, L"open", L"https://github.com/kensaiken/Racingclub/issues/new", nullptr, nullptr, SW_SHOWNORMAL);
 }
+// a trophy notification: dark rounded card, a medal of the trophy's colour (rgb 0xRRGGBB), title, name, detail
+bool host_toast_bitmap(const wchar_t* title, const wchar_t* name, const wchar_t* detail, uint32_t rgb, int w, int h, uint32_t* out) {
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h; bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP bm = dc ? CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+    if (!bm) { if (dc) DeleteDC(dc); return false; }
+    HGDIOBJ oldBm = SelectObject(dc, bm);
+    RECT all{0, 0, w, h};
+    HBRUSH edge = CreateSolidBrush(RGB(0, 62, 190)), card = CreateSolidBrush(RGB(16, 24, 44));
+    FillRect(dc, &all, edge);
+    RECT in{3, 3, w - 3, h - 3};
+    FillRect(dc, &in, card);
+    // medal: outer ring + inner disc in the trophy colour
+    const COLORREF mc = RGB((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
+    HBRUSH medal = CreateSolidBrush(mc), ring = CreateSolidBrush(RGB(255, 255, 255));
+    HPEN noPen = CreatePen(PS_NULL, 0, 0);
+    HGDIOBJ oldPen = SelectObject(dc, noPen);
+    const int r = h * 32 / 100, cx = 18 + r, cy = h / 2;
+    HGDIOBJ oldBr = SelectObject(dc, ring);
+    Ellipse(dc, cx - r, cy - r, cx + r, cy + r);
+    SelectObject(dc, medal);
+    Ellipse(dc, cx - r + 5, cy - r + 5, cx + r - 5, cy + r - 5);
+    SelectObject(dc, oldBr); SelectObject(dc, oldPen);
+    SetBkMode(dc, TRANSPARENT);
+    HFONT f1 = CreateFontW(-h * 17 / 100, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    HFONT f2 = CreateFontW(-h * 25 / 100, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    HFONT f3 = CreateFontW(-h * 15 / 100, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    const int x = cx + r + 16;
+    RECT t1{x, h * 10 / 100, w - 12, h * 33 / 100}, t2{x, h * 33 / 100, w - 12, h * 63 / 100}, t3{x, h * 63 / 100, w - 12, h * 92 / 100};
+    HGDIOBJ oldF = SelectObject(dc, f1);
+    SetTextColor(dc, RGB(150, 190, 255));
+    DrawTextW(dc, title, -1, &t1, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+    SelectObject(dc, f2);
+    SetTextColor(dc, RGB(255, 255, 255));
+    DrawTextW(dc, name, -1, &t2, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+    SelectObject(dc, f3);
+    SetTextColor(dc, RGB(190, 198, 214));
+    DrawTextW(dc, detail, -1, &t3, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+    SelectObject(dc, oldF);
+    GdiFlush();
+    memcpy(out, bits, size_t(w) * h * 4);
+    SelectObject(dc, oldBm);
+    DeleteObject(f1); DeleteObject(f2); DeleteObject(f3); DeleteObject(edge); DeleteObject(card); DeleteObject(medal); DeleteObject(ring); DeleteObject(noPen);
+    DeleteObject(bm); DeleteDC(dc);
+    return true;
+}
 bool host_menu_bitmap(const wchar_t* const* lines, int n, int sel, int w, int h, uint32_t* out) {
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -247,6 +296,7 @@ bool host_wait_refresh() { return false; }
 bool host_menu_bitmap(const wchar_t* const*, int, int, int, int, uint32_t*) { return false; }
 void host_restart() {}
 void host_report(const char*) {}
+bool host_toast_bitmap(const wchar_t*, const wchar_t*, const wchar_t*, uint32_t, int, int, uint32_t*) { return false; }
 void host_sleep_us(uint64_t us) { std::this_thread::sleep_for(std::chrono::microseconds(us)); }
 void host_thread_priority_high() {}
 void host_thread_core(bool) {}

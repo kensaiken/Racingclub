@@ -15,12 +15,13 @@
 #include <set>
 #include <memory>
 #include <mutex>
+#include <deque>
 #include <string>
 #include <unordered_map>
 #include <vector>
 #include <immintrin.h>
 
-namespace gti::recomp { bool host_menu_bitmap(const wchar_t* const* lines, int n, int sel, int w, int h, uint32_t* out); void host_restart(); void host_report(const char* gpu); std::vector<std::string> host_camera_list(); void host_camera_stop(); }   // host_win.cpp
+namespace gti::recomp { bool host_menu_bitmap(const wchar_t* const* lines, int n, int sel, int w, int h, uint32_t* out); void host_restart(); void host_report(const char* gpu); std::vector<std::string> host_camera_list(); void host_camera_stop(); bool host_toast_bitmap(const wchar_t* title, const wchar_t* name, const wchar_t* detail, uint32_t rgb, int w, int h, uint32_t* out); }   // host_win.cpp
 namespace gti::recomp::rsx {
 
 // ------------------------------------------------------------------ OpenGL loader (only what this file uses)
@@ -1845,6 +1846,47 @@ static void draw_menu(int ww, int wh) {
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
 }
 
+// ------------------------------------------------------------------ notifications (trophies)
+struct Toast { std::wstring title, name, detail; uint32_t rgb; };
+static std::mutex g_toastMx;
+static std::deque<Toast> g_toasts;
+void toast(const std::wstring& title, const std::wstring& name, const std::wstring& detail, uint32_t rgb) {
+    std::lock_guard<std::mutex> lk(g_toastMx);
+    g_toasts.push_back({title, name, detail, rgb});
+}
+// the first queued notification, top right, for 5 seconds (then the next one)
+static void draw_toast(int ww, int wh) {
+    static GLuint tex = 0, fbo = 0;
+    static uint64_t shownAt = 0;
+    static bool ready = false;
+    const int W = 520, H = 120;
+    Toast t;
+    {
+        std::lock_guard<std::mutex> lk(g_toastMx);
+        if (g_toasts.empty()) return;
+        if (ready && SDL_GetTicks() - shownAt > 5000) { g_toasts.pop_front(); ready = false; if (g_toasts.empty()) return; }
+        t = g_toasts.front();
+    }
+    if (!tex) { glGenTextures(1, &tex); glGenFramebuffers(1, &fbo); }
+    if (!ready) {
+        static std::vector<uint32_t> px;
+        px.resize(size_t(W) * H);
+        if (!host_toast_bitmap(t.title.c_str(), t.name.c_str(), t.detail.c_str(), t.rgb, W, H, px.data())) { std::lock_guard<std::mutex> lk(g_toastMx); g_toasts.pop_front(); return; }
+        glActiveTexture(GL_TEXTURE0 + 15); ++g_texGen;
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glPixelStorei(0x0CF5 /* GL_UNPACK_ALIGNMENT */, 4);
+        glTexImage2D(GL_TEXTURE_2D, 0, 0x8058 /* GL_RGBA8 */, W, H, 0, 0x80E1 /* GL_BGRA */, GL_UNSIGNED_BYTE, px.data());
+        shownAt = SDL_GetTicks(); ready = true;
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    const int dw = std::min(ww * 4 / 10, W * 2), dh = dw * H / W, m = std::max(8, wh / 40);
+    glBlitFramebuffer(0, 0, W, H, ww - m - dw, wh - m, ww - m, wh - m - dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+}
+
 static SDL_Gamepad* pad = nullptr;
 static bool padHold = false;   // the menu was closed with the controller: the game sees no buttons until they are released
 static void pump_events() {
@@ -2159,6 +2201,7 @@ void flip(uint32_t id) {
         static int warned = 0;
         if (warned++ < 5) RLOG("[rsx] flip %u: display buffer at 0x%x was never rendered\n", id, d.offset);
     }
+    draw_toast(ww, wh);
     if (menuOpen) draw_menu(ww, wh);
     {   // SWAPLOG=1: how long presenting takes (it blocks when the compositor or the driver throttles)
         static const bool swapLog = std::getenv("SWAPLOG") != nullptr;

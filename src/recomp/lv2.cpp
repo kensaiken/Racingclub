@@ -14,6 +14,7 @@
 #include <deque>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <zlib.h>
 #include <map>
@@ -2148,6 +2149,113 @@ bool imports(PPU& c, const char* module, const char* name) {
     if (n == "cellSaveDataAutoLoad2") { ret(c, savedata::op(c, false)); return true; }
     if (n == "cellSaveDataAutoSave2") { ret(c, savedata::op(c, true)); return true; }
     if (n == "cellSaveDataListLoad2") { ret(c, savedata::ERR_NODATA); return true; }
+    // --- trophies (sceNpTrophy): the game's own list (TROPDIR/*/TROPHY.TRP next to USRDIR, in the game's language),
+    //     unlocked ones kept in dev_hdd0/trofeos.txt; an unlock shows a notification on screen
+    if (n.rfind("sceNpTrophy", 0) == 0) {
+        struct Trophy { int id; char type; std::wstring name, detail; };
+        static std::vector<Trophy> list;
+        static std::set<int> unlocked;
+        static bool loaded = false;
+        static const std::string savePath = CFG.hdd0 + "/trofeos.txt";
+        if (!loaded) {
+            loaded = true;
+            std::error_code ec;
+            for (const auto& d : std::filesystem::directory_iterator(std::filesystem::path(CFG.usrdir).parent_path() / "TROPDIR", ec)) {
+                FILE* f = _wfopen((d.path() / "TROPHY.TRP").wstring().c_str(), L"rb");
+                if (!f) continue;
+                std::vector<uint8_t> trp;
+                for (int ch; (ch = std::fgetc(f)) != EOF;) trp.push_back(uint8_t(ch));
+                std::fclose(f);
+                auto be = [&](size_t o, int bytes) { uint64_t v = 0; for (int i = 0; i < bytes && o + i < trp.size(); ++i) v = v << 8 | trp[o + i]; return v; };
+                auto entry = [&](const std::string& want) -> std::string {
+                    const uint32_t cnt = uint32_t(be(0x10, 4)), esz = uint32_t(be(0x14, 4));
+                    for (uint32_t i = 0; i < cnt && 0x40 + (i + 1) * esz <= trp.size(); ++i) {
+                        const size_t o = 0x40 + size_t(i) * esz;
+                        if (std::string(reinterpret_cast<const char*>(&trp[o])) != want) continue;
+                        const uint64_t off = be(o + 32, 8), sz = be(o + 40, 8);
+                        if (off + sz <= trp.size()) return std::string(reinterpret_cast<const char*>(&trp[off]), size_t(sz));
+                    }
+                    return {};
+                };
+                static const char* const langFile[6] = {"TROP.SFM", "TROP_01.SFM", "TROP_02.SFM", "TROP_03.SFM", "TROP_04.SFM", "TROP_05.SFM"};
+                std::string xml = entry(langFile[std::clamp(settings().language, 0, 5)]);
+                if (xml.empty()) xml = entry("TROP.SFM");
+                auto wide = [](const std::string& s) {   // UTF-8, or Latin-1 when it is not valid UTF-8
+                    std::wstring w; bool ok = true;
+                    for (size_t i = 0; i < s.size() && ok;) {
+                        const unsigned char c = uint8_t(s[i]);
+                        int len = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : 0;
+                        if (!len || i + len > s.size()) { ok = false; break; }
+                        uint32_t cp = len == 1 ? c : len == 2 ? c & 31 : c & 15;
+                        for (int k = 1; k < len; ++k) { if ((uint8_t(s[i + k]) >> 6) != 2) { ok = false; break; } cp = cp << 6 | (uint8_t(s[i + k]) & 63); }
+                        w += wchar_t(cp); i += size_t(len);
+                    }
+                    if (!ok) { w.clear(); for (unsigned char c : s) w += wchar_t(c); }
+                    return w;
+                };
+                auto trim = [](std::wstring s) { while (!s.empty() && (s.back() == L' ' || s.back() == L'\n' || s.back() == L'\r')) s.pop_back(); return s; };
+                for (size_t p = 0; (p = xml.find("<trophy ", p)) != std::string::npos; ++p) {
+                    const size_t end = xml.find("</trophy>", p);
+                    if (end == std::string::npos) break;
+                    const std::string t = xml.substr(p, end - p);
+                    auto attr = [&](const char* a) { const size_t q = t.find(std::string(a) + "=\""); return q == std::string::npos ? std::string() : t.substr(q + std::strlen(a) + 2, t.find('"', q + std::strlen(a) + 2) - q - std::strlen(a) - 2); };
+                    auto tag = [&](const char* g) { const size_t q = t.find(std::string("<") + g + ">"); if (q == std::string::npos) return std::string(); const size_t s0 = q + std::strlen(g) + 2; return t.substr(s0, t.find("</", s0) - s0); };
+                    const std::string ty = attr("ttype");
+                    list.push_back({std::atoi(attr("id").c_str()), ty.empty() ? 'B' : ty[0], trim(wide(tag("name"))), trim(wide(tag("detail")))});
+                }
+                break;
+            }
+            if (FILE* f = std::fopen(savePath.c_str(), "r")) { for (int id; std::fscanf(f, "%d%*[^\n]", &id) == 1;) unlocked.insert(id); std::fclose(f); }
+            LOG("[trophy] %zu trophies, %zu unlocked%c", list.size(), unlocked.size(), 10);
+            if (std::getenv("TROPHYTEST") && !list.empty())   // debug: the notification of a trophy (not unlocked)
+                for (const auto& t : list) if (t.id == std::atoi(std::getenv("TROPHYTEST"))) rsx::toast(L"Trofeo desbloqueado", t.name, t.detail, t.type == 'G' ? 0xFFC83Cu : t.type == 'S' ? 0xC8CDD4u : 0xCD7F32u);
+        }
+        auto find = [&](int id) -> const Trophy* { for (const auto& t : list) if (t.id == id) return &t; return nullptr; };
+        if (n == "sceNpTrophyCreateContext" || n == "sceNpTrophyCreateHandle") { if (a32(c, 0)) c.wr32(a32(c, 0), 1); ret(c, CELL_OK); return true; }
+        if (n == "sceNpTrophyGetTrophyUnlockState") {   // (ctx, handle, SceNpTrophyFlagArray* {u32 flag_bits[4]}, u32* count)
+            const uint32_t fl = a32(c, 2);
+            if (fl) { for (int i = 0; i < 4; ++i) c.wr32(fl + 4 * i, 0); for (int id : unlocked) if (id >= 0 && id < 128) c.wr32(fl + 4 * (id >> 5), c.rd32(fl + 4 * (id >> 5)) | 1u << (id & 31)); }
+            if (a32(c, 3)) c.wr32(a32(c, 3), uint32_t(list.size()));
+            ret(c, CELL_OK); return true;
+        }
+        if (n == "sceNpTrophyGetTrophyInfo") {   // (ctx, handle, id, SceNpTrophyDetails* {s32 id, u32 grade, char name[128], char desc[1024], u8 hidden}, SceNpTrophyData*)
+            const int id = int(a32(c, 2));
+            const Trophy* t = find(id);
+            if (const uint32_t d = a32(c, 3)) {
+                std::memset(c.mem + d, 0, 4 + 4 + 128 + 1024 + 4);
+                c.wr32(d, uint32_t(id));
+                c.wr32(d + 4, t ? (t->type == 'P' ? 1u : t->type == 'G' ? 2u : t->type == 'S' ? 3u : 4u) : 0u);
+                if (t) {
+                    auto put = [&](uint32_t a, const std::wstring& w, size_t cap) { std::string u; for (wchar_t ch : w) { if (ch < 0x80) u += char(ch); else if (ch < 0x800) { u += char(0xC0 | (ch >> 6)); u += char(0x80 | (ch & 63)); } else { u += char(0xE0 | (ch >> 12)); u += char(0x80 | ((ch >> 6) & 63)); u += char(0x80 | (ch & 63)); } } std::memcpy(c.mem + a, u.data(), std::min(u.size(), cap - 1)); };
+                    put(d + 8, t->name, 128); put(d + 136, t->detail, 1024);
+                }
+            }
+            if (const uint32_t d = a32(c, 4)) { std::memset(c.mem + d, 0, 16); c.wr32(d + 8, uint32_t(id)); c.wr8(d + 12, unlocked.count(id) ? 1 : 0); }
+            ret(c, t ? CELL_OK : 0x8002290du /* SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID */); return true;
+        }
+        if (n == "sceNpTrophyUnlockTrophy") {   // (ctx, handle, id, s32* platinumId)
+            const int id = int(a32(c, 2));
+            if (a32(c, 3)) c.wr32(a32(c, 3), 0xFFFFFFFFu);   // no platinum unlocked by this
+            auto unlock = [&](const Trophy& t) {
+                unlocked.insert(t.id);
+                if (FILE* f = std::fopen(savePath.c_str(), "a")) { std::fprintf(f, "%d %lld\n", t.id, (long long)std::time(nullptr)); std::fclose(f); }
+                static const wchar_t* const title[6] = {L"Trophy unlocked", L"Trophy unlocked", L"Trophée débloqué", L"Trofeo desbloqueado", L"Trophäe freigeschaltet", L"Trofeo sbloccato"};
+                const uint32_t rgb = t.type == 'P' ? 0x9FD6FFu : t.type == 'G' ? 0xFFC83Cu : t.type == 'S' ? 0xC8CDD4u : 0xCD7F32u;
+                rsx::toast(title[std::clamp(settings().language, 0, 5)], t.name, t.detail, rgb);
+                LOG("[trophy] unlocked %d%c", t.id, 10);
+            };
+            const Trophy* t = find(id);
+            if (t && !unlocked.count(id)) {
+                unlock(*t);
+                // the platinum trophy, if there is one, comes with all the others
+                const Trophy* plat = nullptr; bool all = true;
+                for (const auto& x : list) { if (x.type == 'P') plat = &x; else if (!unlocked.count(x.id)) all = false; }
+                if (plat && all && !unlocked.count(plat->id)) { unlock(*plat); if (a32(c, 3)) c.wr32(a32(c, 3), uint32_t(plat->id)); }
+            }
+            ret(c, CELL_OK); return true;
+        }
+        ret(c, CELL_OK); return true;   // Init, Term, RegisterContext, Destroy*
+    }
     // --- camera (cellCamera): the EyeToy features use a PlayStation Eye; here it is the host camera chosen in the menu
     //     (host_camera.cpp). CellCameraInfoEx: format, resolution, framerate, buffer, bytesize, width, height, dev_num,
     //     guid, info_ver, container, read_mode, pbuf[2]. The game opens it as RAW8 (Bayer), VGA, 60 fps.

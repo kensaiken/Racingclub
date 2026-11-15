@@ -188,6 +188,8 @@ def main():
     if not a.no_copy:
         print('  copiando los datos del juego...', flush=True)
         shutil.copytree(usrdir, os.path.join(out, 'juego', 'USRDIR'), dirs_exist_ok=True, ignore=shutil.ignore_patterns('EBOOT.BIN'))
+        if os.path.isdir(os.path.join(game, 'TROPDIR')):   # the trophy list (names, descriptions, icons)
+            shutil.copytree(os.path.join(game, 'TROPDIR'), os.path.join(out, 'juego', 'TROPDIR'), dirs_exist_ok=True)
     # the decrypted executable and the translated code stay out of the installer's folder, so it can be shared;
     # never in a development checkout (.git), where re/ also holds analysis files that cannot be regenerated
     if not a.keep and not os.path.exists(os.path.join(ROOT, '.git')):
