@@ -20,7 +20,7 @@ void method(uint32_t m, uint32_t arg);                // every NV4097 method (su
 void method_block(uint32_t m0, const uint8_t* args, uint32_t count, bool noInc);
 void set_display_buffer(uint32_t id, uint32_t offset, uint32_t pitch, uint32_t w, uint32_t h);
 void flip(uint32_t bufferId);                         // shows a display buffer and pumps window events
-void toast(const std::wstring& title, const std::wstring& name, const std::wstring& detail, uint32_t rgb);   // a notification (trophy) for 5 s
+void toast(const std::wstring& title, const std::wstring& name, const std::wstring& detail, uint32_t rgb, const std::string& png = {});   // a notification (trophy) for 5 s
 bool quit_requested();
 
 } // namespace gti::recomp::rsx

@@ -13,6 +13,11 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
+#include <objidl.h>
+#include <shlwapi.h>
+#include <algorithm>
+namespace Gdiplus { using std::min; using std::max; }
+#include <gdiplus.h>
 // kernel-mode-thunk vblank wait (gdi32): blocks until the next real vertical blank of the primary display
 extern "C" {
 struct KmtOpenAdapterFromHdc { HDC hDc; UINT hAdapter; LUID luid; UINT vidPnSourceId; };
@@ -204,7 +209,7 @@ void host_report(const char* gpu) {
     ShellExecuteW(nullptr, L"open", L"https://github.com/kensaiken/Racingclub/issues/new", nullptr, nullptr, SW_SHOWNORMAL);
 }
 // a trophy notification: dark rounded card, a medal of the trophy's colour (rgb 0xRRGGBB), title, name, detail
-bool host_toast_bitmap(const wchar_t* title, const wchar_t* name, const wchar_t* detail, uint32_t rgb, int w, int h, uint32_t* out) {
+bool host_toast_bitmap(const wchar_t* title, const wchar_t* name, const wchar_t* detail, uint32_t rgb, const uint8_t* png, size_t pngSize, int w, int h, uint32_t* out) {
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h; bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
@@ -225,9 +230,29 @@ bool host_toast_bitmap(const wchar_t* title, const wchar_t* name, const wchar_t*
     HGDIOBJ oldPen = SelectObject(dc, noPen);
     const int r = h * 32 / 100, cx = 18 + r, cy = h / 2;
     HGDIOBJ oldBr = SelectObject(dc, ring);
-    Ellipse(dc, cx - r, cy - r, cx + r, cy + r);
-    SelectObject(dc, medal);
-    Ellipse(dc, cx - r + 5, cy - r + 5, cx + r - 5, cy + r - 5);
+    bool icon = false;
+    if (png && pngSize) {   // the trophy's own icon, framed in its colour
+        static ULONG_PTR gdipToken = 0;
+        if (!gdipToken) { Gdiplus::GdiplusStartupInput in; Gdiplus::GdiplusStartup(&gdipToken, &in, nullptr); }
+        if (IStream* st = SHCreateMemStream(png, UINT(pngSize))) {
+            Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromStream(st);
+            if (bmp && bmp->GetLastStatus() == Gdiplus::Ok) {
+                SelectObject(dc, medal);
+                Rectangle(dc, cx - r - 3, cy - r - 3, cx + r + 3, cy + r + 3);
+                Gdiplus::Graphics g(dc);
+                g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+                g.DrawImage(bmp, cx - r, cy - r, 2 * r, 2 * r);
+                icon = true;
+            }
+            delete bmp;
+            st->Release();
+        }
+    }
+    if (!icon) {
+        Ellipse(dc, cx - r, cy - r, cx + r, cy + r);
+        SelectObject(dc, medal);
+        Ellipse(dc, cx - r + 5, cy - r + 5, cx + r - 5, cy + r - 5);
+    }
     SelectObject(dc, oldBr); SelectObject(dc, oldPen);
     SetBkMode(dc, TRANSPARENT);
     HFONT f1 = CreateFontW(-h * 17 / 100, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
@@ -296,7 +321,7 @@ bool host_wait_refresh() { return false; }
 bool host_menu_bitmap(const wchar_t* const*, int, int, int, int, uint32_t*) { return false; }
 void host_restart() {}
 void host_report(const char*) {}
-bool host_toast_bitmap(const wchar_t*, const wchar_t*, const wchar_t*, uint32_t, int, int, uint32_t*) { return false; }
+bool host_toast_bitmap(const wchar_t*, const wchar_t*, const wchar_t*, uint32_t, const uint8_t*, size_t, int, int, uint32_t*) { return false; }
 void host_sleep_us(uint64_t us) { std::this_thread::sleep_for(std::chrono::microseconds(us)); }
 void host_thread_priority_high() {}
 void host_thread_core(bool) {}

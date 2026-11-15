@@ -103,7 +103,7 @@ if(RECOMP_FULL_SRC)
   # line tables (no effect on speed) so the RIPPROF samples of the system layer resolve to source lines
   set_source_files_properties(src/recomp/lv2.cpp src/recomp/rsx_gl.cpp PROPERTIES COMPILE_OPTIONS "-gline-tables-only")
   if(WIN32)
-    target_link_libraries(recomp_boot PRIVATE dwmapi)
+    target_link_libraries(recomp_boot PRIVATE dwmapi gdiplus shlwapi)
   endif()
   if(MINGW)
     target_link_options(recomp_boot PRIVATE -static)

@@ -21,7 +21,7 @@
 #include <vector>
 #include <immintrin.h>
 
-namespace gti::recomp { bool host_menu_bitmap(const wchar_t* const* lines, int n, int sel, int w, int h, uint32_t* out); void host_restart(); void host_report(const char* gpu); std::vector<std::string> host_camera_list(); void host_camera_stop(); bool host_toast_bitmap(const wchar_t* title, const wchar_t* name, const wchar_t* detail, uint32_t rgb, int w, int h, uint32_t* out); }   // host_win.cpp
+namespace gti::recomp { bool host_menu_bitmap(const wchar_t* const* lines, int n, int sel, int w, int h, uint32_t* out); void host_restart(); void host_report(const char* gpu); std::vector<std::string> host_camera_list(); void host_camera_stop(); bool host_toast_bitmap(const wchar_t* title, const wchar_t* name, const wchar_t* detail, uint32_t rgb, const uint8_t* png, size_t pngSize, int w, int h, uint32_t* out); }   // host_win.cpp
 namespace gti::recomp::rsx {
 
 // ------------------------------------------------------------------ OpenGL loader (only what this file uses)
@@ -1847,12 +1847,12 @@ static void draw_menu(int ww, int wh) {
 }
 
 // ------------------------------------------------------------------ notifications (trophies)
-struct Toast { std::wstring title, name, detail; uint32_t rgb; };
+struct Toast { std::wstring title, name, detail; uint32_t rgb; std::string png; };
 static std::mutex g_toastMx;
 static std::deque<Toast> g_toasts;
-void toast(const std::wstring& title, const std::wstring& name, const std::wstring& detail, uint32_t rgb) {
+void toast(const std::wstring& title, const std::wstring& name, const std::wstring& detail, uint32_t rgb, const std::string& png) {
     std::lock_guard<std::mutex> lk(g_toastMx);
-    g_toasts.push_back({title, name, detail, rgb});
+    g_toasts.push_back({title, name, detail, rgb, png});
 }
 // the first queued notification, top right, for 5 seconds (then the next one)
 static void draw_toast(int ww, int wh) {
@@ -1871,7 +1871,7 @@ static void draw_toast(int ww, int wh) {
     if (!ready) {
         static std::vector<uint32_t> px;
         px.resize(size_t(W) * H);
-        if (!host_toast_bitmap(t.title.c_str(), t.name.c_str(), t.detail.c_str(), t.rgb, W, H, px.data())) { std::lock_guard<std::mutex> lk(g_toastMx); g_toasts.pop_front(); return; }
+        if (!host_toast_bitmap(t.title.c_str(), t.name.c_str(), t.detail.c_str(), t.rgb, reinterpret_cast<const uint8_t*>(t.png.data()), t.png.size(), W, H, px.data())) { std::lock_guard<std::mutex> lk(g_toastMx); g_toasts.pop_front(); return; }
         glActiveTexture(GL_TEXTURE0 + 15); ++g_texGen;
         glBindTexture(GL_TEXTURE_2D, tex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);

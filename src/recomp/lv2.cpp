@@ -2152,7 +2152,7 @@ bool imports(PPU& c, const char* module, const char* name) {
     // --- trophies (sceNpTrophy): the game's own list (TROPDIR/*/TROPHY.TRP next to USRDIR, in the game's language),
     //     unlocked ones kept in dev_hdd0/trofeos.txt; an unlock shows a notification on screen
     if (n.rfind("sceNpTrophy", 0) == 0) {
-        struct Trophy { int id; char type; std::wstring name, detail; };
+        struct Trophy { int id; char type; std::wstring name, detail; std::string icon; };
         static std::vector<Trophy> list;
         static std::set<int> unlocked;
         static bool loaded = false;
@@ -2201,14 +2201,15 @@ bool imports(PPU& c, const char* module, const char* name) {
                     auto attr = [&](const char* a) { const size_t q = t.find(std::string(a) + "=\""); return q == std::string::npos ? std::string() : t.substr(q + std::strlen(a) + 2, t.find('"', q + std::strlen(a) + 2) - q - std::strlen(a) - 2); };
                     auto tag = [&](const char* g) { const size_t q = t.find(std::string("<") + g + ">"); if (q == std::string::npos) return std::string(); const size_t s0 = q + std::strlen(g) + 2; return t.substr(s0, t.find("</", s0) - s0); };
                     const std::string ty = attr("ttype");
-                    list.push_back({std::atoi(attr("id").c_str()), ty.empty() ? 'B' : ty[0], trim(wide(tag("name"))), trim(wide(tag("detail")))});
+                    list.push_back({std::atoi(attr("id").c_str()), ty.empty() ? 'B' : ty[0], trim(wide(tag("name"))), trim(wide(tag("detail"))), {}});
+                    { char ic[16]; std::snprintf(ic, sizeof ic, "TROP%03d.PNG", list.back().id); list.back().icon = entry(ic); }
                 }
                 break;
             }
             if (FILE* f = std::fopen(savePath.c_str(), "r")) { for (int id; std::fscanf(f, "%d%*[^\n]", &id) == 1;) unlocked.insert(id); std::fclose(f); }
             LOG("[trophy] %zu trophies, %zu unlocked%c", list.size(), unlocked.size(), 10);
             if (std::getenv("TROPHYTEST") && !list.empty())   // debug: the notification of a trophy (not unlocked)
-                for (const auto& t : list) if (t.id == std::atoi(std::getenv("TROPHYTEST"))) rsx::toast(L"Trofeo desbloqueado", t.name, t.detail, t.type == 'G' ? 0xFFC83Cu : t.type == 'S' ? 0xC8CDD4u : 0xCD7F32u);
+                for (const auto& t : list) if (t.id == std::atoi(std::getenv("TROPHYTEST"))) rsx::toast(L"Trofeo desbloqueado", t.name, t.detail, t.type == 'G' ? 0xFFC83Cu : t.type == 'S' ? 0xC8CDD4u : 0xCD7F32u, t.icon);
         }
         auto find = [&](int id) -> const Trophy* { for (const auto& t : list) if (t.id == id) return &t; return nullptr; };
         if (n == "sceNpTrophyCreateContext" || n == "sceNpTrophyCreateHandle") { if (a32(c, 0)) c.wr32(a32(c, 0), 1); ret(c, CELL_OK); return true; }
@@ -2241,7 +2242,7 @@ bool imports(PPU& c, const char* module, const char* name) {
                 if (FILE* f = std::fopen(savePath.c_str(), "a")) { std::fprintf(f, "%d %lld\n", t.id, (long long)std::time(nullptr)); std::fclose(f); }
                 static const wchar_t* const title[6] = {L"Trophy unlocked", L"Trophy unlocked", L"Trophée débloqué", L"Trofeo desbloqueado", L"Trophäe freigeschaltet", L"Trofeo sbloccato"};
                 const uint32_t rgb = t.type == 'P' ? 0x9FD6FFu : t.type == 'G' ? 0xFFC83Cu : t.type == 'S' ? 0xC8CDD4u : 0xCD7F32u;
-                rsx::toast(title[std::clamp(settings().language, 0, 5)], t.name, t.detail, rgb);
+                rsx::toast(title[std::clamp(settings().language, 0, 5)], t.name, t.detail, rgb, t.icon);
                 LOG("[trophy] unlocked %d%c", t.id, 10);
             };
             const Trophy* t = find(id);
