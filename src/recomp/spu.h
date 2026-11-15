@@ -60,6 +60,11 @@ public:
     uint32_t compiled2Lo = 0, compiled2Hi = 0;
     void (*compiled3)(Spu&) = nullptr;
     uint32_t compiled3Lo = 0, compiled3Hi = 0;
+    // called by run() when pc enters (true) or leaves (false) [region3Lo, region3Hi); returning true on entry means the
+    // hook did the work and set pc (to the return address)
+    std::function<bool(Spu&, bool enter)> onRegion3;
+    uint32_t region3Lo = 0, region3Hi = 0;
+    bool inRegion3 = false;
 
     bool readChPub(uint32_t ch, uint32_t& v) { return readCh(ch, v); }
     bool writeChPub(uint32_t ch, uint32_t v) { return writeCh(ch, v); }

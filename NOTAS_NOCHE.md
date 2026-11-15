@@ -446,3 +446,13 @@ El juego necesita que la FIFO llegue a la espera de vblank menos de ~15,8 ms des
 - **Subida de texturas:** las texturas sin reordenar y sin intercambio de bytes se pasan a GL directamente desde la memoria del juego (con `GL_UNPACK_ROW_LENGTH` para el pitch); las reordenadas (*swizzled*) de 32 bits usan una tabla por eje. Una textura de 5,4 MB que cambia de contenido tardaba 20 ms (microparón); ya no aparece ningún `[slowdraw]`.
 - **Perfilador:** `RIPTHREAD=nombre` elige el hilo (`fifo`, `main`, `Render`...) y `RIPLEN=seg` la duración; `RIPPROF` admite decimales.
 - **Parones que quedan** (100-270 ms): solo en transiciones de pantalla y al cargar; coinciden con ráfagas de aperturas de ficheros del juego.
+
+### Decodificador de música propio (15/11, fase 1: interfaz)
+Objetivo: sustituir flashATRAC.pic (firmware de Sony) por un decodificador ATRAC3 nuestro.
+- Ficheros: `.msa` = contenedor MSF (`MSF\x02`, cabecera 0x40), códec 5 = ATRAC3 105 kbps (0x98 bytes por canal y trama), estéreo, 48 kHz.
+- El mezclador (tarea SPU) llama al módulo cargado en LS 0x32980: inicialización `0x32990` una vez (r3 = 0xf750; devuelve 0x38f60, 0x65c8) y decodificación `0x36c58` en bucle.
+- Decodificación: r3 0x12a00, r4 0x1aa00, r5 0x22a00 (tres búferes de 0x8000), r6 0x400, r7 0x2eb80 (contexto del stream copiado por el mezclador; +0x34 = EA del contexto en memoria principal, 0x30b58220/320/420 = tres streams), r8 0x3c200, r9 0x2ea80 (EAs en memoria principal: el módulo hace su propio DMA de la trama comprimida). Devuelve r3 = {muestras (0x200 o 0), canales 2, 0x98, 0}.
+- Salida: float de 32 bits, 512 muestras por canal: canal 0 en LS 0x1aa00, canal 1 en 0x1ba00 (0x808 bytes cambiados en cada uno).
+- Se decodifican varios streams a la vez (música y ambientes, p. ej. wind_loop_stereo.msa).
+- Depuración: `CODECLOG=n` (entradas/salidas del módulo, gancho `Spu::onRegion3`), `CODECDUMP=primera,n` (LS completo antes y después de cada llamada -> codec_NNN_in/out.bin).
+- Siguiente: estructuras r7/r9 (posición de lectura, ring buffer, estado entre llamadas), luego portar el decodificador ATRAC3 (referencia: FFmpeg atrac3.c, LGPL) y comparar muestra a muestra con los volcados.

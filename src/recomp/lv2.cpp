@@ -1510,6 +1510,25 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
     const spurt::Compiled* cpMod = std::getenv("NOSPUREC") ? nullptr : spurt::find_compiled(0xbce880);   // mstream_dsp_reverb.pic
     if (cpMain && !std::memcmp(s.ls + cpMain->lsBase, G->mem + cpMain->eaBin, cpMain->size)) { s.compiled = cpMain->fn; s.compiledLo = cpMain->lsBase; s.compiledHi = cpMain->lsBase + cpMain->size; }
     if (std::getenv("SNDTRACE")) s.mfcTrace = 4000;
+    if (const char* cl = std::getenv("CODECLOG")) {   // debug: CODECLOG=n: the first n calls into the music decoder (LS 0x32980..), arguments and result
+        static int left = std::atoi(cl);
+        s.region3Lo = 0x32980; s.region3Hi = 0x32980 + 0x7d40;
+        s.onRegion3 = [](Spu& sp, bool enter) {
+            if (left <= 0) return false;
+            if (enter) LOG("[codec] enter %05x lr %05x sp %05x r3 %08x %08x %08x %08x r4 %08x r5 %08x r6 %08x r7 %08x r8 %08x r9 %08x%c", sp.pc, sp.r[0].w(0), sp.r[1].w(0),
+                           sp.r[3].w(0), sp.r[3].w(1), sp.r[3].w(2), sp.r[3].w(3), sp.r[4].w(0), sp.r[5].w(0), sp.r[6].w(0), sp.r[7].w(0), sp.r[8].w(0), sp.r[9].w(0), 10);
+            else { LOG("[codec] leave to %05x r3 %08x %08x %08x %08x%c", sp.pc, sp.r[3].w(0), sp.r[3].w(1), sp.r[3].w(2), sp.r[3].w(3), 10); --left; }
+            // CODECDUMP=first,n: whole local store at entry and exit of calls first..first+n-1 -> codec_<k>_in/out.bin
+            static int k = 0, first = -1, n = 0;
+            if (first < 0) { first = 1 << 30; if (const char* d = std::getenv("CODECDUMP")) std::sscanf(d, "%d,%d", &first, &n); }
+            if (k >= first && k < first + n) {
+                char name[64]; std::snprintf(name, sizeof name, "codec_%03d_%s.bin", k, enter ? "in" : "out");
+                if (FILE* f = std::fopen(name, "wb")) { std::fwrite(sp.ls, 1, Spu::LS_SIZE, f); std::fclose(f); }
+            }
+            if (!enter) ++k;
+            return false;
+        };
+    }
     int shown = 0;
     static const bool trace = std::getenv("SNDTRACE") != nullptr;
     s.onBranch = [&](Spu& sp, uint32_t tg) {

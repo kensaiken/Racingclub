@@ -125,6 +125,13 @@ bool Spu::writeCh(uint32_t ch, uint32_t v) {
 void Spu::run(uint64_t maxSteps) {
     running = true;
     for (uint64_t k = 0; running && k < maxSteps; ++k) {
+        if (onRegion3) {   // entering / leaving the third region (the music decoder module): the hook may run its own code instead
+            const bool in = pc >= region3Lo && pc < region3Hi;
+            if (in != inRegion3) {
+                inRegion3 = in;
+                if (onRegion3(*this, in)) { inRegion3 = pc >= region3Lo && pc < region3Hi; continue; }
+            }
+        }
         if (compiled && pc >= compiledLo && pc < compiledHi) {
             const uint32_t before = pc;
             ++compiledCalls; compiled(*this);
