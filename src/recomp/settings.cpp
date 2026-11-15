@@ -4,10 +4,27 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#ifdef _WIN32
+extern "C" __declspec(dllimport) unsigned long __stdcall GetModuleFileNameA(void*, char*, unsigned long);
+#endif
 
 namespace gti::recomp {
 namespace {
-const char* const kFile = "gtiport.ini";
+// next to the executable, whatever the current folder is (a shortcut or another launcher may start the game
+// elsewhere, and the settings are read before main runs)
+const std::string& ini_path() {
+    static const std::string p = [] {
+        std::string dir;
+#ifdef _WIN32
+        char exe[1024];
+        const unsigned long n = GetModuleFileNameA(nullptr, exe, sizeof exe);
+        if (n > 0 && n < sizeof exe) { dir.assign(exe, n); const size_t k = dir.find_last_of("\\/"); dir = k == std::string::npos ? std::string() : dir.substr(0, k + 1); }
+#endif
+        return dir + "gtiport.ini";
+    }();
+    return p;
+}
 struct Field { const char* name; int Settings::* p; int lo, hi; };
 const Field kFields[] = {
     {"pantalla_completa", &Settings::fullscreen, 0, 2}, {"resolucion_interna", &Settings::scale, 1, 3}, {"imagenes_por_segundo", &Settings::gameHz, 60, 144},
@@ -26,7 +43,7 @@ Settings& settings() {
     static bool loaded = false;
     if (!loaded) {
         loaded = true;
-        if (FILE* f = std::fopen(kFile, "r")) {
+        if (FILE* f = std::fopen(ini_path().c_str(), "r")) {
             char line[128];
             while (std::fgets(line, sizeof line, f)) {
                 char* eq = std::strchr(line, '=');
@@ -46,7 +63,7 @@ Settings& settings() {
 
 void settings_save() {
     const Settings& s = settings();
-    FILE* f = std::fopen(kFile, "w");
+    FILE* f = std::fopen(ini_path().c_str(), "w");
     if (!f) return;
     for (const Field& fd : kFields) std::fprintf(f, "%s=%d\n", fd.name, s.*fd.p);
     std::fclose(f);

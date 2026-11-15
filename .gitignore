@@ -30,3 +30,4 @@ rsxdump/
 sim_log.txt
 __pycache__/
 *.pyc
+assets/

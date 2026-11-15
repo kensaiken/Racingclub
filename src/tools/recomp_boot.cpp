@@ -14,18 +14,46 @@
 #include <filesystem>
 #include <string>
 #include <thread>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 using namespace gti::recomp;
 namespace gti::recomp { void host_restore_refresh(); }
 namespace gti::recomp { extern bool g_shadowOn; void rc_dump_all_shadows(); extern uint32_t g_watchLo, g_watchHi; }
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::printf("usage: recomp_boot EBOOT.elf USRDIR [--trace] [--seconds N]\n"); return 1; }
+    // Started without arguments (double click on the game's executable): the game files are looked for next to the
+    // project like the launcher script does, the game runs until its window is closed, the log goes to
+    // recomp_log.txt and no console window stays open.
+    std::string elfArg, usrArg;
+    int seconds = 20;
+    if (argc < 3) {
+        std::error_code ec;
+        std::filesystem::path dir = std::filesystem::path(argv[0]).parent_path();
+#ifdef _WIN32
+        { wchar_t exe[1024]; if (GetModuleFileNameW(nullptr, exe, 1024)) dir = std::filesystem::path(exe).parent_path(); }
+#endif
+        if (!dir.empty()) std::filesystem::current_path(dir, ec);
+        elfArg = "../re/EBOOT.elf"; usrArg = "../../NPEB00060/USRDIR";
+        if (!std::filesystem::exists(elfArg, ec) || !std::filesystem::exists(usrArg, ec)) {
+#ifdef _WIN32
+            MessageBoxW(nullptr, L"No encuentro los ficheros del juego.\n\nHacen falta ..\\re\\EBOOT.elf y ..\\..\\NPEB00060\\USRDIR respecto a la carpeta de este ejecutable.", L"GTI Club", MB_ICONERROR);
+#endif
+            std::printf("usage: recomp_boot EBOOT.elf USRDIR [--trace] [--seconds N]\n");
+            return 1;
+        }
+        std::freopen("recomp_log.txt", "w", stderr);
+        seconds = 0;
+#ifdef _WIN32
+        FreeConsole();
+#endif
+    } else { elfArg = argv[1]; usrArg = argv[2]; }
     setvbuf(stdout, nullptr, _IONBF, 0);
     Lv2Config cfg;
-    cfg.usrdir = argv[2];
+    cfg.usrdir = usrArg;
     cfg.hdd0 = (std::filesystem::path(argv[0]).parent_path() / "dev_hdd0").string();
-    int seconds = 20;
+    if (argc < 3) cfg.hdd0 = "dev_hdd0";
     for (int i = 3; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--trace")) cfg.trace = true;
         else if (!std::strcmp(argv[i], "--chain")) g_shadowOn = true;
@@ -35,7 +63,7 @@ int main(int argc, char** argv) {
     }
     std::filesystem::create_directories(cfg.hdd0);
     static Guest g;
-    if (!g.init(argv[1])) { std::printf("cannot load %s\n", argv[1]); return 1; }
+    if (!g.init(elfArg.c_str())) { std::printf("cannot load %s\n", elfArg.c_str()); return 1; }
     lv2_install(g, cfg);
     // the main thread runs on its own host thread so this one can stop the test after a while
     std::thread mt([] { const int rc = lv2_run_main(g); std::fprintf(stderr, "[boot] main finished (%d)\n", rc); });
