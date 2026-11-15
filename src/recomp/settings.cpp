@@ -35,6 +35,7 @@ const Field kFields[] = {
     {"nitidez", &Settings::sharpen, 0, 3},
     {"modo_directo", &Settings::streaming, 0, 1},
     {"filtrado_anisotropo", &Settings::aniso, 0, 4},
+    {"camara", &Settings::camera, 0, 16},
 };
 }
 

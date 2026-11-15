@@ -13,6 +13,7 @@ struct Settings {
     int streaming = 0;    // live streaming / recording: 60 images per second and the display at 120 Hz, whatever gameHz says
     int fxaa = 1;         // edge antialiasing pass on the final image
     int sharpen = 1;      // contrast-adaptive sharpening of the final image: 0 off, 1 low, 2 medium, 3 high
+    int camera = 1;       // the EyeToy / PlayStation Eye: 0 none, k = the k-th camera of the host
     int sound = 1;        // sound effects (the game's MultiStream mixer runs on a host thread)
     int showFps = 1;      // frame rate in the window title
 };

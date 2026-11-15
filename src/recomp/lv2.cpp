@@ -24,6 +24,7 @@
 #include <thread>
 #include <vector>
 
+namespace gti::recomp { bool host_camera_available(int choice); bool host_camera_start(int choice); void host_camera_stop(); uint32_t host_camera_read(uint8_t* dst, uint32_t cap, int format, int w, int h, uint32_t& frame); }   // host_camera.cpp
 namespace gti::recomp { void ripprof_register_thread(const char* name); void host_sleep_us(uint64_t us); void host_thread_priority_high(); void host_thread_core(bool own); void host_timer_init(); int host_display_hz(); bool host_set_refresh(int hz); void host_restore_refresh(); bool host_wait_refresh(); }   // ripprof.cpp, host_win.cpp   // ripprof.cpp
 namespace gti::recomp {
 
@@ -2147,6 +2148,46 @@ bool imports(PPU& c, const char* module, const char* name) {
     if (n == "cellSaveDataAutoLoad2") { ret(c, savedata::op(c, false)); return true; }
     if (n == "cellSaveDataAutoSave2") { ret(c, savedata::op(c, true)); return true; }
     if (n == "cellSaveDataListLoad2") { ret(c, savedata::ERR_NODATA); return true; }
+    // --- camera (cellCamera): the EyeToy features use a PlayStation Eye; here it is the host camera chosen in the menu
+    //     (host_camera.cpp). CellCameraInfoEx: format, resolution, framerate, buffer, bytesize, width, height, dev_num,
+    //     guid, info_ver, container, read_mode, pbuf[2]. The game opens it as RAW8 (Bayer), VGA, 60 fps.
+    if (n.rfind("cellCamera", 0) == 0) {
+        static uint32_t camFormat = 0, camW = 0, camH = 0, camBuf = 0, camBytes = 0;
+        { static int shown = 0; if (shown++ < 40) LOG("[camera] %s(%x, %x, %x) lr %llx%c", n.c_str(), a32(c, 0), a32(c, 1), a32(c, 2), (unsigned long long)c.lr, 10); }
+        if (n == "cellCameraInit" || n == "cellCameraEnd" || n == "cellCameraReset") { ret(c, CELL_OK); return true; }
+        // one camera, device 0 (the game looks for devices 0, 1, 2... until one is not attached)
+        const bool dev0 = a32(c, 0) == 0 && host_camera_available(settings().camera);
+        if (n == "cellCameraIsAttached") { ret(c, dev0 ? 1 : 0); return true; }
+        if (n == "cellCameraGetType") {   // CELL_CAMERA_EYETOY2 = the PlayStation Eye
+            if (a32(c, 1)) c.wr32(a32(c, 1), dev0 ? 2 : 0);
+            ret(c, dev0 ? CELL_OK : 0x80140808u); return true;
+        }
+        if (n == "cellCameraOpenEx") {
+            if (!dev0) { ret(c, 0x80140808u); return true; }   // CELL_CAMERA_ERROR_DEVICE_NOT_FOUND
+            const uint32_t p = a32(c, 1);
+            camFormat = c.rd32(p);
+            const uint32_t res = c.rd32(p + 4);
+            camW = res == 2 ? 320 : res == 4 ? c.rd32(p + 0x14) : 640;
+            camH = res == 2 ? 240 : res == 3 ? 360 : res == 4 ? c.rd32(p + 0x18) : 480;
+            const uint32_t bpp = camFormat == 5 ? 4 : camFormat == 3 ? 2 : 1;
+            camBytes = camW * camH * bpp;
+            static uint32_t ownBuf = 0, ownBytes = 0;   // allocated once, kept for later opens
+            camBuf = c.rd32(p + 0xc);
+            if (!camBuf) { if (ownBytes < camBytes) { ownBuf = alloc_user(camBytes, 0x100); ownBytes = camBytes; } camBuf = ownBuf; c.wr32(p + 0xc, camBuf); }
+            c.wr32(p + 0x10, camBytes); c.wr32(p + 0x14, camW); c.wr32(p + 0x18, camH);
+            LOG("[camera] open: format %u, %ux%u, %u fps, buffer %08x (%u bytes), read mode %u%c", camFormat, camW, camH, c.rd32(p + 8), camBuf, camBytes, c.rd32(p + 0x2c), 10);
+            ret(c, CELL_OK); return true;
+        }
+        if (n == "cellCameraStart") { ret(c, host_camera_start(settings().camera) ? CELL_OK : 0x80140808u /* CELL_CAMERA_ERROR_DEVICE_NOT_FOUND */); return true; }
+        if (n == "cellCameraRead") {   // (dev, u32* frame_num, u32* bytes_read): the latest image into the buffer given at open
+            uint32_t frame = 0, bytes = 0;
+            if (camBuf && camBytes) bytes = host_camera_read(G->mem + camBuf, camBytes, int(camFormat), int(camW), int(camH), frame);
+            if (a32(c, 1)) c.wr32(a32(c, 1), frame);
+            if (a32(c, 2)) c.wr32(a32(c, 2), bytes);
+            ret(c, CELL_OK); return true;
+        }
+        if (n == "cellCameraStop" || n == "cellCameraClose") { host_camera_stop(); ret(c, CELL_OK); return true; }
+    }
     // --- pad (sys_io): one DualShock 3 connected on port 0; buttons from the host pad state (pad_state())
     if (n == "cellPadInit" || n == "cellPadEnd" || n == "cellPadSetPortSetting") { ret(c, CELL_OK); return true; }
     if (n == "cellPadSetActDirect") {   // (port, CellPadActParam* {u8 motor[6]}): motor 0 = small (on/off), motor 1 = large (0..255)
