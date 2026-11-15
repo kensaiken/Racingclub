@@ -317,6 +317,9 @@ class App:
 
     # ------------------------------------------------------------ run
     def log(self, line):
+        try:   # instalacion.log next to the installer, to attach to a problem report
+            with open(os.path.join(ROOT, 'instalacion.log'), 'a', encoding='utf-8') as f: f.write(line + '\n')
+        except OSError: pass
         self.logbox.insert('end', line + '\n')
         if self.log_shown: self.logbox.see('end')
 
@@ -324,6 +327,11 @@ class App:
         if self.proc or not self.ready(): return
         self.save(); self.ok = False; self.step = 0
         self.logbox.delete('1.0', 'end')
+        try:
+            import datetime, platform
+            with open(os.path.join(ROOT, 'instalacion.log'), 'w', encoding='utf-8') as f:
+                f.write('Racing Club+ installer v%s - %s - %s\n' % (VERSION, datetime.datetime.now().strftime('%Y-%m-%d %H:%M'), platform.platform()))
+        except OSError: pass
         self.draw_button(self.t('install'), False)
         threading.Thread(target=self.worker, daemon=True).start()
 
