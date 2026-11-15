@@ -20,7 +20,7 @@
 #include <vector>
 #include <immintrin.h>
 
-namespace gti::recomp { bool host_menu_bitmap(const wchar_t* const* lines, int n, int sel, int w, int h, uint32_t* out); }   // host_win.cpp
+namespace gti::recomp { bool host_menu_bitmap(const wchar_t* const* lines, int n, int sel, int w, int h, uint32_t* out); void host_restart(); }   // host_win.cpp
 namespace gti::recomp::rsx {
 
 // ------------------------------------------------------------------ OpenGL loader (only what this file uses)
@@ -1757,7 +1757,7 @@ static void set_display_mode(int mode) {
 // ------------------------------------------------------------------ options menu (F1)
 static bool menuOpen = std::getenv("MENUTEST") != nullptr, menuDirty = true;   // MENUTEST=1 (debug): open from the start
 static int menuSel = 1;
-static const int kMenuLines = 15, kMenuFirst = 1, kMenuLast = 12;   // title, 12 options, 2 notes
+static const int kMenuLines = 16, kMenuFirst = 1, kMenuLast = 13;   // title, 12 options, "apply" (restarts the game), 2 notes
 static void menu_change(int dir) {
     Settings& s = settings();
     switch (menuSel) {
@@ -1772,6 +1772,7 @@ static void menu_change(int dir) {
         case 9: s.aniso = std::clamp(s.aniso + (dir ? dir : 1), 0, 4); ++g_texGen; break;
         case 10: s.streaming ^= 1; break;
         case 11: s.fxaa ^= 1; break;
+        case 13: if (dir >= 0) { settings_save(); host_restart(); } break;   // the options marked * are read once at start
         case 12: s.sharpen = (s.sharpen + (dir ? dir : 1) + 4) % 4; break;   // the texture cache keeps sampler state: rebuild it
     }
     menuDirty = true;
@@ -1812,8 +1813,9 @@ static void draw_menu(int ww, int wh) {
             static const wchar_t* const sh[4] = {L"No", L"Baja", L"Media", L"Alta"};
             std::swprintf(l[12], 96, L"Nitidez\t‹ %ls ›", sh[std::clamp(s.sharpen, 0, 3)]);
         }
-        std::swprintf(l[13], 96, L"* se aplica al reiniciar el juego");
-        std::swprintf(l[14], 96, L"Flechas: elegir y cambiar   ·   F1 o Esc: cerrar   ·   F11: ventana / pantalla completa");
+        std::swprintf(l[13], 96, L"Aplicar cambios\t‹ Reiniciar el juego ›");
+        std::swprintf(l[14], 96, L"* se aplica al reiniciar el juego (Aplicar cambios + Intro)");
+        std::swprintf(l[15], 96, L"Flechas: elegir y cambiar   ·   F1 o Esc: cerrar   ·   F11: ventana / pantalla completa");
         const wchar_t* lines[kMenuLines];
         for (int i = 0; i < kMenuLines; ++i) lines[i] = l[i];
         static std::vector<uint32_t> px;

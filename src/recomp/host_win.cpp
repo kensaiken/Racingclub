@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <cwchar>
 #include <thread>
 #include <chrono>
@@ -152,6 +153,18 @@ void host_thread_core(bool own) {
 }
 // Draws the options panel with GDI: n lines of "label<TAB>value" text (line 0 is the title, `sel` is highlighted,
 // lines without a tab are notes) into w x h top-down BGRA pixels.
+// "Aplicar cambios" in the options menu: starts the game again with the same command line and ends this process at
+// once (the display mode goes back first, so the new process finds the desktop's own mode)
+void host_restart() {
+    host_restore_refresh();
+    STARTUPINFOW si{}; si.cb = sizeof si;
+    PROCESS_INFORMATION pi{};
+    std::wstring cmd = GetCommandLineW();
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) return;
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    std::fflush(nullptr);
+    TerminateProcess(GetCurrentProcess(), 0);
+}
 bool host_menu_bitmap(const wchar_t* const* lines, int n, int sel, int w, int h, uint32_t* out) {
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -194,6 +207,7 @@ bool host_set_refresh(int) { return false; }
 void host_restore_refresh() {}
 bool host_wait_refresh() { return false; }
 bool host_menu_bitmap(const wchar_t* const*, int, int, int, int, uint32_t*) { return false; }
+void host_restart() {}
 void host_sleep_us(uint64_t us) { std::this_thread::sleep_for(std::chrono::microseconds(us)); }
 void host_thread_priority_high() {}
 void host_thread_core(bool) {}
