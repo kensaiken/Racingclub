@@ -1,3 +1,7 @@
+<p align="center"><img src="assets/banner_racing_club.png" alt="Racing Club+" width="100%"></p>
+
+<p align="center"><a href="https://www.patreon.com/ilesraider/posts/racing-club-175397772"><b>❤️ Apoya el proyecto y descarga el instalador en Patreon / Support the project and download the installer on Patreon</b></a></p>
+
 # GTI Club PC (port nativo) — Hito 1: visor de modelos
 
 Reimplementación nativa para PC (Windows x64, OpenGL) de *GTI Club + Rally Côte d'Azur* (PS3, NPEB00060).
