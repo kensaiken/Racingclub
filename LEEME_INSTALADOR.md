@@ -1,4 +1,4 @@
-# GTI Club+ para PC — instalador
+# Racing Club+ para PC — instalador
 
 Este instalador **no contiene ningún fichero del juego**. Fabrica la versión de PC en tu ordenador a partir de **tu propia copia** de GTI Club+ Rally Côte d'Azur de PS3.
 
@@ -22,7 +22,7 @@ Haz doble clic en `instalar.bat`, arrastra la carpeta de RPCS3 a la ventana y pu
 python instalar.py --rpcs3 "C:\ruta\a\RPCS3"
 ```
 
-Tarda varios minutos (traducir y compilar). Al terminar, la carpeta `GTI Club+` contiene `GTI Club+.exe` y una copia de los datos de tu juego. Las partidas guardadas y los ajustes se crean ahí mismo.
+Tarda varios minutos (traducir y compilar). Al terminar, la carpeta `Racing Club+` contiene `Racing Club+.exe` y una copia de los datos de tu juego. Las partidas guardadas y los ajustes se crean ahí mismo.
 
 ## Qué hace, paso a paso
 
@@ -35,7 +35,7 @@ Tarda varios minutos (traducir y compilar). Al terminar, la carpeta `GTI Club+` 
 
 ## Importante
 
-La carpeta `GTI Club+` resultante contiene tu copia del juego y código derivado de él: es para tu uso personal. **No la repartas.** Lo que sí se puede compartir es este instalador.
+La carpeta `Racing Club+` resultante contiene tu copia del juego y código derivado de él: es para tu uso personal. **No la repartas.** Lo que sí se puede compartir es este instalador.
 
 ## En el juego
 

@@ -1,4 +1,4 @@
-"""GTI Club+ : builds the PC version of the game from the user's own copy. No game file is part of this project.
+"""Racing Club+ : builds the PC version of the game from the user's own copy. No game file is part of this project.
 
 usage: python instalar.py --rpcs3 <RPCS3 folder> [--out <folder>] [--toolchain <folder>] [--jobs N] [--no-copy]
 
@@ -51,9 +51,9 @@ def sfo(path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description='GTI Club+ para PC a partir de tu copia del juego (NPEB00060, 1.02)')
+    ap = argparse.ArgumentParser(description='Racing Club+ para PC a partir de tu copia del juego (NPEB00060, 1.02)')
     ap.add_argument('--rpcs3', required=True, help='carpeta de RPCS3 con el juego y el firmware instalados')
-    ap.add_argument('--out', default=os.path.join(ROOT, 'GTI Club+'), help='carpeta de salida')
+    ap.add_argument('--out', default=os.path.join(ROOT, 'Racing Club+'), help='carpeta de salida')
     ap.add_argument('--toolchain', default=os.environ.get('GTI_TOOLCHAIN', ''), help='carpeta del compilador (bin/, deps/)')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
     ap.add_argument('--no-copy', action='store_true', help='no copiar los datos del juego a la salida')
@@ -128,7 +128,7 @@ def main():
     step(7, 'Preparando la carpeta del juego')
     out = os.path.abspath(a.out)
     os.makedirs(os.path.join(out, 'juego'), exist_ok=True)
-    shutil.copyfile(os.path.join(build, 'recomp_boot.exe'), os.path.join(out, 'GTI Club+.exe'))
+    shutil.copyfile(os.path.join(build, 'recomp_boot.exe'), os.path.join(out, 'Racing Club+.exe'))
     shutil.copyfile(elf, os.path.join(out, 'juego', 'EBOOT.elf'))
     if pic:
         os.makedirs(os.path.join(out, 'dev_flash', 'sys', 'external'), exist_ok=True)
@@ -136,7 +136,7 @@ def main():
     if not a.no_copy:
         print('  copiando los datos del juego...', flush=True)
         shutil.copytree(usrdir, os.path.join(out, 'juego', 'USRDIR'), dirs_exist_ok=True, ignore=shutil.ignore_patterns('EBOOT.BIN'))
-    print('\nHecho en %d min. Para jugar: "%s"' % ((time.time() - t0) / 60, os.path.join(out, 'GTI Club+.exe')))
+    print('\nHecho en %d min. Para jugar: "%s"' % ((time.time() - t0) / 60, os.path.join(out, 'Racing Club+.exe')))
     print('Esa carpeta contiene tu copia del juego: es para tu uso, no la repartas.')
 
 

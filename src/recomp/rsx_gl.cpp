@@ -1709,7 +1709,7 @@ static void init_gl() {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 5);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    win = SDL_CreateWindow("GTI Club (F1: opciones)", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    win = SDL_CreateWindow("Racing Club+ (F1: opciones)", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
     if (!win) { RLOG("[rsx] window: %s\n", SDL_GetError()); return; }
     glc = SDL_GL_CreateContext(win);
     if (!glc) { RLOG("[rsx] GL context: %s\n", SDL_GetError()); return; }
@@ -1766,7 +1766,7 @@ static void menu_change(int dir) {
         case 3: { static const int r[4] = {60, 72, 120, 144}; int i = 0; while (i < 3 && r[i] != s.gameHz) ++i; s.gameHz = r[(i + dir + 4) % 4]; break; }
         case 4: s.refresh ^= 1; break;
         case 5: s.language = 1 + (s.language - 1 + dir + 5) % 5; break;
-        case 6: s.showFps ^= 1; if (!s.showFps) SDL_SetWindowTitle(win, "GTI Club"); break;
+        case 6: s.showFps ^= 1; if (!s.showFps) SDL_SetWindowTitle(win, "Racing Club+"); break;
         case 7: s.vsync ^= 1; SDL_GL_SetSwapInterval(s.vsync); break;
         case 8: s.sound ^= 1; break;
         case 9: s.aniso = std::clamp(s.aniso + (dir ? dir : 1), 0, 4); ++g_texGen; break;
@@ -2166,7 +2166,7 @@ void flip(uint32_t id) {
         static const bool fpsLog = std::getenv("FPSLOG") != nullptr;   // FPSLOG=1: frame rate every 2 s in the log (benchmarks)
         if (fpsLog) RLOG("[fps] %.1f s: %.1f\n", now / 1000.0, (frameNo - lastF) * 1000.0 / (now - lastT));
         char title[160];
-        std::snprintf(title, sizeof title, "GTI Club - %.1f fps (F1: opciones)", (frameNo - lastF) * 1000.0 / (now - lastT),
+        std::snprintf(title, sizeof title, "Racing Club+ - %.1f fps (F1: opciones)", (frameNo - lastF) * 1000.0 / (now - lastT),
                       (unsigned long long)drawsThisFrame, programs.size());
         SDL_SetWindowTitle(win, title);
         lastT = now; lastF = frameNo;

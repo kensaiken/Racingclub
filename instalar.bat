@@ -1,9 +1,9 @@
 @echo off
-rem GTI Club+ : asks for the RPCS3 folder and builds the game from the user's own copy (see LEEME_INSTALADOR.md)
+rem Racing Club+ : asks for the RPCS3 folder and builds the game from the user's own copy (see LEEME_INSTALADOR.md)
 setlocal
 cd /d "%~dp0"
 echo ==============================================================
-echo  GTI Club+ para PC - instalador
+echo  Racing Club+ para PC - instalador
 echo.
 echo  Necesitas TU copia del juego instalada en RPCS3:
 echo    - version EUROPEA  NPEB00060  con la actualizacion 1.02
@@ -34,6 +34,6 @@ if errorlevel 1 (
   )
 )
 set /p RP=Arrastra aqui la carpeta de RPCS3 y pulsa Intro:
-"%PY%" instalar.py --rpcs3 %RP% --out "%~dp0GTI Club+"
+"%PY%" instalar.py --rpcs3 %RP% --out "%~dp0Racing Club+"
 echo.
 pause

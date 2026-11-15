@@ -40,7 +40,7 @@ int main(int argc, char** argv) {
         if (!std::filesystem::exists(elfArg, ec) || !std::filesystem::exists(usrArg, ec)) { elfArg = "../re/EBOOT.elf"; usrArg = "../../NPEB00060/USRDIR"; }
         if (!std::filesystem::exists(elfArg, ec) || !std::filesystem::exists(usrArg, ec)) {
 #ifdef _WIN32
-            MessageBoxW(nullptr, L"No encuentro los ficheros del juego.\n\nHacen falta juego\\EBOOT.elf y la carpeta juego\\USRDIR junto a este ejecutable (los crea el instalador a partir de tu copia del juego).", L"GTI Club", MB_ICONERROR);
+            MessageBoxW(nullptr, L"No encuentro los ficheros del juego.\n\nHacen falta juego\\EBOOT.elf y la carpeta juego\\USRDIR junto a este ejecutable (los crea el instalador a partir de tu copia del juego).", L"Racing Club+", MB_ICONERROR);
 #endif
             std::printf("usage: recomp_boot EBOOT.elf USRDIR [--trace] [--seconds N]\n");
             return 1;

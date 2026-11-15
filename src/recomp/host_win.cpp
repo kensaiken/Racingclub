@@ -186,7 +186,7 @@ void host_report(const char* gpu) {
     MEMORYSTATUSEX ms{}; ms.dwLength = sizeof ms; GlobalMemoryStatusEx(&ms);
     SYSTEMTIME t; GetLocalTime(&t);
     char head[512];
-    std::snprintf(head, sizeof head, "GTI Club+ - informe de problemas\r\nFecha: %04d-%02d-%02d %02d:%02d\r\nProcesador: %s (%u hilos)\r\nMemoria: %llu MB\r\nGrafica: %s\r\nPantalla: %d Hz\r\n\r\n--- gtiport.ini ---\r\n",
+    std::snprintf(head, sizeof head, "Racing Club+ - informe de problemas\r\nFecha: %04d-%02d-%02d %02d:%02d\r\nProcesador: %s (%u hilos)\r\nMemoria: %llu MB\r\nGrafica: %s\r\nPantalla: %d Hz\r\n\r\n--- gtiport.ini ---\r\n",
         t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, cpu, std::thread::hardware_concurrency(), (unsigned long long)(ms.ullTotalPhys >> 20), gpu ? gpu : "?", host_display_hz());
     std::string out = head + slurp("gtiport.ini", 1 << 16) + "\r\n--- final de recomp_log.txt ---\r\n" + slurp("recomp_log.txt", 300000);
     char user[256]; DWORD un = sizeof user;
