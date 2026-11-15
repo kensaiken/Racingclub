@@ -9,7 +9,7 @@ Este instalador **no contiene ningún fichero del juego**. Fabrica la versión d
    - Con la **actualización 1.02** instalada.
    - Opcional: el pack de coches (DLC).
    - Otras regiones (americana, japonesa) u otras versiones **no funcionan**: el instalador lo comprueba y se detiene.
-2. **RPCS3** con el juego instalado y funcionando (con sus licencias `.rap`) y con el **firmware oficial de PS3** instalado. Del firmware solo se usa el decodificador de música; sin él, el juego no tiene música.
+2. **RPCS3** (gratuito). Solo se usa para descifrar tu juego; **no hace falta el firmware de PS3**, porque el decodificador de música va integrado.
 3. **Python 3** con el módulo `capstone` 5.0.7: va incluido en `toolchain/python` si usas el paquete completo. Si no está, `instalar.bat` usa el Python del sistema e instala `capstone`.
 4. **El compilador**: carpeta `toolchain/` junto a este fichero (llvm-mingw + CMake + Ninja, con SDL3 y zlib en `toolchain/deps`), o indicada con `--toolchain`.
 5. Un PC con Windows 10/11 de 64 bits, procesador con AVX2 y gráfica con OpenGL 4.5. Unos 3 GB libres.

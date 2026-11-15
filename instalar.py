@@ -5,8 +5,7 @@ usage: python instalar.py --rpcs3 <RPCS3 folder> [--out <folder>] [--toolchain <
 Needs, inside the RPCS3 folder:
   - the game installed: GTI Club+ Rally Cote d'Azur, EUROPEAN version NPEB00060 with update 1.02 (and, optionally,
     the car pack) with its licences (.rap) -> dev_hdd0/game/NPEB00060
-  - the PS3 system software installed -> dev_flash/sys/external/flashATRAC.pic (music decoder; without it the game
-    has no music)
+  - nothing from the PS3 system software: the music decoder is built in (src/recomp/atrac3.cpp)
 Needs on this PC: Python 3 with capstone 5.0.x, and the llvm-mingw + CMake + Ninja toolchain (see LEEME_INSTALADOR.md).
 
 Steps: check the version, decrypt the executable (RPCS3 does it), translate the game code and the SPU programs to
@@ -19,7 +18,6 @@ TITLE_ID, APP_VER = 'NPEB00060', '01.02'
 ELF_SHA1 = 'e9faf331b52770164be0c19f427c10aef747776d'     # decrypted EBOOT of NPEB00060 1.02
 EBOOT_SHA1 = 'c68e065fb373c69c18195182fc0cd79635cead39'   # the same, encrypted (USRDIR/EBOOT.BIN)
 SPU_SPECS = ['ba3680:0xa200', 'baea80:0x14c00', '0xbd0b00:0xd560:0x3000', '0xbce880:0x2000:0x2f080']
-ATRAC_SPEC = 'file:re/spu_atrac_32980.bin:0:0x7d40:32980:a7ac00'
 
 
 def fail(msg):
@@ -92,7 +90,7 @@ def install_pkg(exe, rp, pkg):
 
 def main():
     ap = argparse.ArgumentParser(description='Racing Club+ para PC a partir de tu copia del juego (NPEB00060, 1.02)')
-    ap.add_argument('--rpcs3', required=True, help='carpeta de RPCS3 (con el firmware de PS3 instalado; y con el juego, si no se usa --juego)')
+    ap.add_argument('--rpcs3', required=True, help='carpeta de RPCS3 (solo se usa para descifrar; con el juego instalado si no se usa --pkg ni --juego)')
     ap.add_argument('--pkg', nargs='*', default=[], help='paquetes .pkg a instalar antes en RPCS3, en orden: juego, actualizacion 1.02, pack de coches')
     ap.add_argument('--juego', help='carpeta del juego extraido de los .pkg (p. ej. con PyKG): NPEB00060 con USRDIR dentro')
     ap.add_argument('--rap', nargs='*', default=[], help='licencias .rap del juego (y del pack de coches); se copian a RPCS3 para descifrar')
@@ -138,10 +136,6 @@ def main():
         fail('el EBOOT.BIN no es el de %s con la actualizacion %s. Si has extraido los .pkg, extrae tambien la actualizacion encima del juego.' % (TITLE_ID, APP_VER))
     print('  ejecutable del juego: version %s correcta' % APP_VER)
     if not os.path.isdir(os.path.join(usrdir, 'data', 'cars', 'pack_modern_1')): print('  aviso: no veo el pack de coches (DLC); el juego funciona sin el')
-    pic = os.path.join(rp, 'dev_flash', 'sys', 'external', 'flashATRAC.pic')
-    if not os.path.exists(pic):
-        pic = None
-        print('  aviso: RPCS3 no tiene el firmware de PS3 instalado (flashATRAC.pic): el juego no tendra musica')
     tc = a.toolchain or os.path.join(ROOT, 'toolchain')
     if not os.path.isdir(os.path.join(tc, 'bin')): tc = os.path.join(os.path.expanduser('~'), '.local', 'share', 'retcomm', 'toolchains', 'cmake-clang-v1', 'latest')
     if not os.path.exists(os.path.join(tc, 'bin', 'clang++.exe')): fail('no encuentro el compilador (carpeta toolchain/ o --toolchain). Mira LEEME_INSTALADOR.md')
@@ -176,9 +170,6 @@ def main():
 
     step(5, 'Traduciendo los programas de sonido y geometria')
     specs = list(SPU_SPECS)
-    if pic:
-        run([py, os.path.join('tools', 'atrac_image.py'), pic, os.path.join(re_dir, 'spu_atrac_32980.bin')])
-        specs.append(ATRAC_SPEC)
     run([py, os.path.join('tools', 'spu2cpp.py'), os.path.join('re', 'EBOOT.elf'), os.path.join('src', 'recomp', 'spu_gen')] + specs, quiet=True)
 
     step(6, 'Compilando (varios minutos; usa %d hilos)' % a.jobs)
@@ -194,9 +185,6 @@ def main():
     os.makedirs(os.path.join(out, 'juego'), exist_ok=True)
     shutil.copyfile(os.path.join(build, 'recomp_boot.exe'), os.path.join(out, 'Racing Club+.exe'))
     shutil.copyfile(elf, os.path.join(out, 'juego', 'EBOOT.elf'))
-    if pic:
-        os.makedirs(os.path.join(out, 'dev_flash', 'sys', 'external'), exist_ok=True)
-        shutil.copyfile(pic, os.path.join(out, 'dev_flash', 'sys', 'external', 'flashATRAC.pic'))
     if not a.no_copy:
         print('  copiando los datos del juego...', flush=True)
         shutil.copytree(usrdir, os.path.join(out, 'juego', 'USRDIR'), dirs_exist_ok=True, ignore=shutil.ignore_patterns('EBOOT.BIN'))

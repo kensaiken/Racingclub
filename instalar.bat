@@ -8,7 +8,7 @@ echo.
 echo  Necesitas TU copia del juego instalada en RPCS3:
 echo    - version EUROPEA  NPEB00060  con la actualizacion 1.02
 echo    - (opcional) el pack de coches
-echo    - el firmware de PS3 instalado en RPCS3 (para la musica)
+echo  RPCS3 solo se usa para descifrar: no hace falta el firmware de PS3.
 echo  Otras regiones o versiones NO sirven.
 echo ==============================================================
 echo.

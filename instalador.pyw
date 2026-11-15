@@ -25,11 +25,11 @@ T = {
               'Sus ficheros .pkg (juego, actualización 1.02 y, si lo tienes, el pack de coches) y sus licencias .rap',
               'Die .pkg-Dateien (Spiel, Update 1.02 und, falls vorhanden, das Autopaket) und ihre .rap-Lizenzen',
               'I suoi file .pkg (gioco, aggiornamento 1.02 e, se ce l\'hai, il pacchetto auto) e le licenze .rap'],
- 'reqr':     ['RPCS3 (free): it decrypts your game, and for now it also provides the music (install the PS3 system software in it: File > Install Firmware)',
-              'RPCS3 (gratuit) : il déchiffre votre jeu et, pour l\'instant, fournit aussi la musique (installez-y le logiciel système PS3 : Fichier > Installer le firmware)',
-              'RPCS3 (gratis): descifra tu juego y, de momento, también aporta la música (instala en él el firmware de PS3: Archivo > Instalar firmware)',
-              'RPCS3 (kostenlos): entschlüsselt dein Spiel und liefert vorerst auch die Musik (PS3-Systemsoftware darin installieren: Datei > Firmware installieren)',
-              'RPCS3 (gratuito): decifra il tuo gioco e, per ora, fornisce anche la musica (installa il software di sistema PS3: File > Installa firmware)'],
+ 'reqr':     ['RPCS3 (free): it is only used to decrypt your game. No PS3 system software is needed (the music decoder is built in)',
+              'RPCS3 (gratuit) : il sert uniquement à déchiffrer votre jeu. Le logiciel système PS3 n\'est pas nécessaire (décodeur de musique intégré)',
+              'RPCS3 (gratis): solo se usa para descifrar tu juego. No hace falta el firmware de PS3 (el decodificador de música va integrado)',
+              'RPCS3 (kostenlos): wird nur zum Entschlüsseln deines Spiels benutzt. Keine PS3-Systemsoftware nötig (Musikdecoder integriert)',
+              'RPCS3 (gratuito): serve solo a decifrare il tuo gioco. Il software di sistema PS3 non serve (decoder musicale integrato)'],
  'dl':       ['Download RPCS3', 'Télécharger RPCS3', 'Descargar RPCS3', 'RPCS3 herunterladen', 'Scarica RPCS3'],
  'src':      ['Your game', 'Votre jeu', 'Tu juego', 'Dein Spiel', 'Il tuo gioco'],
  'src0':     ['From the .pkg files', 'Depuis les fichiers .pkg', 'Desde los ficheros .pkg', 'Aus den .pkg-Dateien', 'Dai file .pkg'],
@@ -334,9 +334,8 @@ class App:
         if not os.path.exists(os.path.join(p, 'rpcs3.exe')):
             self.status_rpcs3.config(text='✗  ' + self.t('norpcs3'), fg=ERR)
             return False
-        if self.mode.get() == 0:   # the game comes from the .pkg files: RPCS3 only needs to be there (and its firmware, for the music)
-            fw = os.path.exists(os.path.join(p, 'dev_flash', 'sys', 'external', 'flashATRAC.pic'))
-            self.status_rpcs3.config(text='✓  ' + self.t('rpcs3ok') + ('' if fw else '\n⚠  ' + self.t('nofw')), fg=OK if fw else WARN, justify='left')
+        if self.mode.get() == 0:   # the game comes from the .pkg files: RPCS3 only needs to be there
+            self.status_rpcs3.config(text='✓  ' + self.t('rpcs3ok'), fg=OK, justify='left')
             if not (self.pkgs[0].get() and self.pkgs[1].get() and self.raps):
                 self.msg.config(text=self.t('needpkg'), fg=GREY)
                 return False
@@ -348,9 +347,6 @@ class App:
             return False
         ver = sfo_version(sfo)
         txt, col = '✓  ' + self.t('found') % ver, OK if ver == '01.02' else ERR
-        if not os.path.exists(os.path.join(p, 'dev_flash', 'sys', 'external', 'flashATRAC.pic')):
-            txt += '\n⚠  ' + self.t('nofw')
-            col = WARN if col == OK else col
         self.status_rpcs3.config(text=txt, fg=col, justify='left')
         return True
 
