@@ -1494,38 +1494,45 @@ uint32_t be32(uint32_t a) { uint32_t x; std::memcpy(&x, G->mem + a, 4); return _
 // new one; on the next call, the whole new frame. Returns r3 = {0 or 0x200, 2, 0x98, 0}.
 // Matches the module's output to +-1 in the 16-bit samples (FFmpeg-exact decoding; see NOTAS_NOCHE.md).
 struct AtracVoice {
-    atrac3::Decoder dec{2, 0x98};
-    float cur[2][1024] = {}, prevHalf[2][512] = {};
+    static constexpr int kMax = 6;
+    int nch = 0;
+    std::unique_ptr<atrac3::Decoder> dec;
+    float cur[kMax][1024] = {}, prevHalf[kMax][512] = {};
     int stage = 0;   // 0 start (next call asks for a frame), 1 a frame comes now, 2 second half
+    void reset(int channels) {
+        if (channels != nch || !dec) { nch = channels; dec = std::make_unique<atrac3::Decoder>(channels, 0x98); }
+        else dec->reset();
+        std::memset(cur, 0, sizeof cur); std::memset(prevHalf, 0, sizeof prevHalf); stage = 0;
+    }
 };
 std::map<uint32_t, std::unique_ptr<AtracVoice>> g_atracVoices;   // only the mixer task thread uses it
 std::atomic<uint64_t> g_atracFrames{0}, g_atracBad{0};
-// one call: the 2 x 1028 samples to write; returns the value for r3
-uint32_t atrac_compute(const uint8_t* frame, uint32_t key, uint32_t flags, int16_t (&s)[2][1028]) {
+// channels of a voice: second byte of its context flags (2 or 6; the frame holds that many 0x98-byte sound units)
+int atrac_channels(uint32_t flags) { const int n = int((flags >> 16) & 0xff); return n >= 1 && n <= AtracVoice::kMax ? n : 2; }
+// one call: the n x 1028 samples to write (n = channels of the voice); returns the value for r3
+uint32_t atrac_compute(const uint8_t* frame, uint32_t key, uint32_t flags, int16_t (&s)[AtracVoice::kMax][1028], int& n) {
     auto& slot = g_atracVoices[key];
     if (!slot) slot = std::make_unique<AtracVoice>();
     AtracVoice& v = *slot;
-    if ((flags >> 24) == 2) { v.dec.reset(); std::memset(v.cur, 0, sizeof v.cur); std::memset(v.prevHalf, 0, sizeof v.prevHalf); v.stage = 0; }
-    float win[2][1024];
+    n = atrac_channels(flags);
+    if ((flags >> 24) == 2 || v.nch != n) v.reset(n);
+    float win[AtracVoice::kMax][1024];
+    float* o[AtracVoice::kMax];
+    for (int c = 0; c < n; ++c) o[c] = v.cur[c];
     uint32_t ret;
     if (v.stage == 1) {
-        for (int c = 0; c < 2; ++c) std::memcpy(v.prevHalf[c], v.cur[c] + 512, sizeof v.prevHalf[c]);
-        if (frame) {
-            float* o[2] = {v.cur[0], v.cur[1]};
-            if (!v.dec.decode(frame, o)) ++g_atracBad;
-            ++g_atracFrames;
-        }
-        for (int c = 0; c < 2; ++c) { std::memcpy(win[c], v.prevHalf[c], 512 * 4); std::memcpy(win[c] + 512, v.cur[c], 512 * 4); }
+        for (int c = 0; c < n; ++c) std::memcpy(v.prevHalf[c], v.cur[c] + 512, sizeof v.prevHalf[c]);
+        if (frame) { if (!v.dec->decode(frame, o)) ++g_atracBad; ++g_atracFrames; }
+        for (int c = 0; c < n; ++c) { std::memcpy(win[c], v.prevHalf[c], 512 * 4); std::memcpy(win[c] + 512, v.cur[c], 512 * 4); }
         v.stage = 2; ret = 0;
     } else {
         if (v.stage == 0 && frame && (frame[0] >> 2) == 0x28) {   // start: the first frame primes the decoder; out goes
-            float* o[2] = {v.cur[0], v.cur[1]};                     // (silence) + the first half of that frame
-            if (!v.dec.decode(frame, o)) ++g_atracBad;
-            for (int c = 0; c < 2; ++c) { std::memset(win[c], 0, 512 * 4); std::memcpy(win[c] + 512, v.cur[c], 512 * 4); }
-        } else for (int c = 0; c < 2; ++c) std::memcpy(win[c], v.cur[c], 1024 * 4);
+            if (!v.dec->decode(frame, o)) ++g_atracBad;            // (silence) + the first half of that frame
+            for (int c = 0; c < n; ++c) { std::memset(win[c], 0, 512 * 4); std::memcpy(win[c] + 512, v.cur[c], 512 * 4); }
+        } else for (int c = 0; c < n; ++c) std::memcpy(win[c], v.cur[c], 1024 * 4);
         v.stage = 1; ret = 0x200;
     }
-    for (int c = 0; c < 2; ++c) {
+    for (int c = 0; c < n; ++c) {
         for (int i = 0; i < 1024; ++i) s[c][i] = int16_t(std::clamp(std::lrintf(win[c][i] * -32768.0f), -32768L, 32767L));
         for (int i = 0; i < 4; ++i)   // 16-bit wrap-around like the module (no clamping)
             s[c][1024 + i] = int16_t(uint16_t(int(s[c][1023]) + (i + 1) * (int(s[c][1023]) - int(s[c][1022]))));
@@ -1534,12 +1541,20 @@ uint32_t atrac_compute(const uint8_t* frame, uint32_t key, uint32_t flags, int16
 }
 bool atrac_decode_call(Spu& sp) {
     const uint32_t in = sp.r[3].w(0) & 0x3ffff, out = sp.r[4].w(0) & 0x3ffff, ctx = sp.r[7].w(0) & 0x3ffff;
-    int16_t s[2][1028];
-    const uint32_t ret = atrac_compute(in + 0x130 <= Spu::LS_SIZE ? sp.ls + in : nullptr, sp.lsw(ctx + 0x34), sp.lsw(ctx + 0x20), s);
-    for (int c = 0; c < 2; ++c) {
+    const uint32_t flags = sp.lsw(ctx + 0x20);
+    int16_t s[AtracVoice::kMax][1028];
+    int n = 0;
+    const uint32_t ret = atrac_compute(in + 0x98u * uint32_t(atrac_channels(flags)) <= Spu::LS_SIZE ? sp.ls + in : nullptr, sp.lsw(ctx + 0x34), flags, s, n);
+    for (int c = 0; c < n; ++c) {   // channel c at r4 + c * 0x1000
         uint32_t a = out + uint32_t(c) * 0x1000;
         if (a + 1028 * 2 > Spu::LS_SIZE) continue;
         for (int i = 0; i < 1028; ++i, a += 2) { sp.ls[a] = uint8_t(uint16_t(s[c][i]) >> 8); sp.ls[a + 1] = uint8_t(s[c][i]); }
+    }
+    if (const char* z = std::getenv("ATRACZERO")) {   // debug: clear (part of) the three buffers except our two outputs
+        const int m = std::atoi(z);
+        if (m & 1) std::memset(sp.ls + 0x12a00, 0, 0x8000);                       // r3 buffer (input + module scratch)
+        if (m & 2) { std::memset(sp.ls + 0x1b208, 0, 0x1ba00 - 0x1b208); std::memset(sp.ls + 0x1c208, 0, 0x22a00 - 0x1c208); }   // rest of r4
+        if (m & 4) std::memset(sp.ls + 0x22a00, 0, 0x8000);                       // r5 buffer
     }
     sp.r[3].sw(0, ret); sp.r[3].sw(1, 2); sp.r[3].sw(2, 0x98); sp.r[3].sw(3, 0);
     sp.pc = sp.r[0].w(0) & 0x3fffc;
@@ -1595,28 +1610,29 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
     if (std::getenv("ATRACCHECK")) {
         s.region3Lo = 0x32980; s.region3Hi = 0x32980 + 0x7d40;
         s.onRegion3 = [](Spu& sp, bool enter) {
-            static uint32_t out = 0, key = 0, phase = 0; static bool decoding = false; static uint8_t frame[0x130];
+            static uint32_t out = 0, key = 0, phase = 0; static bool decoding = false; static uint8_t frame[0x98 * AtracVoice::kMax];
             if (enter) {
                 decoding = sp.pc == 0x36c58;
                 static const bool noPut = std::getenv("ATRACNOPUT") != nullptr;   // debug: the module's writes to main memory are dropped
                 sp.dropPuts = noPut && decoding;
                 const uint32_t in = sp.r[3].w(0) & 0x3ffff;
                 out = sp.r[4].w(0) & 0x3ffff; key = sp.lsw((sp.r[7].w(0) & 0x3ffff) + 0x34); phase = sp.lsw((sp.r[9].w(0) & 0x3ffff) + 0x10);
-                if (in + 0x130 <= Spu::LS_SIZE) std::memcpy(frame, sp.ls + in, 0x130);
+                if (in + sizeof frame <= Spu::LS_SIZE) std::memcpy(frame, sp.ls + in, sizeof frame);
                 for (int i = 0; i < 32; ++i) g_chkCtx[i] = sp.lsw((sp.r[7].w(0) & 0x3ffff) + 4 * i);
                 g_chkRegs[0] = in; g_chkRegs[1] = out; g_chkRegs[2] = sp.r[5].w(0);
                 for (int r = 0; r < 128; ++r) for (int w = 0; w < 4; ++w) g_chkIn[r][w] = sp.r[r].w(w);
-                if (std::getenv("ATRACUNDO")) std::memcpy(g_chkLs.data(), sp.ls, Spu::LS_SIZE);
+                std::memcpy(g_chkLs.data(), sp.ls, Spu::LS_SIZE);
                 return false;
             }
             sp.dropPuts = false;
             if (!decoding) return false;
             decoding = false;
-            int16_t s[2][1028];
-            const uint32_t ourRet = atrac_compute(frame, key, g_chkCtx[8], s);
+            int16_t s[AtracVoice::kMax][1028];
+            int nch = 0;
+            const uint32_t ourRet = atrac_compute(frame, key, g_chkCtx[8], s, nch);
             if (sp.r[3].w(0) != ourRet) ++g_chkRet;
             uint64_t bad = 0, worst = 0;
-            for (int c = 0; c < 2; ++c)
+            for (int c = 0; c < nch; ++c)
                 for (int i = 0; i < 1028; ++i) {
                     const uint32_t a = (out + uint32_t(c) * 0x1000 + uint32_t(i) * 2) & (Spu::LS_SIZE - 2);
                     const int16_t sony = int16_t(uint16_t(sp.ls[a]) << 8 | sp.ls[a + 1]);
@@ -1650,10 +1666,38 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
                     LOG("%c", 10);
                 }
             }
+            {   // which 0x1000 blocks of the three buffers the module writes, for 2- and 6-channel voices
+                static int shown2 = 0, shown6 = 0;
+                const int chans = int((g_chkCtx[8] >> 16) & 0xff);
+                int& shown = chans == 6 ? shown6 : shown2;
+                static int dumped6 = 0;   // the local store before and after a few 6-channel calls -> atrac6_<n>_in/out.bin
+                if (chans == 6 && (g_chkCtx[8] >> 24) == 1 && dumped6 < 6) {
+                    char name[48];
+                    std::snprintf(name, sizeof name, "atrac6_%d_in.bin", dumped6);
+                    if (FILE* f = std::fopen(name, "wb")) { std::fwrite(g_chkLs.data(), 1, Spu::LS_SIZE, f); std::fclose(f); }
+                    std::snprintf(name, sizeof name, "atrac6_%d_out.bin", dumped6);
+                    if (FILE* f = std::fopen(name, "wb")) { std::fwrite(sp.ls, 1, Spu::LS_SIZE, f); std::fclose(f); }
+                    ++dumped6;
+                }
+                static int shownR5 = 0;
+                bool r5w = false;
+                for (uint32_t b = 0x1b208; b < 0x2aa00 && !r5w; ++b) if ((b < 0x1ba00 || b >= 0x1c208) && sp.ls[b] != g_chkLs[b]) r5w = true;
+                if (shown < 3 || (r5w && shownR5 < 10)) {
+                    ++shown; if (r5w) ++shownR5;
+                    LOG("[atrac] %d-ch voice %08x flags %08x ret %x writes outside the 2 outputs:", chans, key, g_chkCtx[8], sp.r[3].w(0));
+                    for (uint32_t b = 0x1b208; b < 0x2aa00;) {
+                        if ((b >= 0x1ba00 && b < 0x1c208) || sp.ls[b] == g_chkLs[b]) { ++b; continue; }
+                        uint32_t e = b; while (e < 0x2aa00 && (sp.ls[e] != g_chkLs[e] || (e + 8 < 0x2aa00 && std::memcmp(sp.ls + e, g_chkLs.data() + e, 8)))) ++e;
+                        LOG(" %05x-%05x", b, e); b = e;
+                    }
+                    const uint32_t a = 0x23a00;
+                    LOG(" | 23a00: %04x %04x %04x %04x%c", uint32_t(sp.ls[a]) << 8 | sp.ls[a + 1], uint32_t(sp.ls[a + 2]) << 8 | sp.ls[a + 3], uint32_t(sp.ls[a + 4]) << 8 | sp.ls[a + 5], uint32_t(sp.ls[a + 6]) << 8 | sp.ls[a + 7], 10);
+                }
+            }
             static int shownBig = 0;
             if (worst > 1000 && shownBig++ < 8) {
                 int at = 0, cc = 0, so = 0, us = 0;
-                for (int c = 0; c < 2; ++c)
+                for (int c = 0; c < nch; ++c)
                     for (int i = 0; i < 1028; ++i) {
                         const uint32_t a = (out + uint32_t(c) * 0x1000 + uint32_t(i) * 2) & (Spu::LS_SIZE - 2);
                         const int sv = int(int16_t(uint16_t(sp.ls[a]) << 8 | sp.ls[a + 1]));
@@ -1665,7 +1709,7 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
             static int shownDetail = 0;
             if (bad > 100 && (g_chkCtx[8] >> 24) == 2 && shownDetail++ < 2) {   // a start call that differs: both outputs, sampled
                 LOG("[atrac] start detail voice %08x:", key);
-                for (int c = 0; c < 2; ++c)
+                for (int c = 0; c < nch; ++c)
                     for (int i = 0; i < 1028; i += 64) {
                         const uint32_t a = (out + uint32_t(c) * 0x1000 + uint32_t(i) * 2) & (Spu::LS_SIZE - 2);
                         LOG(" c%d[%d] %d/%d", c, i, int(int16_t(uint16_t(sp.ls[a]) << 8 | sp.ls[a + 1])), int(s[c][i]));
@@ -1686,7 +1730,7 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
                 for (int r = 2; r < 128; ++r) if (r != 3) for (int w = 0; w < 4; ++w) sp.r[r].sw(w, g_chkIn[r][w]);
             static const bool overwrite = std::getenv("ATRACCHECK")[0] == '2';   // ATRACCHECK=2: then replace Sony's output by ours
             if (overwrite)
-                for (int c = 0; c < 2; ++c)
+                for (int c = 0; c < nch; ++c)
                     for (int i = 0; i < 1028; ++i) {
                         const uint32_t a = (out + uint32_t(c) * 0x1000 + uint32_t(i) * 2) & (Spu::LS_SIZE - 2);
                         sp.ls[a] = uint8_t(uint16_t(s[c][i]) >> 8); sp.ls[a + 1] = uint8_t(s[c][i]);
