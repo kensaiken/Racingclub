@@ -20,11 +20,34 @@ T = {
               'Tu copia de GTI Club+ Rally Côte d\'Azur, versión EUROPEA NPEB00060 con la actualización 1.02 (pack de coches opcional)',
               'Deine Kopie von GTI Club+ Rally Côte d\'Azur, EUROPÄISCHE Version NPEB00060 mit Update 1.02 (Autopaket optional)',
               'La tua copia di GTI Club+ Rally Côte d\'Azur, versione EUROPEA NPEB00060 con l\'aggiornamento 1.02 (pacchetto auto opzionale)'],
- 'req2':     ['Installed in RPCS3, together with the PS3 system software (needed for the music)',
-              'Installée dans RPCS3, avec le logiciel système PS3 (nécessaire pour la musique)',
-              'Instalada en RPCS3, junto con el firmware de PS3 (necesario para la música)',
-              'In RPCS3 installiert, zusammen mit der PS3-Systemsoftware (für die Musik nötig)',
-              'Installata in RPCS3, insieme al software di sistema PS3 (necessario per la musica)'],
+ 'req2':     ['Its .pkg files (game, update 1.02 and, if you have it, the car pack) and their .rap licences',
+              'Ses fichiers .pkg (jeu, mise à jour 1.02 et, si vous l\'avez, le pack de voitures) et leurs licences .rap',
+              'Sus ficheros .pkg (juego, actualización 1.02 y, si lo tienes, el pack de coches) y sus licencias .rap',
+              'Die .pkg-Dateien (Spiel, Update 1.02 und, falls vorhanden, das Autopaket) und ihre .rap-Lizenzen',
+              'I suoi file .pkg (gioco, aggiornamento 1.02 e, se ce l\'hai, il pacchetto auto) e le licenze .rap'],
+ 'reqr':     ['RPCS3 (free): it decrypts your game, and for now it also provides the music (install the PS3 system software in it: File > Install Firmware)',
+              'RPCS3 (gratuit) : il déchiffre votre jeu et, pour l\'instant, fournit aussi la musique (installez-y le logiciel système PS3 : Fichier > Installer le firmware)',
+              'RPCS3 (gratis): descifra tu juego y, de momento, también aporta la música (instala en él el firmware de PS3: Archivo > Instalar firmware)',
+              'RPCS3 (kostenlos): entschlüsselt dein Spiel und liefert vorerst auch die Musik (PS3-Systemsoftware darin installieren: Datei > Firmware installieren)',
+              'RPCS3 (gratuito): decifra il tuo gioco e, per ora, fornisce anche la musica (installa il software di sistema PS3: File > Installa firmware)'],
+ 'dl':       ['Download RPCS3', 'Télécharger RPCS3', 'Descargar RPCS3', 'RPCS3 herunterladen', 'Scarica RPCS3'],
+ 'src':      ['Your game', 'Votre jeu', 'Tu juego', 'Dein Spiel', 'Il tuo gioco'],
+ 'src0':     ['From the .pkg files', 'Depuis les fichiers .pkg', 'Desde los ficheros .pkg', 'Aus den .pkg-Dateien', 'Dai file .pkg'],
+ 'src1':     ['Already installed in RPCS3', 'Déjà installé dans RPCS3', 'Ya instalado en RPCS3', 'Schon in RPCS3 installiert', 'Già installato in RPCS3'],
+ 'pkg0':     ['Game (.pkg)', 'Jeu (.pkg)', 'Juego (.pkg)', 'Spiel (.pkg)', 'Gioco (.pkg)'],
+ 'pkg1':     ['Update 1.02 (.pkg)', 'Mise à jour 1.02 (.pkg)', 'Actualización 1.02 (.pkg)', 'Update 1.02 (.pkg)', 'Aggiornamento 1.02 (.pkg)'],
+ 'pkg2':     ['Car pack (.pkg, optional)', 'Pack voitures (.pkg, option)', 'Pack de coches (.pkg, opcional)', 'Autopaket (.pkg, optional)', 'Pacchetto auto (.pkg, opz.)'],
+ 'raps':     ['Licences (.rap)', 'Licences (.rap)', 'Licencias (.rap)', 'Lizenzen (.rap)', 'Licenze (.rap)'],
+ 'rapn':     ['%d selected', '%d sélectionnée(s)', '%d seleccionada(s)', '%d ausgewählt', '%d selezionate'],
+ 'rpcs3ok':  ['RPCS3 found', 'RPCS3 trouvé', 'RPCS3 encontrado', 'RPCS3 gefunden', 'RPCS3 trovato'],
+ 'pkghelp':  ['RPCS3 will open once per package and ask you to confirm: press “Install”. It closes by itself when it is done.',
+              'RPCS3 s\'ouvrira pour chaque paquet et demandera confirmation : appuyez sur « Install ». Il se ferme tout seul.',
+              'RPCS3 se abrirá con cada paquete y te pedirá confirmar: pulsa «Install». Se cierra solo al terminar.',
+              'RPCS3 öffnet sich für jedes Paket und fragt nach: „Install“ drücken. Es schließt sich danach von selbst.',
+              'RPCS3 si aprirà per ogni pacchetto e chiederà conferma: premi «Install». Si chiude da solo alla fine.'],
+ 'needpkg':  ['Choose the game and update .pkg files and the .rap licences', 'Choisissez les .pkg du jeu et de la mise à jour et les licences .rap',
+              'Elige los .pkg del juego y de la actualización y las licencias .rap', 'Wähle die .pkg von Spiel und Update und die .rap-Lizenzen',
+              'Scegli i .pkg del gioco e dell\'aggiornamento e le licenze .rap'],
  'req3':     ['Other regions or versions are not supported. No game file is included in this installer.',
               'Les autres régions ou versions ne sont pas prises en charge. Aucun fichier du jeu n\'est inclus.',
               'Otras regiones o versiones no sirven. Este instalador no incluye ningún fichero del juego.',
@@ -151,6 +174,9 @@ class App:
         st.map('TCheckbutton', background=[('active', BG)])
 
         self.rpcs3 = tk.StringVar(value=prefs.get('rpcs3', ''))
+        self.mode = tk.IntVar(value=prefs.get('mode', 0))   # 0 from the .pkg files, 1 game already installed in RPCS3
+        self.pkgs = [tk.StringVar(value=v) for v in (prefs.get('pkgs') or ['', '', ''])]
+        self.raps = list(prefs.get('raps', []))
         self.out = tk.StringVar(value=prefs.get('out', os.path.join(ROOT, 'Racing Club+')))
         self.glang = tk.IntVar(value=prefs.get('game_lang', self.li))
         self.copy = tk.BooleanVar(value=True)
@@ -170,14 +196,14 @@ class App:
         r = self.root
         pad = 28
         head = tk.Frame(r, bg=BG)
-        head.pack(fill='x', padx=pad, pady=(22, 10))
+        head.pack(fill='x', padx=pad, pady=(16, 8))
         logo = os.path.join(ROOT, 'assets', 'racing_club_logo.png')
         if os.path.exists(logo):
             self.logo = tk.PhotoImage(file=logo)
             tk.Label(head, image=self.logo, bg=BG).pack(side='left')
         title = tk.Frame(head, bg=BG)
         title.pack(side='left', padx=(18, 0), fill='y')
-        tk.Label(title, text='Racing Club+', font=('Arial Black', 30), fg=BLUE, bg=BG).pack(anchor='w', pady=(28, 0))
+        tk.Label(title, text='Racing Club+', font=('Arial Black', 26), fg=BLUE, bg=BG).pack(anchor='w', pady=(14, 0))
         tk.Label(title, text=self.t('sub'), font=('Segoe UI', 12), fg=GREY, bg=BG).pack(anchor='w')
         lf = tk.Frame(head, bg=BG)
         lf.pack(side='right', anchor='n', pady=(6, 0))
@@ -189,35 +215,58 @@ class App:
 
         # requirements card
         card = tk.Frame(r, bg=CARD, highlightbackground=LINE, highlightthickness=1)
-        card.pack(fill='x', padx=pad, pady=(4, 14))
-        tk.Label(card, text=self.t('req'), font=('Segoe UI Semibold', 11), fg=INK, bg=CARD).pack(anchor='w', padx=16, pady=(12, 4))
-        for k in ('req1', 'req2'):
+        card.pack(fill='x', padx=pad, pady=(2, 10))
+        tk.Label(card, text=self.t('req'), font=('Segoe UI Semibold', 11), fg=INK, bg=CARD).pack(anchor='w', padx=16, pady=(8, 2))
+        for k in ('req1', 'req2', 'reqr'):
             row = tk.Frame(card, bg=CARD)
             row.pack(fill='x', padx=16, pady=1)
             tk.Label(row, text='•', font=('Segoe UI', 10), fg=BLUE, bg=CARD).pack(side='left', anchor='n')
             tk.Label(row, text=self.t(k), font=('Segoe UI', 10), fg=INK, bg=CARD, justify='left', wraplength=600).pack(side='left', padx=(6, 0))
-        tk.Label(card, text=self.t('req3'), font=('Segoe UI', 9), fg=GREY, bg=CARD, justify='left', wraplength=620).pack(anchor='w', padx=16, pady=(6, 12))
+        foot = tk.Frame(card, bg=CARD)
+        foot.pack(fill='x', padx=16, pady=(4, 8))
+        tk.Label(foot, text=self.t('req3'), font=('Segoe UI', 9), fg=GREY, bg=CARD, justify='left', wraplength=470).pack(side='left')
+        link = tk.Label(foot, text=self.t('dl') + '  ↗', font=('Segoe UI Semibold', 10, 'underline'), fg=BLUE, bg=CARD, cursor='hand2')
+        link.pack(side='right')
+        link.bind('<Button-1>', lambda e: os.startfile('https://rpcs3.net/download'))
 
         # options
         tk.Label(r, text=self.t('opts'), font=('Segoe UI Semibold', 11), fg=INK, bg=BG).pack(anchor='w', padx=pad)
         grid = tk.Frame(r, bg=BG)
         grid.pack(fill='x', padx=pad, pady=(6, 0))
         grid.columnconfigure(1, weight=1)
-        self.path_row(grid, 0, 'rpcs3', self.rpcs3, self.pick_rpcs3)
+        tk.Label(grid, text=self.t('src'), font=('Segoe UI', 10), fg=INK, bg=BG).grid(row=0, column=0, sticky='w')
+        rb = tk.Frame(grid, bg=BG)
+        rb.grid(row=0, column=1, columnspan=2, sticky='w', padx=8)
+        for i, k in enumerate(('src0', 'src1')):
+            tk.Radiobutton(rb, text=self.t(k), variable=self.mode, value=i, command=self.rebuild, font=('Segoe UI', 10), bg=BG, fg=INK,
+                           activebackground=BG, selectcolor=BG, highlightthickness=0).pack(side='left', padx=(0, 16))
+        row = 1
+        self.rap_label = None
+        if self.mode.get() == 0:
+            for i in range(3):
+                self.path_row(grid, row, 'pkg%d' % i, self.pkgs[i], lambda i=i: self.pick_pkg(i), pady=3)
+                row += 1
+            tk.Label(grid, text=self.t('raps'), font=('Segoe UI', 10), fg=INK, bg=BG).grid(row=row, column=0, sticky='w')
+            self.rap_label = tk.Label(grid, text='', font=('Segoe UI', 10), fg=INK, bg=BG, anchor='w', width=40)
+            self.rap_label.grid(row=row, column=1, sticky='ew', padx=12)
+            self.button(grid, self.t('browse'), self.pick_raps, primary=False).grid(row=row, column=2, sticky='e', pady=3)
+            tk.Label(grid, text=self.t('pkghelp'), font=('Segoe UI', 9), fg=GREY, bg=BG, justify='left', wraplength=640).grid(row=row + 1, column=0, columnspan=3, sticky='w', pady=(2, 8))
+            row += 2
+        self.path_row(grid, row, 'rpcs3', self.rpcs3, self.pick_rpcs3, pady=3)
         self.status_rpcs3 = tk.Label(grid, text='', font=('Segoe UI', 9), bg=BG, anchor='w')
-        self.status_rpcs3.grid(row=1, column=1, columnspan=2, sticky='w', pady=(0, 6))
-        self.path_row(grid, 2, 'out', self.out, self.pick_out)
-        tk.Label(grid, text=self.t('glang'), font=('Segoe UI', 10), fg=INK, bg=BG).grid(row=3, column=0, sticky='w', pady=(10, 0))
+        self.status_rpcs3.grid(row=row + 1, column=1, columnspan=2, sticky='w', pady=(0, 4))
+        self.path_row(grid, row + 2, 'out', self.out, self.pick_out, pady=3)
+        tk.Label(grid, text=self.t('glang'), font=('Segoe UI', 10), fg=INK, bg=BG).grid(row=row + 3, column=0, sticky='w', pady=(8, 0))
         gl = ttk.Combobox(grid, values=LANGS, state='readonly', width=14, font=('Segoe UI', 10))
         gl.current(self.glang.get())
         gl.bind('<<ComboboxSelected>>', lambda e: self.glang.set(gl.current()))
-        gl.grid(row=3, column=1, sticky='w', padx=(12, 0), pady=(10, 0))
-        ttk.Checkbutton(grid, text=self.t('copy'), variable=self.copy).grid(row=4, column=0, columnspan=3, sticky='w', pady=(12, 0))
-        ttk.Checkbutton(grid, text=self.t('lnk'), variable=self.lnk).grid(row=5, column=0, columnspan=3, sticky='w', pady=(4, 0))
+        gl.grid(row=row + 3, column=1, sticky='w', padx=(12, 0), pady=(8, 0))
+        ttk.Checkbutton(grid, text=self.t('copy'), variable=self.copy).grid(row=row + 4, column=0, columnspan=3, sticky='w', pady=(10, 0))
+        ttk.Checkbutton(grid, text=self.t('lnk'), variable=self.lnk).grid(row=row + 5, column=0, columnspan=3, sticky='w', pady=(2, 0))
 
         # progress
         prog = tk.Frame(r, bg=BG)
-        prog.pack(fill='x', padx=pad, pady=(18, 0))
+        prog.pack(fill='x', padx=pad, pady=(12, 0))
         self.bar = ttk.Progressbar(prog, style='Blue.Horizontal.TProgressbar', maximum=1000)
         self.bar.pack(fill='x')
         self.msg = tk.Label(prog, text=self.t('ready'), font=('Segoe UI', 10), fg=GREY, bg=BG, anchor='w', justify='left', wraplength=640)
@@ -227,7 +276,7 @@ class App:
 
         # buttons
         bar = tk.Frame(r, bg=BG)
-        bar.pack(side='bottom', fill='x', padx=pad, pady=(14, 22))
+        bar.pack(side='bottom', fill='x', padx=pad, pady=(10, 16))
         self.btn_details = self.button(bar, self.t('details'), self.toggle_log, primary=False)
         self.btn_details.pack(side='left')
         self.btn_quit = self.button(bar, self.t('quit'), self.close, primary=False)
@@ -236,22 +285,35 @@ class App:
         self.btn_go.pack(side='right', padx=(0, 10))
 
     def button(self, parent, text, cmd, primary):
-        b = tk.Button(parent, text=text, command=cmd, font=('Segoe UI Semibold', 10), relief='flat', bd=0, cursor='hand2', padx=22, pady=8,
+        b = tk.Button(parent, text=text, command=cmd, font=('Segoe UI Semibold', 10), relief='flat', bd=0, cursor='hand2', padx=20, pady=6,
                       bg=BLUE if primary else CARD, fg='white' if primary else INK,
                       activebackground=BLUE_DARK if primary else LINE, activeforeground='white' if primary else INK)
         return b
 
-    def path_row(self, grid, row, key, var, cmd):
+    def path_row(self, grid, row, key, var, cmd, pady=0):
         tk.Label(grid, text=self.t(key), font=('Segoe UI', 10), fg=INK, bg=BG).grid(row=row, column=0, sticky='w')
         e = tk.Entry(grid, textvariable=var, font=('Segoe UI', 10), relief='flat', bg=BG, fg=INK, highlightbackground=LINE, highlightcolor=BLUE, highlightthickness=1)
-        e.grid(row=row, column=1, sticky='ew', padx=12, ipady=5)
-        self.button(grid, self.t('browse'), cmd, primary=False).grid(row=row, column=2, sticky='e')
+        e.grid(row=row, column=1, sticky='ew', padx=12, ipady=3)
+        self.button(grid, self.t('browse'), cmd, primary=False).grid(row=row, column=2, sticky='e', pady=pady)
 
     def set_lang(self, i):
         self.li = i
+        self.rebuild()
+
+    def rebuild(self):
         self.save()
         self.build()
         self.check()
+
+    def pick_pkg(self, i):
+        f = filedialog.askopenfilename(title=self.t('pkg%d' % i), filetypes=[('PS3 .pkg', '*.pkg'), ('*', '*.*')],
+                                       initialdir=os.path.dirname(self.pkgs[i].get()) or None)
+        if f: self.pkgs[i].set(os.path.normpath(f)); self.check()
+
+    def pick_raps(self):
+        fs = filedialog.askopenfilenames(title=self.t('raps'), filetypes=[('PS3 .rap', '*.rap'), ('*', '*.*')],
+                                         initialdir=os.path.dirname(self.raps[0]) if self.raps else (os.path.dirname(self.pkgs[0].get()) or None))
+        if fs: self.raps = [os.path.normpath(f) for f in fs]; self.check()
 
     def toggle_log(self):
         self.log_shown = not self.log_shown
@@ -263,6 +325,8 @@ class App:
 
     # ---------------------------------------------------------------- checks
     def check(self):
+        if self.rap_label is not None:
+            self.rap_label.config(text=self.t('rapn') % len(self.raps) + ('   ' + ', '.join(os.path.basename(x)[-16:] for x in self.raps[:2]) if self.raps else ''))
         p = self.rpcs3.get().strip().strip('"')
         if not p:
             self.status_rpcs3.config(text='')
@@ -270,6 +334,14 @@ class App:
         if not os.path.exists(os.path.join(p, 'rpcs3.exe')):
             self.status_rpcs3.config(text='✗  ' + self.t('norpcs3'), fg=ERR)
             return False
+        if self.mode.get() == 0:   # the game comes from the .pkg files: RPCS3 only needs to be there (and its firmware, for the music)
+            fw = os.path.exists(os.path.join(p, 'dev_flash', 'sys', 'external', 'flashATRAC.pic'))
+            self.status_rpcs3.config(text='✓  ' + self.t('rpcs3ok') + ('' if fw else '\n⚠  ' + self.t('nofw')), fg=OK if fw else WARN, justify='left')
+            if not (self.pkgs[0].get() and self.pkgs[1].get() and self.raps):
+                self.msg.config(text=self.t('needpkg'), fg=GREY)
+                return False
+            self.msg.config(text=self.t('ready'), fg=GREY)
+            return True
         sfo = os.path.join(p, 'dev_hdd0', 'game', 'NPEB00060', 'PARAM.SFO')
         if not os.path.exists(sfo):
             self.status_rpcs3.config(text='✗  ' + self.t('nogame'), fg=ERR)
@@ -291,7 +363,8 @@ class App:
         if d: self.out.set(os.path.join(os.path.normpath(d), 'Racing Club+') if os.path.basename(d) != 'Racing Club+' else os.path.normpath(d))
 
     def save(self):
-        save_prefs({'lang': self.li, 'rpcs3': self.rpcs3.get(), 'out': self.out.get(), 'game_lang': self.glang.get(), 'shortcut': self.lnk.get()})
+        save_prefs({'lang': self.li, 'rpcs3': self.rpcs3.get(), 'out': self.out.get(), 'game_lang': self.glang.get(), 'shortcut': self.lnk.get(),
+                    'mode': self.mode.get(), 'pkgs': [v.get() for v in self.pkgs], 'raps': self.raps})
 
     # ---------------------------------------------------------------- run
     def log(self, line):
@@ -323,6 +396,8 @@ class App:
             self.q.put(('log', r.stdout + r.stderr))
         cmd = [py, '-u', os.path.join(ROOT, 'instalar.py'), '--rpcs3', self.rpcs3.get().strip().strip('"'), '--out', self.out.get(), '--idioma', str(self.glang.get() + 1)]
         if not self.copy.get(): cmd.append('--no-copy')
+        if self.mode.get() == 0:
+            cmd += ['--pkg'] + [v.get().strip().strip('"') for v in self.pkgs if v.get().strip()] + ['--rap'] + self.raps
         self.proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=flags, text=True, encoding='utf-8', errors='replace')
         for line in self.proc.stdout: self.q.put(('line', line.rstrip()))
         rc = self.proc.wait()
