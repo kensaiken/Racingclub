@@ -1757,7 +1757,7 @@ static void set_display_mode(int mode) {
 // ------------------------------------------------------------------ options menu (F1)
 static bool menuOpen = std::getenv("MENUTEST") != nullptr, menuDirty = true;   // MENUTEST=1 (debug): open from the start
 static int menuSel = 1;
-static const int kMenuLines = 16, kMenuFirst = 1, kMenuLast = 13;   // title, 12 options, "apply" (restarts the game), 2 notes
+static const int kMenuLines = 17, kMenuFirst = 1, kMenuLast = 14;   // title, 12 options, "apply" (restarts the game), "quit", 2 notes
 static void menu_change(int dir) {
     Settings& s = settings();
     switch (menuSel) {
@@ -1772,7 +1772,8 @@ static void menu_change(int dir) {
         case 9: s.aniso = std::clamp(s.aniso + (dir ? dir : 1), 0, 4); ++g_texGen; break;
         case 10: s.streaming ^= 1; break;
         case 11: s.fxaa ^= 1; break;
-        case 13: if (dir >= 0) { settings_save(); host_restart(); } break;   // the options marked * are read once at start
+        case 13: if (dir >= 0) { settings_save(); host_restart(); } break;
+        case 14: if (dir >= 0) { settings_save(); SDL_Event q{}; q.type = SDL_EVENT_QUIT; SDL_PushEvent(&q); } break;   // same as closing the window   // the options marked * are read once at start
         case 12: s.sharpen = (s.sharpen + (dir ? dir : 1) + 4) % 4; break;   // the texture cache keeps sampler state: rebuild it
     }
     menuDirty = true;
@@ -1814,8 +1815,9 @@ static void draw_menu(int ww, int wh) {
             std::swprintf(l[12], 96, L"Nitidez\t‹ %ls ›", sh[std::clamp(s.sharpen, 0, 3)]);
         }
         std::swprintf(l[13], 96, L"Aplicar cambios\t‹ Reiniciar el juego ›");
-        std::swprintf(l[14], 96, L"* se aplica al reiniciar el juego (Aplicar cambios + Intro)");
-        std::swprintf(l[15], 96, L"Flechas: elegir y cambiar   ·   F1 o Esc: cerrar   ·   F11: ventana / pantalla completa");
+        std::swprintf(l[14], 96, L"Salir del juego\t‹ Salir ›");
+        std::swprintf(l[15], 96, L"* se aplica al reiniciar el juego (Aplicar cambios + Intro)");
+        std::swprintf(l[16], 96, L"Teclado: flechas, Intro, F1 o Esc   ·   Mando: panel táctil o botón PS, cruceta, cruz, círculo");
         const wchar_t* lines[kMenuLines];
         for (int i = 0; i < kMenuLines; ++i) lines[i] = l[i];
         static std::vector<uint32_t> px;
@@ -1834,11 +1836,20 @@ static void draw_menu(int ww, int wh) {
 }
 
 static SDL_Gamepad* pad = nullptr;
+static bool padHold = false;   // the menu was closed with the controller: the game sees no buttons until they are released
 static void pump_events() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) quitFlag = true;
         if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad) pad = SDL_OpenGamepad(e.gdevice.which);
+        if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {   // the menu with the controller: touchpad click or PS button opens and closes it
+            const int b = e.gbutton.button;
+            if (b == SDL_GAMEPAD_BUTTON_TOUCHPAD || b == SDL_GAMEPAD_BUTTON_GUIDE || (menuOpen && b == SDL_GAMEPAD_BUTTON_EAST)) { menuOpen = !menuOpen; menuDirty = true; if (!menuOpen) { settings_save(); padHold = true; } }
+            else if (menuOpen && b == SDL_GAMEPAD_BUTTON_DPAD_UP) { menuSel = menuSel > kMenuFirst ? menuSel - 1 : kMenuLast; menuDirty = true; }
+            else if (menuOpen && b == SDL_GAMEPAD_BUTTON_DPAD_DOWN) { menuSel = menuSel < kMenuLast ? menuSel + 1 : kMenuFirst; menuDirty = true; }
+            else if (menuOpen && b == SDL_GAMEPAD_BUTTON_DPAD_LEFT) menu_change(-1);
+            else if (menuOpen && (b == SDL_GAMEPAD_BUTTON_DPAD_RIGHT || b == SDL_GAMEPAD_BUTTON_SOUTH)) menu_change(1);
+        }
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
             const SDL_Scancode sc = e.key.scancode;
             if (sc == SDL_SCANCODE_F11 || (sc == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT))) { Settings& st = settings(); if (st.fullscreen) { g_lastFull = st.fullscreen; st.fullscreen = 0; } else st.fullscreen = g_lastFull; set_display_mode(st.fullscreen); menuDirty = true; settings_save(); }
@@ -1860,6 +1871,10 @@ static void pump_events() {
         }
     }
     if (menuOpen) { lv2_set_pad(PadState{}); return; }   // the game sees no input while the menu is open
+    if (padHold) {
+        if (pad && (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_EAST) || SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_SOUTH))) { lv2_set_pad(PadState{}); return; }
+        padHold = false;
+    }
     // input -> DualShock 3 state
     PadState s;
     const bool* k = SDL_GetKeyboardState(nullptr);
