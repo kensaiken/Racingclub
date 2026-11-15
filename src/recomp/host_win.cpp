@@ -116,6 +116,30 @@ void host_thread_priority_high() {
     static const bool cls = SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) != 0; (void)cls;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 }
+// The RSX thread is the one every image waits for. With a dozen busy threads on 8 cores Windows sometimes put it on
+// the second hardware thread of a core a geometry worker was using: it then ran a third slower for seconds on end
+// (the start grid stuck at ~95 images per second instead of 144, run after run at random). own = true keeps the
+// calling thread on the first physical core (logical CPUs 0 and 1); own = false keeps it off that core. Only on
+// machines with at least 12 logical CPUs. AFINIDAD=0: off.
+void host_thread_core(bool own) {
+    // Off unless AFINIDAD is set: measured, no placement beat the scheduler (the slow runs were the test window
+    // losing the focus, not the cores).
+    static const bool off = !std::getenv("AFINIDAD") || std::getenv("AFINIDAD")[0] == '0';
+    DWORD_PTR proc = 0, sys = 0;
+    if (off || !GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys)) return;
+    int n = 0;
+    for (DWORD_PTR m = proc; m; m >>= 1) n += int(m & 1);
+    if (n < 12 || (proc & 3) != 3) return;
+    // AFINIDAD=mode: 1 = own core is 0 (CPUs 0,1); 2 = own core is the last one; 3 = no pinning, only priority for the owner;
+    // 4 = owner on one logical CPU of the last core, the others off that whole core
+    static const int mode = std::getenv("AFINIDAD") ? std::atoi(std::getenv("AFINIDAD")) : 3;
+    int hi = 0; for (int k = 0; k < 64; ++k) if (proc >> k & 1) hi = k;
+    const DWORD_PTR last = DWORD_PTR(3) << (hi - 1);
+    if (mode == 1) SetThreadAffinityMask(GetCurrentThread(), own ? DWORD_PTR(3) : (proc & ~DWORD_PTR(3)));
+    else if (mode == 2) SetThreadAffinityMask(GetCurrentThread(), own ? last : (proc & ~last));
+    else if (mode == 4) SetThreadAffinityMask(GetCurrentThread(), own ? (DWORD_PTR(1) << (hi - 1)) : (proc & ~last));
+    if (own) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+}
 // Draws the options panel with GDI: n lines of "label<TAB>value" text (line 0 is the title, `sel` is highlighted,
 // lines without a tab are notes) into w x h top-down BGRA pixels.
 bool host_menu_bitmap(const wchar_t* const* lines, int n, int sel, int w, int h, uint32_t* out) {
@@ -161,6 +185,7 @@ void host_restore_refresh() {}
 bool host_wait_refresh() { return false; }
 bool host_menu_bitmap(const wchar_t* const*, int, int, int, int, uint32_t*) { return false; }
 void host_thread_priority_high() {}
+void host_thread_core(bool) {}
 void host_timer_init() {}
 }
 #endif

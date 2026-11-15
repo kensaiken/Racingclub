@@ -23,7 +23,7 @@
 #include <thread>
 #include <vector>
 
-namespace gti::recomp { void ripprof_register_thread(const char* name); void host_thread_priority_high(); void host_timer_init(); int host_display_hz(); bool host_set_refresh(int hz); void host_restore_refresh(); bool host_wait_refresh(); }   // ripprof.cpp, host_win.cpp   // ripprof.cpp
+namespace gti::recomp { void ripprof_register_thread(const char* name); void host_thread_priority_high(); void host_thread_core(bool own); void host_timer_init(); int host_display_hz(); bool host_set_refresh(int hz); void host_restore_refresh(); bool host_wait_refresh(); }   // ripprof.cpp, host_win.cpp   // ripprof.cpp
 namespace gti::recomp {
 
 extern uint64_t g_missLr;
@@ -262,6 +262,14 @@ long g_flStart = std::getenv("FRAMELOG") ? std::atol(std::getenv("FRAMELOG")) : 
 void fl(const char* tag, uint32_t v = 0);
 uint64_t g_frHoleUs = 0, g_frIdleUs = 0, g_frHoles = 0;   // FRAMELOG: time the FIFO waited at holes / for commands in this frame
 std::atomic<uint32_t> g_vblankTick{0};   // bumped (and waiters woken) after every vblank handler call
+// A frame whose commands end a moment after a vblank used to wait for the next one: at 144 Hz a frame that needed
+// 7.2 ms instead of 6.9 took 13.9, and a scene on the edge fell to 72-100 images per second. When the RSX reaches the
+// vblank wait within g_lateUs of a vblank that no frame used, that vblank still counts (its handler runs again now);
+// the image is shown at the next refresh as it would be anyway. VBLANKLATE=us (0 = off).
+std::atomic<uint64_t> g_lastVblankUs{0};
+std::atomic<bool> g_vblankFree{false};   // the last vblank found no frame waiting for it
+std::atomic<uint64_t> g_lateUsed{0};
+const uint64_t g_lateUs = std::getenv("VBLANKLATE") ? std::strtoull(std::getenv("VBLANKLATE"), nullptr, 10) : 2500;
 bool g_flipDue = false;
 uint64_t g_flipDueSince = 0;
 void call_guest(uint32_t opd, uint64_t arg);
@@ -325,6 +333,9 @@ void method(uint32_t m, uint32_t arg, uint32_t& semOff406e, uint32_t& semOff4097
             }
             if (semOff406e == 0x810) { fl("h", uint32_t(g_frHoleUs / 100)); fl("n", uint32_t(g_frHoles)); fl("i", uint32_t(g_frIdleUs / 100)); fl("S"); g_frHoleUs = g_frIdleUs = g_frHoles = 0; }
             if (semOff406e == 0x810) {   // waits for the vblank handler: woken by the vblank thread, not by polling
+                if (rd(labels + semOff406e) != arg && g_lateUs && g_vblankFree.exchange(false) && now_us() - g_lastVblankUs.load() < g_lateUs) {
+                    call_guest(vblankHandler, 1); ++g_lateUsed; fl("L");
+                }
                 for (;;) {
                     const uint32_t tick = g_vblankTick.load();
                     if (rd(labels + semOff406e) == arg || now_us() - ts > 2000000) break;
@@ -401,6 +412,7 @@ extern uint64_t g_profSem, g_profFlip, g_profClear;
 void fifo_thread() {
     t_tid = 0x01000200;
     ripprof_register_thread("fifo");
+    host_thread_core(true);
     static const bool prof = std::getenv("FIFOPROF") != nullptr;
     uint32_t semA = 0, semB = 0;
     std::vector<uint32_t> callStack;
@@ -602,7 +614,7 @@ void vblank_thread() {
             while (std::chrono::steady_clock::now() < next) std::this_thread::yield();
         }
         if (flipPending.load()) { ++flips; call_guest(flipHandler, 1); flipPending = false; }
-        { const uint32_t b = labels ? rd(labels + 0x810) : 0; call_guest(vblankHandler, 1); fl("V", b * 16 + (labels ? rd(labels + 0x810) : 0)); }
+        { const uint32_t b = labels ? rd(labels + 0x810) : 0; call_guest(vblankHandler, 1); const uint32_t a = labels ? rd(labels + 0x810) : 0; fl("V", b * 16 + a); g_vblankFree = b == a; g_lastVblankUs = now_us(); }
         ++g_vblankTick; g_vblankTick.notify_all();
         static int tick = 0;
         if (tick == 600 && ctx) {   // ~10 s: dump the command stream before the current GET (debug)
@@ -1282,6 +1294,7 @@ void worker(int idx) {
     if (idx == 0) std::thread(ring_watchdog).detach();
     t_spuNum = idx;
     { char nm[16]; std::snprintf(nm, sizeof nm, "spu%d", idx); ripprof_register_thread(nm); }
+    host_thread_core(false);
     for (;;) {
         JobDesc jd;
         {

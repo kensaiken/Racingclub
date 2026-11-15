@@ -1362,6 +1362,7 @@ static GLuint cached_stream(int a, uint32_t need) {
 // Per-draw vertex and index data go into one persistently mapped buffer used as a ring of 4 segments: a fence is
 // set when the writer leaves a segment and waited for before it comes back (several frames later), so no draw
 // pays for a buffer allocation in the driver (two glBufferData per draw before). RSXNORING=1: old path.
+static uint64_t pfRingWaits, pfRingWaitT;   // RSXPROF: ring fence waits
 static GLuint ringBuf = 0;
 static uint8_t* ringPtr = nullptr;
 static constexpr size_t kRingSeg = size_t(16) << 20, kRingSegs = 4;
@@ -1383,7 +1384,7 @@ static uint8_t* ring_alloc(size_t bytes, size_t align, size_t& off) {
     if (h + bytes > (ringSegNo + 1) * kRingSeg) {   // next segment: fence this one, wait until the GPU is done with the next
         ringFence[ringSegNo] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         ringSegNo = (ringSegNo + 1) % kRingSegs;
-        if (ringFence[ringSegNo]) { glClientWaitSync(ringFence[ringSegNo], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull); glDeleteSync(ringFence[ringSegNo]); ringFence[ringSegNo] = nullptr; }
+        if (ringFence[ringSegNo]) { const uint64_t tw = SDL_GetPerformanceCounter(); glClientWaitSync(ringFence[ringSegNo], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull); glDeleteSync(ringFence[ringSegNo]); ringFence[ringSegNo] = nullptr; ++pfRingWaits; pfRingWaitT += SDL_GetPerformanceCounter() - tw; }
         h = ringSegNo * kRingSeg;
     }
     ringHead = h + bytes;
@@ -1393,6 +1394,7 @@ static uint8_t* ring_alloc(size_t bytes, size_t align, size_t& off) {
 
 // RSXPROF=1: time inside do_draw by stage (ms per second) and totals per second
 static uint64_t pfT[6], pfDraws, pfVerts, pfIdx, pfLast;
+static uint64_t pfSub[4];   // RSXPROF: attribute setup, index copy, draw call, (spare)
 static const char* const pfName[6] = {"target+program", "state+uniforms", "textures", "indices", "vertex conversion", "upload+draw"};
 static void do_draw() {
     if (ranges.empty() || !glOk) return;
@@ -1598,6 +1600,8 @@ static void do_draw() {
         if (frameNo % 100 == 0 && drawsThisFrame == 1) RLOG("[vstat] local: %llu/%llu draws bad; main: %llu/%llu draws bad\n", (unsigned long long)badDraws[0], (unsigned long long)draws[0], (unsigned long long)badDraws[1], (unsigned long long)draws[1]);
     }
     mark();
+    uint64_t ps = prof ? SDL_GetPerformanceCounter() : 0;
+    const auto sub = [&](int k) { if (prof) { const uint64_t n = SDL_GetPerformanceCounter(); pfSub[k] += n - ps; ps = n; } };
     glBindVertexArray(vao);
     const GLuint vBuf = inRing ? ringBuf : vbo;
     glBindBuffer(GL_ARRAY_BUFFER, vBuf);
@@ -1616,15 +1620,23 @@ static void do_draw() {
         for (uint32_t i = 0; i < nv; ++i) vmap[uniq[i] - vmin] = i;
         for (uint32_t& v : idx) if (v != 0xffffffffu) v = vmap[v - vmin];
     }
+    sub(0);
     size_t iOff = 0;
     if (uint8_t* ip = ring_alloc(idx.size() * 4, 4, iOff)) { std::memcpy(ip, idx.data(), idx.size() * 4); glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ringBuf); }
     else { iOff = 0; glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo); glBufferData(GL_ELEMENT_ARRAY_BUFFER, idx.size() * 4, idx.data(), GL_STREAM_DRAW); }
+    sub(1);
     // not sparse: the buffers start at vertex vmin, the base vertex takes it off the indices (restart is tested before it)
     glDrawElementsBaseVertex(gl_prim(prim), GLsizei(idx.size()), GL_UNSIGNED_INT, reinterpret_cast<const void*>(iOff), sparse ? 0 : -GLint(vmin));
+    sub(2);
     mark();
     if (prof) {
         ++pfDraws; pfVerts += nv; pfIdx += idx.size();
         const uint64_t now = SDL_GetTicks();
+        if (now - pfLast >= 4000) {
+            const double k2 = 1000.0 / double(SDL_GetPerformanceFrequency()) / ((now - pfLast) / 1000.0);
+            RLOG("[rsxprof] upload+draw ms/s: attributes %.0f, index copy %.0f, draw call %.0f; ring fence waits %llu (%.0f ms/s)\n", pfSub[0] * k2, pfSub[1] * k2, pfSub[2] * k2, (unsigned long long)pfRingWaits, pfRingWaitT * k2);
+            pfSub[0] = pfSub[1] = pfSub[2] = 0; pfRingWaits = pfRingWaitT = 0;
+        }
         if (now - pfLast >= 4000) {
             const double k = 1000.0 / double(SDL_GetPerformanceFrequency()) / ((now - pfLast) / 1000.0);
             std::string o; char b[64];
@@ -2158,10 +2170,27 @@ void method_block(uint32_t m0, const uint8_t* args, uint32_t count, bool noInc) 
     // plain register writes (most of a draw's state) go straight to R; only the methods with side effects take the
     // full path. This loop runs for every word of the command stream.
     if (!glOk || !enabled() || rsxTrace) { for (uint32_t i = 0; i < count; ++i) { uint32_t w; std::memcpy(&w, args + 4 * i, 4); method(noInc ? m0 : m0 + 4 * i, __builtin_bswap32(w)); } return; }
+    // methods with side effects, as a prefix count: a packet without any is one byte-swapping copy into R
+    struct Special {
+        uint16_t before[0x4001];   // number of special methods below index i
+        bool is(uint32_t i) const { return before[i + 1] != before[i]; }
+        Special() {
+            uint16_t n = 0;
+            for (uint32_t i = 0; i < 0x4000; ++i) {
+                before[i] = n;
+                const uint32_t m = i * 4;
+                if ((m >= 0x0b80 && m < 0x0c00) || (m >= 0x1f00 && m < 0x1f80) || m == 0x1e9c || m == 0x1efc || m == 0x1808 || m == 0x1814 || m == 0x1824 || m == 0x1d94) ++n;
+            }
+            before[0x4000] = n;
+        }
+    };
+    static const Special sp;
+    const uint32_t i0 = m0 >> 2;
+    if (!noInc && i0 + count <= 0x4000 && sp.before[i0 + count] == sp.before[i0]) { bswap32_block(R + i0, args, count); return; }
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t w; std::memcpy(&w, args + 4 * i, 4); w = __builtin_bswap32(w);
         const uint32_t m = noInc ? m0 : m0 + 4 * i;
-        if ((m >= 0x0b80 && m < 0x0c00) || (m >= 0x1f00 && m < 0x1f80) || m == 0x1e9c || m == 0x1efc || m == 0x1808 || m == 0x1814 || m == 0x1824 || m == 0x1d94 || m >= 0x10000) method(m, w);
+        if (m >= 0x10000 || sp.is(m >> 2)) method(m, w);
         else R[m >> 2] = w;
     }
 }
