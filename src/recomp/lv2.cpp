@@ -940,7 +940,11 @@ uint32_t op(PPU& c, bool isSave) {
 namespace jobs {
 constexpr uint32_t LS_STUB = 0x100, LS_CTX = 0x2c00, LS_JOB = 0x2d00, LS_BIN = 0x3000, LS_STACK = 0x3fff0;
 constexpr uint32_t EVENTFLAG_JOB = 0xbad880;   // job binary that sets a SPURS event flag (done on the host)
-const int g_workers = std::getenv("SPUS") ? std::max(1, std::atoi(std::getenv("SPUS"))) : 8;   // host threads running jobs. The game only describes Edge output buffers for SPUs 0-2; run_job creates those of workers 3-5 (more than 6 have none and would drop their geometry)
+// Default by processor size: the game keeps ~6 other host threads busy (main, render, FIFO, job manager, sound,
+// streams), so the workers get what is left: 8 with 16 hardware threads, 6 with 12, 3 at least. More workers than
+// free hardware threads only add wake-up and contention costs (measured: each extra worker adds CPU use).
+const int g_workers = std::getenv("SPUS") ? std::max(1, std::atoi(std::getenv("SPUS")))
+                                          : std::clamp(int(std::thread::hardware_concurrency()) - 6, 3, 8);   // host threads running jobs. The game only describes Edge output buffers for SPUs 0-2; run_job creates those of workers 3-5 (more than 6 have none and would drop their geometry)
 
 uint32_t list = 0;
 std::thread th;
@@ -2485,6 +2489,7 @@ bool imports(PPU& c, const char* module, const char* name) {
     // --- SPURS: the Edge Zlib inflate task is done on the host (same result as the SPU task), event flags polled
     if (n == "_cellSpursJobChainAttributeInitialize") {   // (attr, jmRev, sdkRev, u64* jobChainEntry, sizeJobDescriptor, maxGrabbedJob, prio*, maxContention, ...)
         g_jobChainEntry = a32(c, 3);
+        LOG("[spurs] %d SPU worker threads (%u hardware threads)\n", jobs::g_workers, std::thread::hardware_concurrency());
         LOG("[spurs] job chain attribute: command list 0x%x, job descriptor size %u, max grabbed %u, max contention %u (lr %llx)\n",
             g_jobChainEntry, a32(c, 4), a32(c, 5), a32(c, 7), (unsigned long long)c.lr);
         ret(c, CELL_OK); return true;

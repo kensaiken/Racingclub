@@ -79,6 +79,7 @@ enum : GLenum {
     X(void, glBufferData, GLenum, GLsizeiptr, const void*, GLenum) X(void, glBufferSubData, GLenum, GLintptr, GLsizeiptr, const void*) \
     X(void, glBufferStorage, GLenum, GLsizeiptr, const void*, GLbitfield) X(void*, glMapBufferRange, GLenum, GLintptr, GLsizeiptr, GLbitfield) \
     X(GLsync, glFenceSync, GLenum, GLbitfield) X(GLenum, glClientWaitSync, GLsync, GLbitfield, GLuint64) X(void, glDeleteSync, GLsync) X(void, glBindBufferBase, GLenum, GLuint, GLuint) \
+    X(void, glBindBufferRange, GLenum, GLuint, GLuint, GLintptr, GLsizeiptr) \
     X(void, glGenVertexArrays, GLsizei, GLuint*) X(void, glBindVertexArray, GLuint) \
     X(void, glVertexAttribPointer, GLuint, GLint, GLenum, GLboolean, GLsizei, const void*) X(void, glEnableVertexAttribArray, GLuint) \
     X(void, glDisableVertexAttribArray, GLuint) X(void, glVertexAttrib4f, GLuint, GLfloat, GLfloat, GLfloat, GLfloat) \
@@ -1413,6 +1414,7 @@ static GLuint ringBuf = 0;
 static uint8_t* ringPtr = nullptr;
 static constexpr size_t kRingSeg = size_t(16) << 20, kRingSegs = 4;
 static size_t ringHead = 0, ringSegNo = 0;
+static uint64_t ringSegSerial = 0;   // +1 every segment change: data older than 3 changes may be overwritten
 static GLsync ringFence[kRingSegs] = {};
 static void ring_init() {
     if (std::getenv("RSXNORING") || !glBufferStorage || !glMapBufferRange || !glFenceSync) return;
@@ -1429,7 +1431,7 @@ static uint8_t* ring_alloc(size_t bytes, size_t align, size_t& off) {
     size_t h = (ringHead + align - 1) & ~(align - 1);
     if (h + bytes > (ringSegNo + 1) * kRingSeg) {   // next segment: fence this one, wait until the GPU is done with the next
         ringFence[ringSegNo] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-        ringSegNo = (ringSegNo + 1) % kRingSegs;
+        ringSegNo = (ringSegNo + 1) % kRingSegs; ++ringSegSerial;
         if (ringFence[ringSegNo]) { const uint64_t tw = SDL_GetPerformanceCounter(); glClientWaitSync(ringFence[ringSegNo], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull); glDeleteSync(ringFence[ringSegNo]); ringFence[ringSegNo] = nullptr; ++pfRingWaits; pfRingWaitT += SDL_GetPerformanceCounter() - tw; }
         h = ringSegNo * kRingSeg;
     }
@@ -1444,20 +1446,25 @@ static uint64_t pfSub[4];   // RSXPROF: attribute setup, index copy, draw call, 
 static const char* const pfName[6] = {"target+program", "state+uniforms", "textures", "indices", "vertex conversion", "upload+draw"};
 static void do_draw() {
     if (ranges.empty() || !glOk) return;
-    struct SlowDraw {   // a draw over 6 ms: what it had to build
-        uint64_t t0 = SDL_GetPerformanceCounter(), tu = g_texUploads, tb = g_texUploadBytes, sb = g_streamBuilds, sv = g_streamVerts, pb = g_progBuilds;
+    uint64_t stT[6] = {};   // this draw's time per stage (pfName), for [slowdraw]
+    struct SlowDraw {   // a draw over 6 ms: what it had to build and which stage took the time
+        const uint64_t* st;
+        uint64_t t0 = SDL_GetPerformanceCounter(), tu = g_texUploads, tb = g_texUploadBytes, sb = g_streamBuilds, sv = g_streamVerts, pb = g_progBuilds, rw = pfRingWaitT;
+        explicit SlowDraw(const uint64_t* s) : st(s) {}
         ~SlowDraw() {
             const uint64_t dt = SDL_GetPerformanceCounter() - t0;
             g_drawTicks += dt; ++g_drawCount;
-            const double ms = dt * 1000.0 / SDL_GetPerformanceFrequency();
-            if (ms > 6) RLOG("[slowdraw] %.0f ms: %llu textures uploaded (%llu KB), %llu vertex streams built (%llu vertices), %llu programs built\n", ms, (unsigned long long)(g_texUploads - tu),
-                             (unsigned long long)((g_texUploadBytes - tb) >> 10), (unsigned long long)(g_streamBuilds - sb), (unsigned long long)(g_streamVerts - sv), (unsigned long long)(g_progBuilds - pb));
+            const double k = 1000.0 / SDL_GetPerformanceFrequency(), ms = dt * k;
+            if (ms > 6) RLOG("[slowdraw] %.0f ms: %llu textures uploaded (%llu KB), %llu vertex streams built (%llu vertices), %llu programs built; "
+                             "program %.1f, state+constants %.1f, textures %.1f, indices %.1f, vertices %.1f, draw %.1f ms (ring wait %.1f)\n", ms, (unsigned long long)(g_texUploads - tu),
+                             (unsigned long long)((g_texUploadBytes - tb) >> 10), (unsigned long long)(g_streamBuilds - sb), (unsigned long long)(g_streamVerts - sv), (unsigned long long)(g_progBuilds - pb),
+                             st[0] * k, st[1] * k, st[2] * k, st[3] * k, st[4] * k, st[5] * k, (pfRingWaitT - rw) * k);
         }
-    } slowDraw;
+    } slowDraw(stT);
     static const bool prof = std::getenv("RSXPROF") != nullptr;
-    uint64_t pt = prof ? SDL_GetPerformanceCounter() : 0;
+    uint64_t pt = SDL_GetPerformanceCounter();
     int stage = 0;
-    auto mark = [&] { if (prof) { const uint64_t n = SDL_GetPerformanceCounter(); pfT[stage++] += n - pt; pt = n; } };
+    auto mark = [&] { const uint64_t n = SDL_GetPerformanceCounter(); if (stage < 6) { stT[stage] = n - pt; if (prof) pfT[stage] += n - pt; ++stage; } pt = n; };
     ++drawsThisFrame;
     {   // RSXSKIP=a-b: skip draws a..b of every frame (debug bisection)
         static long s0 = -1, s1 = -1;
@@ -1478,14 +1485,46 @@ static void do_draw() {
     glUseProgram(p->prog);
     apply_state();
     // vertex program constants
-    if (vpConstDirty) {   // only the constants written since the last draw (usually a matrix or two of the 468 registers)
+    // Default: a full copy of the constants goes into the persistent ring and is bound by range, so the driver
+    // never has to update a buffer the GPU may still be reading (glBufferSubData on a busy UBO stalls the AMD
+    // OpenGL driver until the GPU catches up). Only on AMD: on NVIDIA rebinding the range per draw costs ~2 us of
+    // driver time per draw (measured 3.2 -> 6.5 us/draw), while its glBufferSubData does not stall.
+    // RSXUBORING=1 / RSXUBOSUB=1 force the ring / the old path (dirty range into one UBO).
+    static const bool uboSub = [] {
+        if (!glBindBufferRange || std::getenv("RSXUBOSUB")) return true;
+        if (std::getenv("RSXUBORING")) return false;
+        const char* v = reinterpret_cast<const char*>(glGetString(0x1F00 /* GL_VENDOR */));
+        const char* r = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+        const bool amd = (v && (std::strstr(v, "ATI") || std::strstr(v, "AMD"))) || (r && (std::strstr(r, "AMD") || std::strstr(r, "Radeon")));
+        RLOG("[rsx] vertex constants: %s\n", amd ? "copied into the persistent ring (AMD)" : "updated in one buffer");
+        return !amd;
+    }();
+    static GLint uboAlign = 0;
+    static uint64_t uboSerial = ~0ull;   // ring segment serial when the bound copy was made
+    static bool uboInRing = false;
+    bool uboDone = false;
+    if (!uboSub && ringPtr) {
+        if (!uboAlign) { glGetIntegerv(0x8A34 /* GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT */, &uboAlign); if (uboAlign <= 0) uboAlign = 256; }
+        if (uboInRing && !vpConstDirty && ringSegSerial - uboSerial < kRingSegs - 1) uboDone = true;   // bound copy still valid
+        else {
+            size_t uOff = 0;
+            if (uint8_t* up = ring_alloc(sizeof vpConst, size_t(uboAlign), uOff)) {
+                std::memcpy(up, vpConst, sizeof vpConst);
+                glBindBufferRange(GL_UNIFORM_BUFFER, 0, ringBuf, GLintptr(uOff), GLsizeiptr(sizeof vpConst));
+                uboSerial = ringSegSerial; uboInRing = true; uboDone = true;
+                vpConstDirty = false; vpDirtyLo = 468 * 4; vpDirtyHi = 0;
+            }
+        }
+    }
+    if (!uboDone && uboInRing) { uboInRing = false; vpConstDirty = true; vpDirtyLo = 0; vpDirtyHi = 468 * 4; }   // back to the UBO: refresh it whole
+    if (!uboDone && vpConstDirty) {   // only the constants written since the last draw (usually a matrix or two of the 468 registers)
         static bool allocated = false;
         glBindBuffer(GL_UNIFORM_BUFFER, ubo);
         if (!allocated) { glBufferData(GL_UNIFORM_BUFFER, sizeof vpConst, vpConst, GL_DYNAMIC_DRAW); allocated = true; }
         else glBufferSubData(GL_UNIFORM_BUFFER, GLintptr(vpDirtyLo) * 4, GLsizeiptr(vpDirtyHi - vpDirtyLo) * 4, vpConst + vpDirtyLo);
         vpConstDirty = false; vpDirtyLo = 468 * 4; vpDirtyHi = 0;
     }
-    glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo);
+    if (!uboDone) glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo);
     float vs[4] = {rf(0xa30), rf(0xa34), rf(0xa38), rf(0xa3c)}, vo[4] = {rf(0xa20), rf(0xa24), rf(0xa28), rf(0xa2c)};
     glUniform4fv(p->uVs, 1, vs);
     glUniform4fv(p->uVo, 1, vo);
@@ -2259,10 +2298,10 @@ void flip(uint32_t id) {
         const uint64_t ts = SDL_GetTicksNS();
         SDL_GL_SwapWindow(win);
         g_swapUs += (SDL_GetTicksNS() - ts) / 1000;
-        // GPUTIME=1: when the GPU really finished each image, measured from the flip (GPU timestamp after the swap).
+        // [gpu]: when the GPU really finished each image, measured from the flip (GPU timestamp after the swap).
         // Past one refresh the image cannot be shown at the next refresh: the display repeats the previous one (a
         // visible skip) although the game produced every image on time.
-        static const bool gpuTime = std::getenv("GPUTIME") != nullptr;
+        static const bool gpuTime = !(std::getenv("GPUTIME") && std::getenv("GPUTIME")[0] == '0');   // on by default (problem reports); GPUTIME=0 off
         if (gpuTime && glQueryCounter && glGetQueryObjectui64v && glGetInteger64v) {
             struct Q { GLuint id; uint64_t cpuNs; };
             static std::deque<Q> pending; static std::vector<GLuint> freeQ;
