@@ -44,6 +44,9 @@ T = {
  'where':   ['Install to', 'Installer dans', 'Instalar en', 'Installieren nach', 'Installa in'],
  'change':  ['change', 'modifier', 'cambiar', 'ändern', 'cambia'],
  'details': ['details', 'détails', 'detalles', 'Details', 'dettagli'],
+ 'patreon': ['Support on Patreon', 'Soutenir sur Patreon', 'Apoyar en Patreon', 'Auf Patreon unterstützen', 'Sostieni su Patreon'],
+ 'twitch':  ['Twitch channel', 'Chaîne Twitch', 'Canal de Twitch', 'Twitch-Kanal', 'Canale Twitch'],
+ 'github':  ['GitHub repository', 'Dépôt GitHub', 'Repositorio GitHub', 'GitHub-Repository', 'Repository GitHub'],
  'licence': ['licence', 'licence', 'licencia', 'Lizenz', 'licenza'],
  'nolic':   ['the .rap licence is missing', 'il manque la licence .rap', 'falta la licencia .rap', 'die .rap-Lizenz fehlt', 'manca la licenza .rap'],
  'nopkg':   ['the .pkg is missing', 'il manque le .pkg', 'falta el .pkg', 'die .pkg fehlt', 'manca il .pkg'],
@@ -184,6 +187,16 @@ class App:
         self.where_lbl.pack(side='left')
         self.link(foot, self.t('change'), self.pick_out, hexrgb(BLUE_B)).pack(side='left', padx=(6, 0))
         self.link(foot, self.t('details'), self.toggle_log, GREY).pack(side='right')
+        social = tk.Frame(r, bg=WHITE)
+        social.pack(fill='x', padx=26, pady=(0, 12))
+        for i, (key, url, bg, act) in enumerate((
+                ('patreon', 'https://www.patreon.com/ilesraider/membership', '#FF424D', '#E03A44'),
+                ('twitch', 'https://www.twitch.tv/ilesraider', '#9146FF', '#7A35E0'),
+                ('github', 'https://github.com/kensaiken/Racingclub', '#24292F', '#3A4048'))):
+            social.columnconfigure(i, weight=1, uniform='s')
+            tk.Button(social, text=self.t(key), command=lambda u=url: os.startfile(u), font=('Segoe UI Semibold', 9),
+                      relief='flat', bd=0, cursor='hand2', pady=6, bg=bg, fg='white',
+                      activebackground=act, activeforeground='white').grid(row=0, column=i, sticky='ew', padx=(0 if i == 0 else 4, 0))
         self.logbox = tk.Text(r, height=8, font=('Consolas', 8), bg=SOFT, fg=INK, relief='flat', wrap='none')
         self.refresh()
 
