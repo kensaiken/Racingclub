@@ -621,7 +621,9 @@ void vblank_thread() {
             // VBLANKFASE=us: the game's vblank comes that long after the real refresh, so its image is presented in the
             // middle of the refresh interval instead of right at the moment the compositor (DWM, windowed / borderless)
             // picks the image up: one image a refresh at 120 Hz has no slack for a present landing on either side of it
-            {   static const long fase = std::getenv("VBLANKFASE") ? std::atol(std::getenv("VBLANKFASE")) : 0;
+            // Default: half a refresh when every refresh carries a new image (120 on 120 Hz, 144 on 144 Hz); with two or
+            // more refreshes per image (72 on 144 Hz) there is slack and nothing changes. VBLANKFASE=0 turns it off.
+            {   static const long fase = std::getenv("VBLANKFASE") ? std::atol(std::getenv("VBLANKFASE")) : (perVblank == 1 ? 500000 / g_gameHz : 0);
                 if (fase > 0 && perVblank) host_sleep_us(uint64_t(fase)); }
             const uint64_t t = now_us(), dt = t - lastTick;
             lastTick = t;
