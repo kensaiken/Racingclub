@@ -88,7 +88,9 @@ enum : GLenum {
     X(void, glProgramBinary, GLuint, GLenum, const void*, GLsizei) X(void, glGetProgramBinary, GLuint, GLsizei, GLsizei*, GLenum*, void*) \
     X(void, glAttachShader, GLuint, GLuint) X(void, glLinkProgram, GLuint) X(void, glGetProgramiv, GLuint, GLenum, GLint*) \
     X(void, glGetProgramInfoLog, GLuint, GLsizei, GLsizei*, GLchar*) X(void, glUseProgram, GLuint) X(GLint, glGetUniformLocation, GLuint, const GLchar*) \
-    X(void, glUniform4fv, GLint, GLsizei, const GLfloat*) X(void, glUniform1i, GLint, GLint) X(void, glDeleteShader, GLuint) X(GLenum, glGetError) X(void, glReadPixels, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*) X(void, glGetIntegerv, GLenum, GLint*) X(GLboolean, glIsEnabled, GLenum)
+    X(void, glUniform4fv, GLint, GLsizei, const GLfloat*) X(void, glUniform1i, GLint, GLint) X(void, glDeleteShader, GLuint) X(GLenum, glGetError) X(void, glReadPixels, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*) X(void, glGetIntegerv, GLenum, GLint*) X(GLboolean, glIsEnabled, GLenum) \
+    X(void, glGenQueries, GLsizei, GLuint*) X(void, glQueryCounter, GLuint, GLenum) X(void, glGetQueryObjectiv, GLuint, GLenum, GLint*) \
+    X(void, glGetQueryObjectui64v, GLuint, GLenum, uint64_t*) X(void, glGetInteger64v, GLenum, int64_t*)
 #define RSX_DECL(ret, name, ...) typedef ret (*PFN_##name)(__VA_ARGS__); static PFN_##name name = nullptr;
 RSX_GL(RSX_DECL)
 #undef RSX_DECL
@@ -2257,6 +2259,40 @@ void flip(uint32_t id) {
         const uint64_t ts = SDL_GetTicksNS();
         SDL_GL_SwapWindow(win);
         g_swapUs += (SDL_GetTicksNS() - ts) / 1000;
+        // GPUTIME=1: when the GPU really finished each image, measured from the flip (GPU timestamp after the swap).
+        // Past one refresh the image cannot be shown at the next refresh: the display repeats the previous one (a
+        // visible skip) although the game produced every image on time.
+        static const bool gpuTime = std::getenv("GPUTIME") != nullptr;
+        if (gpuTime && glQueryCounter && glGetQueryObjectui64v && glGetInteger64v) {
+            struct Q { GLuint id; uint64_t cpuNs; };
+            static std::deque<Q> pending; static std::vector<GLuint> freeQ;
+            static int64_t offNs = 0; static uint64_t calibAt = 0;
+            static uint64_t n = 0, over = 0, worst = 0, sum = 0, lastLog = 0;
+            const uint64_t nowNs = SDL_GetTicksNS();
+            if (!calibAt || nowNs - calibAt > 1000000000ull) {   // GPU clock -> CPU clock
+                int64_t g = 0; glGetInteger64v(0x8E28 /* GL_TIMESTAMP */, &g);
+                offNs = int64_t(SDL_GetTicksNS()) - g; calibAt = nowNs;
+            }
+            GLuint q;
+            if (freeQ.empty()) glGenQueries(1, &q); else { q = freeQ.back(); freeQ.pop_back(); }
+            glQueryCounter(q, 0x8E28);
+            pending.push_back({q, ts});
+            static const uint64_t periodNs = 1000000000ull / uint64_t(settings().gameHz > 0 ? settings().gameHz : 60);
+            while (!pending.empty()) {
+                GLint avail = 0; glGetQueryObjectiv(pending.front().id, 0x8867 /* RESULT_AVAILABLE */, &avail);
+                if (!avail) break;
+                uint64_t g = 0; glGetQueryObjectui64v(pending.front().id, 0x8866 /* RESULT */, &g);
+                const int64_t lat = int64_t(g) + offNs - int64_t(pending.front().cpuNs);
+                const uint64_t l = lat > 0 ? uint64_t(lat) : 0;
+                ++n; sum += l; worst = std::max(worst, l); if (l > periodNs) ++over;
+                freeQ.push_back(pending.front().id); pending.pop_front();
+            }
+            if (nowNs - lastLog > 2000000000ull && n) {
+                RLOG("[gpu] %.1f s: %llu images, GPU done %.2f ms after the flip on average, %.2f at worst, %llu past one refresh, %zu in flight\n",
+                     nowNs / 1e9, (unsigned long long)n, sum / 1e6 / n, worst / 1e6, (unsigned long long)over, pending.size());
+                n = over = worst = sum = 0; lastLog = nowNs;
+            }
+        }
         if (swapLog) { static uint64_t sum = 0, mx = 0, n = 0; const uint64_t d = SDL_GetTicksNS() - ts; sum += d; mx = std::max(mx, d); if (++n == 240) { RLOG("[swap] 240 presents: %.2f ms average, %.2f ms longest\n", sum / 240e6, mx / 1e6); sum = mx = n = 0; } }
     }
     pump_events();

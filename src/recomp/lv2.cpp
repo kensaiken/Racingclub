@@ -618,6 +618,11 @@ void vblank_thread() {
     for (;;) {
         if (perVblank) {
             for (int k = 0; k < perVblank && perVblank; ++k) if (!host_wait_refresh()) perVblank = 0;
+            // VBLANKFASE=us: the game's vblank comes that long after the real refresh, so its image is presented in the
+            // middle of the refresh interval instead of right at the moment the compositor (DWM, windowed / borderless)
+            // picks the image up: one image a refresh at 120 Hz has no slack for a present landing on either side of it
+            {   static const long fase = std::getenv("VBLANKFASE") ? std::atol(std::getenv("VBLANKFASE")) : 0;
+                if (fase > 0 && perVblank) host_sleep_us(uint64_t(fase)); }
             const uint64_t t = now_us(), dt = t - lastTick;
             lastTick = t;
             if (g_missLog && dt * g_gameHz > 1500000) LOG("[vgap] %.1f ms between vblanks\n", dt / 1000.0);
