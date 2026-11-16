@@ -263,7 +263,10 @@ uint64_t g_profSem = 0, g_profFlip = 0, g_profClear = 0;   // FIFOPROF: label wa
 // S label wait starts, E label wait ends, F flip, D flip handler delivered
 long g_flStart = std::getenv("FRAMELOG") ? std::atol(std::getenv("FRAMELOG")) : -1;
 void fl(const char* tag, uint32_t v = 0);
-uint64_t g_frHoleUs = 0, g_frIdleUs = 0, g_frHoles = 0;   // FRAMELOG: time the FIFO waited at holes / for commands in this frame
+uint64_t g_frHoleUs = 0, g_frIdleUs = 0, g_frHoles = 0;
+// MISSLOG=1: every frame whose FIFO reached the vblank wait later than one refresh after the flip, with what it did
+const bool g_missLog = std::getenv("MISSLOG") != nullptr;
+const bool g_frAcct = g_flStart >= 0 || g_missLog;   // FRAMELOG: time the FIFO waited at holes / for commands in this frame
 std::atomic<uint32_t> g_vblankTick{0};   // bumped (and waiters woken) after every vblank handler call
 // A frame whose commands end a moment after a vblank used to wait for the next one: at 144 Hz a frame that needed
 // 7.2 ms instead of 6.9 took 13.9, and a scene on the edge fell to 72-100 images per second. When the RSX reaches the
@@ -334,16 +337,32 @@ void method(uint32_t m, uint32_t arg, uint32_t& semOff406e, uint32_t& semOff4097
                     g_mBuild = g_mRsx = g_mLate = g_mN = 0;
                 }
             }
+            if (semOff406e == 0x810 && g_missLog && g_tDeliver) {
+                static rsx::Counters c0{}; static bool have = false;
+                const rsx::Counters c1 = rsx::counters();
+                static const uint64_t period = 1000000 / uint64_t(settings().gameHz > 0 ? settings().gameHz : 60);
+                const uint64_t rsxT = ts - g_tDeliver, build = g_tPut > g_tDeliver ? g_tPut - g_tDeliver : 0;
+                if (have && rsxT > period)
+                    LOG("[miss] build %.1f rsx %.1f | holes %.1f (%llu) idle %.1f | draws %llu in %.1f ms, swap %.1f, progs %llu (%.1f ms), tex %llu (%llu KB, %.1f ms), streams %llu (%llu vertices, convert %.1f ms, buffers %.1f ms)\n",
+                        build / 1000.0, rsxT / 1000.0, g_frHoleUs / 1000.0, (unsigned long long)g_frHoles, g_frIdleUs / 1000.0,
+                        (unsigned long long)(c1.draws - c0.draws), (c1.drawUs - c0.drawUs) / 1000.0, (c1.swapUs - c0.swapUs) / 1000.0,
+                        (unsigned long long)(c1.progs - c0.progs), (c1.progUs - c0.progUs) / 1000.0, (unsigned long long)(c1.texUploads - c0.texUploads),
+                        (unsigned long long)((c1.texBytes - c0.texBytes) >> 10), (c1.texUs - c0.texUs) / 1000.0, (unsigned long long)(c1.streams - c0.streams), (unsigned long long)(c1.streamVerts - c0.streamVerts), (c1.convUs - c0.convUs) / 1000.0, (c1.bufUs - c0.bufUs) / 1000.0);
+                c0 = c1; have = true;
+            }
             if (semOff406e == 0x810) { fl("h", uint32_t(g_frHoleUs / 100)); fl("n", uint32_t(g_frHoles)); fl("i", uint32_t(g_frIdleUs / 100)); fl("S"); g_frHoleUs = g_frIdleUs = g_frHoles = 0; }
             if (semOff406e == 0x810) {   // waits for the vblank handler: woken by the vblank thread, not by polling
                 if (rd(labels + semOff406e) != arg && g_lateUs && g_vblankFree.exchange(false) && now_us() - g_lastVblankUs.load() < g_lateUs) {
                     call_guest(vblankHandler, 1); ++g_lateUsed; fl("L");
                 }
+                bool dumped = false;
                 for (;;) {
                     const uint32_t tick = g_vblankTick.load();
                     if (rd(labels + semOff406e) == arg || now_us() - ts > 2000000) break;
+                    if (g_missLog && !dumped && now_us() - ts > 20000) { dumped = true; LOG("[late] the RSX has waited %.1f ms for the game to release the vblank label:\n", (now_us() - ts) / 1000.0); lv2_dump_waits(); }
                     g_vblankTick.wait(tick);
                 }
+                if (dumped) LOG("[late] waited %.1f ms in all\n", (now_us() - ts) / 1000.0);
             } else
                 for (const uint64_t until = ts + 2000000; rd(labels + semOff406e) != arg && now_us() < until;) std::this_thread::yield();
             g_profSem += now_us() - ts;
@@ -436,7 +455,7 @@ void fifo_thread() {
         static uint64_t waitStart = 0; static int waitKind = 0;   // FRAMELOG accounting of waits
         if (get == put) {   // nothing to run: the game publishes commands within microseconds, so yield first and only sleep after a while
             const uint64_t t0 = now_us();
-            if (g_flStart >= 0 && waitKind != 2) { if (waitKind == 1) { g_frHoleUs += t0 - waitStart; ++g_frHoles; } waitStart = t0; waitKind = 2; }
+            if (g_frAcct && waitKind != 2) { if (waitKind == 1) { g_frHoleUs += t0 - waitStart; ++g_frHoles; } waitStart = t0; waitKind = 2; }
             static uint64_t idleSince = 0;
             if (!idle++) idleSince = t0;
             if (t0 - idleSince < 4000) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(50));
@@ -477,7 +496,7 @@ void fifo_thread() {
         uint32_t g2 = get;
         const uint32_t cmd = rd(io2ea(g2));
         const bool selfJump = ((cmd & 0xE0000003) == 0x20000000 && (cmd & 0x1FFFFFFC) == g2) || ((cmd & 3) == 1 && (cmd & 0xFFFFFFFC) == g2);
-        if (g_flStart >= 0) {
+        if (g_frAcct) {
             const int kind = selfJump ? 1 : 0;
             if (kind != waitKind) {
                 const uint64_t t = now_us();
@@ -601,6 +620,7 @@ void vblank_thread() {
             for (int k = 0; k < perVblank && perVblank; ++k) if (!host_wait_refresh()) perVblank = 0;
             const uint64_t t = now_us(), dt = t - lastTick;
             lastTick = t;
+            if (g_missLog && dt * g_gameHz > 1500000) LOG("[vgap] %.1f ms between vblanks\n", dt / 1000.0);
             // the refreshes must really be 60 Hz: most of every 240 vblanks have to be 16.67 ms apart (stalls excluded)
             static int good = 0, seen = 0;
             (void)odd;
@@ -615,6 +635,12 @@ void vblank_thread() {
             next += std::chrono::microseconds(1000000 / g_gameHz);
             std::this_thread::sleep_until(next - std::chrono::microseconds(2000));
             while (std::chrono::steady_clock::now() < next) std::this_thread::yield();
+        }
+        if (g_missLog) {   // a stretch without flips while the vblanks go on: what every thread is blocked in, once per stretch
+            static uint64_t lastFlips = 0, since = 0; static bool dumped = false;
+            const uint64_t f = flips.load(), t = now_us();
+            if (f != lastFlips) { lastFlips = f; since = t; dumped = false; }
+            else if (!dumped && since && t - since > 60000) { dumped = true; LOG("[stall] no flip for %.0f ms:\n", (t - since) / 1000.0); lv2_dump_waits(); }
         }
         if (flipPending.load()) { ++flips; call_guest(flipHandler, 1); flipPending = false; }
         { const uint32_t b = labels ? rd(labels + 0x810) : 0; call_guest(vblankHandler, 1); const uint32_t a = labels ? rd(labels + 0x810) : 0; fl("V", b * 16 + a); g_vblankFree = b == a; g_lastVblankUs = now_us(); }

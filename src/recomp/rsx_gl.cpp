@@ -141,7 +141,9 @@ static float half2f(uint16_t h) {
 }
 static uint32_t ea_of(uint32_t offset, uint32_t location /*0 local, 1 main*/) { return (location ? C.ioAddr : C.localAddr) + offset; }
 
-static uint64_t g_texUploads = 0, g_texUploadBytes = 0, g_streamBuilds = 0, g_streamVerts = 0, g_progBuilds = 0;   // work counters, see [slowdraw]
+static uint64_t g_texUploads = 0, g_texUploadBytes = 0, g_streamBuilds = 0, g_streamVerts = 0, g_progBuilds = 0;
+static std::atomic<uint64_t> g_swapUs{0}; static uint64_t g_drawTicks = 0, g_drawCount = 0, g_progTicks = 0, g_texTicks = 0, g_convTicks = 0, g_bufTicks = 0;
+struct TickScope { uint64_t& acc; uint64_t t0; explicit TickScope(uint64_t& a) : acc(a), t0(SDL_GetPerformanceCounter()) {} ~TickScope() { acc += SDL_GetPerformanceCounter() - t0; } };   // MISSLOG (counters())   // work counters, see [slowdraw]
 static uint64_t fnv(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {   // keys used inside this process only
     const uint8_t* b = static_cast<const uint8_t*>(p);
     for (; n >= 8; n -= 8, b += 8) { uint64_t w; std::memcpy(&w, b, 8); h = (h ^ w) * 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
@@ -636,6 +638,7 @@ static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, u
     Program& p = programs[key];
     p.key = key;
     ++g_progBuilds;
+    TickScope progTime(g_progTicks);
     const VpInfo vi = translate_vp(vpCode, vpStart);
     const FpInfo fi = translate_fp(fpEa, texDims, control);
     p.vpInputs = vi.inputs;
@@ -1102,6 +1105,7 @@ static void bind_texture_impl(int i, float* tsc) {
         tx.sig = sig;
         tx.sampler = ~0ull;
         ++g_texUploads; g_texUploadBytes += total;
+        TickScope texTime(g_texTicks);
         glBindTexture(target, tx.id);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
@@ -1324,8 +1328,36 @@ static void apply_state() {
 // change from frame to frame: they are converted to floats once and kept in a GL buffer. Edge geometry output
 // (positions, in main memory) is new every frame and goes through the per-draw path. The content of a cached
 // stream is sampled once per frame, so a level change that reuses the address is noticed.
-struct Stream { GLuint vbo = 0; uint32_t count = 0; uint64_t sig = 0, checked = ~0ull; };
+struct Stream { GLuint vbo = 0; size_t offset = 0; uint32_t count = 0; uint64_t sig = 0, checked = ~0ull; };
 static std::unordered_map<uint64_t, Stream> streams;
+// The streams live in a few big GL buffers (64 MB each, filled front to back): a buffer of its own per stream cost
+// ~25 us of driver time each, and a scene change builds 1000-2000 of them (40 ms in one frame). A stream that has to
+// grow or changed content gets new room; the space it leaves is reclaimed when the arena is full (everything is
+// dropped and rebuilt, once per few scene changes). RSXNOARENA=1: one buffer per stream as before.
+static constexpr size_t kArenaChunk = size_t(64) << 20, kArenaMaxChunks = 12;
+static std::vector<GLuint> arenaBufs;
+static size_t arenaChunk = 0, arenaHead = 0;
+static bool arena_alloc(size_t bytes, GLuint& buf, size_t& off) {
+    if (bytes > kArenaChunk) return false;
+    if (arenaBufs.empty() || arenaHead + bytes > kArenaChunk) {
+        if (!arenaBufs.empty()) ++arenaChunk;
+        arenaHead = 0;
+        if (arenaChunk >= kArenaMaxChunks) {   // full: start over (the streams are rebuilt as draws ask for them)
+            for (auto& [k, st] : streams) st.vbo = 0, st.count = 0;
+            arenaChunk = 0;
+            RLOG("[rsx] vertex stream arena full: rebuilt\n");
+        }
+        while (arenaBufs.size() <= arenaChunk) {
+            GLuint b = 0; glGenBuffers(1, &b); glBindBuffer(GL_ARRAY_BUFFER, b);
+            if (glBufferStorage) glBufferStorage(GL_ARRAY_BUFFER, GLsizeiptr(kArenaChunk), nullptr, 0x0100 /* GL_DYNAMIC_STORAGE_BIT */);
+            else glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(kArenaChunk), nullptr, 0x88E4 /* GL_STATIC_DRAW */);
+            arenaBufs.push_back(b);
+        }
+    }
+    buf = arenaBufs[arenaChunk]; off = arenaHead;
+    arenaHead += (bytes + 255) & ~size_t(255);
+    return true;
+}
 static uint64_t stream_sig(const uint8_t* p, uint32_t stride, uint32_t count) {
     uint64_t h = fnv(&count, 4);
     const uint32_t step = std::max<uint32_t>(1, count / 24);
@@ -1333,7 +1365,7 @@ static uint64_t stream_sig(const uint8_t* p, uint32_t stride, uint32_t count) {
     return fnv(p + size_t(count - 1) * stride, std::min<uint32_t>(stride, 8), h);
 }
 // GL buffer with attribute a converted for vertices 0..need-1 (4 floats each), or 0 when the stream is not cacheable
-static GLuint cached_stream(int a, uint32_t need) {
+static GLuint cached_stream(int a, uint32_t need, size_t& offset) {
     static const bool off = std::getenv("RSXNOSTREAMCACHE") != nullptr;
     const uint32_t fmt = R[(0x1740 + 4 * a) >> 2], offReg = R[(0x1680 + 4 * a) >> 2];
     const uint32_t stride = (fmt >> 8) & 0xff;
@@ -1350,13 +1382,24 @@ static GLuint cached_stream(int a, uint32_t need) {
         static std::vector<float> tmp;
         const uint32_t n = need + need / 4 + 64;   // room to grow: other draws of the object use later vertices
         tmp.resize(size_t(n) * 4);
-        convert_attr(a, 0, n, tmp.data());
-        if (!st.vbo) glGenBuffers(1, &st.vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, st.vbo);
-        glBufferData(GL_ARRAY_BUFFER, tmp.size() * 4, tmp.data(), 0x88E4 /* GL_STATIC_DRAW */);
+        { TickScope t(g_convTicks); convert_attr(a, 0, n, tmp.data()); }
+        TickScope bt(g_bufTicks);
+        static const bool noArena = std::getenv("RSXNOARENA") != nullptr;
+        GLuint ab = 0; size_t ao = 0;
+        if (!noArena && arena_alloc(tmp.size() * 4, ab, ao)) {
+            st.vbo = ab; st.offset = ao;   // (an arena reset clears entries but keeps them: st stays valid)
+            glBindBuffer(GL_ARRAY_BUFFER, ab);
+            glBufferSubData(GL_ARRAY_BUFFER, GLintptr(ao), GLsizeiptr(tmp.size() * 4), tmp.data());
+        } else {
+            if (!st.vbo || !noArena) { glGenBuffers(1, &st.vbo); }   // (a stream too big for the arena: its own buffer)
+            st.offset = 0;
+            glBindBuffer(GL_ARRAY_BUFFER, st.vbo);
+            glBufferData(GL_ARRAY_BUFFER, tmp.size() * 4, tmp.data(), 0x88E4 /* GL_STATIC_DRAW */);
+        }
         st.count = n; st.sig = stream_sig(p, stride, n); st.checked = frameNo;
         ++g_streamBuilds; g_streamVerts += n;
     }
+    offset = st.offset;
     return st.vbo;
 }
 
@@ -1402,7 +1445,9 @@ static void do_draw() {
     struct SlowDraw {   // a draw over 6 ms: what it had to build
         uint64_t t0 = SDL_GetPerformanceCounter(), tu = g_texUploads, tb = g_texUploadBytes, sb = g_streamBuilds, sv = g_streamVerts, pb = g_progBuilds;
         ~SlowDraw() {
-            const double ms = (SDL_GetPerformanceCounter() - t0) * 1000.0 / SDL_GetPerformanceFrequency();
+            const uint64_t dt = SDL_GetPerformanceCounter() - t0;
+            g_drawTicks += dt; ++g_drawCount;
+            const double ms = dt * 1000.0 / SDL_GetPerformanceFrequency();
             if (ms > 6) RLOG("[slowdraw] %.0f ms: %llu textures uploaded (%llu KB), %llu vertex streams built (%llu vertices), %llu programs built\n", ms, (unsigned long long)(g_texUploads - tu),
                              (unsigned long long)((g_texUploadBytes - tb) >> 10), (unsigned long long)(g_streamBuilds - sb), (unsigned long long)(g_streamVerts - sv), (unsigned long long)(g_progBuilds - pb));
         }
@@ -1544,12 +1589,12 @@ static void do_draw() {
             glVertexAttrib4f(a, rf(0x1c00 + 16 * a), rf(0x1c04 + 16 * a), rf(0x1c08 + 16 * a), rf(0x1c0c + 16 * a));
         }
     }
-    GLuint streamVbo[16] = {};
+    GLuint streamVbo[16] = {}; size_t streamOff[16] = {};
     // where in vtx each attribute converted for this draw starts (in floats; -1 = cached stream), and its floats per vertex
     long slot[16]; uint32_t comps[16]; size_t vtxFloats = 0;
     for (int k = 0; k < na; ++k) {
         comps[k] = 4;
-        if (!sparse && (streamVbo[k] = cached_stream(attrs[k], vmax + 1)) != 0) { slot[k] = -1; continue; }
+        if (!sparse && (streamVbo[k] = cached_stream(attrs[k], vmax + 1, streamOff[k])) != 0) { slot[k] = -1; continue; }
         const uint32_t fmt = R[(0x1740 + 4 * attrs[k]) >> 2];
         comps[k] = ((fmt >> 8) & 0xff) ? attr_comps(attrs[k]) : 4;
         slot[k] = long(vtxFloats);
@@ -1611,7 +1656,7 @@ static void do_draw() {
         glEnableVertexAttribArray(attrs[k]);
         if (streamVbo[k]) {   // cached stream: holds every vertex from 0, the indices are relative to vmin
             glBindBuffer(GL_ARRAY_BUFFER, streamVbo[k]);
-            glVertexAttribPointer(attrs[k], 4, GL_FLOAT, 0, 16, reinterpret_cast<const void*>(size_t(vmin) * 16));
+            glVertexAttribPointer(attrs[k], 4, GL_FLOAT, 0, 16, reinterpret_cast<const void*>(streamOff[k] + size_t(vmin) * 16));
             glBindBuffer(GL_ARRAY_BUFFER, vBuf);
         } else
             glVertexAttribPointer(attrs[k], GLint(comps[k]), GL_FLOAT, 0, GLsizei(4 * comps[k]), reinterpret_cast<const void*>(vOff + size_t(slot[k]) * 4));
@@ -2102,6 +2147,10 @@ void flip(uint32_t id) {
         static uint64_t lastFlip = 0, worst = 0, since = 0; static int over = 0;
         const uint64_t t = SDL_GetPerformanceCounter(), fq = SDL_GetPerformanceFrequency();
         if (lastFlip) { const uint64_t d = t - lastFlip; worst = std::max(worst, d); if (d * 1000 > fq * 25) ++over; }
+        static const bool missLog = std::getenv("MISSLOG") != nullptr;
+        static uint64_t swapAtLast = 0;
+        if (missLog && lastFlip && (t - lastFlip) * 1000 > fq * 25) RLOG("[gap] %.1f ms between flips (swap %.1f ms since last flip)\n", (t - lastFlip) * 1000.0 / fq, (g_swapUs.load() - swapAtLast) / 1000.0);
+        swapAtLast = g_swapUs.load();
         if (lastFlip && (t - lastFlip) * 1000 > fq * 60) RLOG("[hitch] %.0f ms without a flip, ending %.2f s after launch\n", (t - lastFlip) * 1000.0 / fq, SDL_GetTicks() / 1000.0);
         lastFlip = t;
         if (t - since > 2 * fq) {
@@ -2205,8 +2254,9 @@ void flip(uint32_t id) {
     if (menuOpen) draw_menu(ww, wh);
     {   // SWAPLOG=1: how long presenting takes (it blocks when the compositor or the driver throttles)
         static const bool swapLog = std::getenv("SWAPLOG") != nullptr;
-        const uint64_t ts = swapLog ? SDL_GetTicksNS() : 0;
+        const uint64_t ts = SDL_GetTicksNS();
         SDL_GL_SwapWindow(win);
+        g_swapUs += (SDL_GetTicksNS() - ts) / 1000;
         if (swapLog) { static uint64_t sum = 0, mx = 0, n = 0; const uint64_t d = SDL_GetTicksNS() - ts; sum += d; mx = std::max(mx, d); if (++n == 240) { RLOG("[swap] 240 presents: %.2f ms average, %.2f ms longest\n", sum / 240e6, mx / 1e6); sum = mx = n = 0; } }
     }
     pump_events();
@@ -2224,6 +2274,11 @@ void flip(uint32_t id) {
     }
     drawsThisFrame = 0;
     if (const GLenum e = glGetError()) { static int n = 0; if (n++ < 20) RLOG("[rsx] GL error 0x%x (frame %llu)\n", e, (unsigned long long)frameNo); }
+}
+
+Counters counters() {
+    static const uint64_t fq = SDL_GetPerformanceFrequency();
+    return Counters{g_progBuilds, g_texUploads, g_texUploadBytes, g_streamBuilds, g_swapUs.load(), g_drawCount, g_drawTicks * 1000000 / fq, g_progTicks * 1000000 / fq, g_texTicks * 1000000 / fq, g_convTicks * 1000000 / fq, g_bufTicks * 1000000 / fq, g_streamVerts};
 }
 
 void method_block(uint32_t m0, const uint8_t* args, uint32_t count, bool noInc) {

@@ -22,5 +22,8 @@ void set_display_buffer(uint32_t id, uint32_t offset, uint32_t pitch, uint32_t w
 void flip(uint32_t bufferId);                         // shows a display buffer and pumps window events
 void toast(const std::wstring& title, const std::wstring& name, const std::wstring& detail, uint32_t rgb, const std::string& png = {});   // a notification (trophy) for 5 s
 bool quit_requested();
+// running work counters of the RSX thread (MISSLOG: what a late frame had to build)
+struct Counters { uint64_t progs, texUploads, texBytes, streams, swapUs, draws, drawUs, progUs, texUs, convUs, bufUs, streamVerts; };
+Counters counters();
 
 } // namespace gti::recomp::rsx
