@@ -35,6 +35,14 @@ inline __m128i V(const Q& q) { return _mm_loadu_si128(reinterpret_cast<const __m
 inline Q mk(__m128i v) { Q q; _mm_storeu_si128(reinterpret_cast<__m128i*>(q.w), v); return q; }
 // Q layout <-> SPU byte order (memory index i = SPU byte i); the shuffle is its own inverse
 inline __m128i swp(__m128i v) { return _mm_shuffle_epi8(v, _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12)); }
+// whole-quadword float helpers (tools/spu2cpp.py VEC templates); same results as the scalar f()/spu_mul forms
+inline __m128 PS(__m128i v) { return _mm_castsi128_ps(v); }
+inline __m128i IS(__m128 v) { return _mm_castps_si128(v); }
+inline __m128i vabs(__m128i v) { return _mm_and_si128(v, _mm_set1_epi32(0x7fffffff)); }
+inline __m128 vmul_spu(__m128 a, __m128 b) {   // spu_mul: a zero factor gives +0
+    const __m128 z = _mm_setzero_ps();
+    return _mm_andnot_ps(_mm_or_ps(_mm_cmpeq_ps(a, z), _mm_cmpeq_ps(b, z)), _mm_mul_ps(a, b));
+}
 inline __m128i iota16() { return _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); }
 
 inline Q ldq(const uint8_t* ls, uint32_t a) {
