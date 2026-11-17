@@ -15,7 +15,7 @@
 #include <vector>
 
 using namespace gti::recomp;
-namespace gti::recomp { extern uint64_t g_edgeCullCyc[4]; extern uint8_t* g_edgeCullWhy; }
+namespace gti::recomp { extern uint64_t g_edgeCullCyc[4]; extern uint8_t* g_edgeCullWhy; extern uint64_t g_edgeCullBox; }
 static uint8_t g_why[0x4000]; static uint64_t g_extraWhy[8];
 
 static bool load(const char* fn, std::vector<uint8_t>& d) {
@@ -81,6 +81,8 @@ int main(int argc, char** argv) {
             auto be32 = [](const uint8_t* p) { return uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]; };
             const uint32_t edgeCount = be32(out.data() + Spu::LS_SIZE + 3 * 16);
             if (!cr.handled) { ++notHandled; continue; }
+            { static uint64_t vAll = 0, vCulled = 0, jCulled = 0; const uint32_t nv0 = uint32_t(in[(ctx & 0x3fff0) + 8]) << 8 | in[(ctx & 0x3fff0) + 9]; vAll += nv0; if (!cr.count) { vCulled += nv0; ++jCulled; }
+              if (std::getenv("CULLSTAT") && j == first + count - 1) std::printf("fully culled: %llu jobs (box %llu), %llu of %llu vertices\n", (unsigned long long)jCulled, (unsigned long long)g_edgeCullBox, (unsigned long long)vCulled, (unsigned long long)vAll); }
             const uint32_t idx = be32(s.ls + (ctx & 0x3fff0) + 0x50);
             // ours must contain every console triangle, in order
             uint32_t k = 0; bool sup = true;

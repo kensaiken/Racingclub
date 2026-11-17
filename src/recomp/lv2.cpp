@@ -1111,13 +1111,32 @@ void run_job(const JobDesc& J) {
     (void)cullCapOn;
     ++t_jobSeq;
     const uint32_t jea = J.jea;
-    static thread_local Spu* spu = new Spu;
     const uint32_t eaBin = uint32_t(jd32(J, 4)) & ~0xFu;
+    // one local store per job binary on each worker: the game interleaves the dispatcher (0xba3680) with the Edge
+    // jobs, and with a single one the 64 KB Edge binary was copied in again for a third of its jobs. Each binary
+    // keeps its own resident image, as it would while consecutive jobs use it. JOBONELS=1: the old single one.
+    struct LsSlot { uint32_t bin = 0, resident = 0; Spu* spu = nullptr; };
+    static thread_local LsSlot slots[4];
+    static const bool oneLs = std::getenv("JOBONELS") != nullptr;
+    LsSlot* slot = &slots[0];
+    if (!oneLs) {
+        int k = 0;
+        while (k < 4 && slots[k].spu && slots[k].bin != eaBin) ++k;
+        if (k == 4) k = 3;   // more binaries than slots: the last slot is shared
+        slot = &slots[k];
+        if (!slot->spu) slot->bin = eaBin;
+    }
+    if (!slot->spu) slot->spu = new Spu;
+    Spu* const spu = slot->spu;
     const uint32_t sizeBin = uint32_t(jd16(J, 8)) * 16, sizeDma = jd16(J, 0xa);
     const uint32_t sizeInOut = jd32(J, 0x14), sizeOut = jd32(J, 0x18);
     const uint32_t sizeCacheDma = jd32(J, 0x24);
     ++jobsRun;
-    {
+    static thread_local uint32_t seenHere[8]; static thread_local unsigned nSeenHere = 0;   // binaries this worker has met
+    bool newHere = true;
+    for (unsigned k = 0; k < nSeenHere; ++k) if (seenHere[k] == eaBin) { newHere = false; break; }
+    if (newHere && nSeenHere < 8) seenHere[nSeenHere++] = eaBin;
+    if (newHere) {   // (a global lock per job was measurable with 8 workers)
         static std::mutex seenMx; static std::map<uint32_t, int> seen;
         std::lock_guard<std::mutex> lk(seenMx);
         if (!seen[eaBin]++) LOG("[job] binary %x: %u bytes (descriptor %x)\n", eaBin, sizeBin, jea);
@@ -1168,7 +1187,7 @@ void run_job(const JobDesc& J) {
     // like the SPURS job manager: the local store is not cleared, and the binary stays resident while consecutive
     // jobs on this SPU use the same one (JOBRELOAD=1 restores the old clear-and-reload behaviour)
     static const bool reload = std::getenv("JOBRELOAD") != nullptr;
-    static thread_local uint32_t residentBin = 0;
+    uint32_t& residentBin = slot->resident;
     if (reload) std::memset(s.ls + 0x3000, 0, Spu::LS_SIZE - 0x3000);
     if (reload || residentBin != eaBin) { std::memcpy(s.ls + LS_BIN, G->mem + eaBin, std::min<uint32_t>(sizeBin, 0x30000)); residentBin = eaBin; }
     const uint32_t lsIo = (LS_BIN + sizeBin + 127) & ~127u;   // buffers follow the binary (its size covers .bss)

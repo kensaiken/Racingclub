@@ -13,17 +13,85 @@
 #include <cmath>
 #include <x86intrin.h>
 #include <cstring>
+#include <cstdlib>
 
 namespace gti::recomp {
 
 uint64_t g_edgeCullCyc[4];   // profiling: load, vertices, triangles
 uint8_t* g_edgeCullWhy;      // debug (cull_replay): why each kept triangle was kept
+uint64_t g_edgeCullBox;      // jobs culled whole by the bounding box test
 
 namespace {
 inline uint32_t be32(const uint8_t* ls, uint32_t a) { const uint8_t* p = ls + (a & 0x3ffff); return uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 inline uint16_t be16(const uint8_t* ls, uint32_t a) { const uint8_t* p = ls + (a & 0x3ffff); return uint16_t(p[0] << 8 | p[1]); }
 inline float bef(const uint8_t* ls, uint32_t a) { const uint32_t u = be32(ls, a); float f; std::memcpy(&f, &u, 4); return f; }
 inline void wr32(uint8_t* ls, uint32_t a, uint32_t v) { uint8_t* p = ls + (a & 0x3ffff); p[0] = uint8_t(v >> 24); p[1] = uint8_t(v >> 16); p[2] = uint8_t(v >> 8); p[3] = uint8_t(v); }
+
+// Whole-job shortcut: true when every vertex is certainly outside one and the same clip plane, so that the
+// per-vertex pass would give all of them that outcode bit and every triangle is culled (as on the console: the
+// per-vertex outcodes only claim what is certain). Half of the vertices in a race are in jobs like that.
+// The box of the local positions (w must be 1) is tested at its 8 corners: each condition is linear in the
+// position, so holding at the corners means holding inside. Margins: twice the per-vertex error bounds, which
+// are themselves bounded over the box.
+bool box_outside(const uint8_t* ls, uint32_t pos, uint32_t nv, const double T[4][4], const double TA[4][4],
+                 double scX, double scY, double ofX, double ofY, double fW, double fH) {
+    const __m128i bs = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    const __m256i bs2 = _mm256_broadcastsi128_si256(bs);
+    const uint8_t* src = ls + pos;
+    // nan: 0 * q summed, NaN or infinity anywhere makes it NaN (min/max alone would drop a NaN lane)
+    __m256 mn = _mm256_set1_ps(3.0e38f), mx = _mm256_set1_ps(-3.0e38f), nan = _mm256_setzero_ps();
+    const __m256 zero = _mm256_setzero_ps();
+    uint32_t v = 0;
+    for (; v + 2 <= nv; v += 2) {
+        const __m256 q = _mm256_castsi256_ps(_mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 16 * v)), bs2));
+        mn = _mm256_min_ps(mn, q); mx = _mm256_max_ps(mx, q); nan = _mm256_add_ps(nan, _mm256_mul_ps(zero, q));
+    }
+    {
+        float a[8]; _mm256_storeu_ps(a, nan);
+        for (float x : a) if (x != 0.0f) return false;
+    }
+    __m128 mn4 = _mm_min_ps(_mm256_castps256_ps128(mn), _mm256_extractf128_ps(mn, 1));
+    __m128 mx4 = _mm_max_ps(_mm256_castps256_ps128(mx), _mm256_extractf128_ps(mx, 1));
+    if (v < nv) {
+        const __m128 q = _mm_castsi128_ps(_mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 16 * v)), bs));
+        mn4 = _mm_min_ps(mn4, q); mx4 = _mm_max_ps(mx4, q);
+    }
+    float lo[4], hi[4];
+    _mm_storeu_ps(lo, mn4); _mm_storeu_ps(hi, mx4);
+    if (lo[3] != 1.0f || hi[3] != 1.0f) return false;
+    for (int k = 0; k < 3; ++k) if (!(lo[k] <= hi[k]) || !(std::fabs(lo[k]) < 1e30f) || !(std::fabs(hi[k]) < 1e30f)) return false;
+    double A[4] = {std::fmax(std::fabs(lo[0]), std::fabs(hi[0])), std::fmax(std::fabs(lo[1]), std::fabs(hi[1])), std::fmax(std::fabs(lo[2]), std::fabs(hi[2])), 1.0};
+    double mb[4];
+    for (int i = 0; i < 4; ++i) mb[i] = ((TA[i][0] * A[0] + TA[i][1] * A[1]) + (TA[i][2] * A[2] + TA[i][3])) * 3e-7 * 1.02 + 1e-30;
+    double c[8][4];
+    for (int k = 0; k < 8; ++k) {
+        const double p[4] = {(k & 1) ? hi[0] : lo[0], (k & 2) ? hi[1] : lo[1], (k & 4) ? hi[2] : lo[2], 1.0};
+        for (int i = 0; i < 4; ++i) c[k][i] = T[i][0] * p[0] + T[i][1] * p[1] + T[i][2] * p[2] + T[i][3];
+    }
+    bool far = true, near = true;
+    double c3min = 1e300, c0max = 0, c1max = 0;
+    for (int k = 0; k < 8; ++k) {
+        far = far && c[k][2] - c[k][3] > 2 * (mb[2] + mb[3]);
+        near = near && c[k][2] < -2 * mb[2];
+        c3min = std::fmin(c3min, c[k][3]);
+        c0max = std::fmax(c0max, std::fabs(c[k][0])); c1max = std::fmax(c1max, std::fabs(c[k][1]));
+    }
+    if (far || near) return true;
+    if (!(c3min > 8 * mb[3] + 1e-19)) return false;   // some vertex may lack a screen position
+    // bound of the per-vertex screen error e (edge_cull_native), then twice that as margin, in pixels
+    const double rw = mb[3] / c3min, X = c0max / c3min * std::fabs(scX) + std::fabs(ofX), Y = c1max / c3min * std::fabs(scY) + std::fabs(ofY);
+    const double eb = (mb[0] / c3min + c0max / c3min * rw) * std::fabs(scX) + (mb[1] / c3min + c1max / c3min * rw) * std::fabs(scY) + (X + Y + 1.0) * 6e-7;
+    const double em = 2 * eb + 1e-3;
+    bool r = true, l = true, b = true, t = true;   // x > width, x < 0, y > height, y < 0
+    for (int k = 0; k < 8; ++k) {
+        const double sx = c[k][0] * scX + ofX * c[k][3], sy = c[k][1] * scY + ofY * c[k][3];   // screen position times w
+        r = r && sx - (fW + em) * c[k][3] > 0;
+        l = l && -sx - em * c[k][3] > 0;
+        b = b && sy - (fH + em) * c[k][3] > 0;
+        t = t && -sy - em * c[k][3] > 0;
+    }
+    return r || l || b || t;
+}
 
 }  // namespace
 
@@ -63,6 +131,19 @@ EdgeCullResult edge_cull_native(uint8_t* ls, uint32_t ctx, uint32_t mode, uint32
             if (k == 3) { v += M[i][3]; va += std::fabs(M[i][3]); }
             T[i][k] = v; TA[i][k] = va;
         }
+    static const bool boxOn = !std::getenv("EDGEBOX") || std::atoi(std::getenv("EDGEBOX")) != 0;
+    if (boxOn && box_outside(ls, pos, nv, T, TA, scX, scY, ofX, ofY, double(sw), double(sh))) {
+        uint32_t bad = 0;   // like the full path: an index past the vertices means data we do not understand
+        for (uint32_t t = 0; t < ni; ++t) bad |= uint32_t(be16(ls, idx + 2 * t) >= nv);
+        if (!bad) {
+            ++g_edgeCullBox;
+            wr32(ls, ctx + 0x58, idx);
+            wr32(ls, entryR1 + 0x258, 0);
+            res.handled = true;
+            res.count = 0;
+            return res;
+        }
+    }
     // per-vertex pass, 8 vertices at a time in float (separate arrays, no branches). The error bounds (3e-7 of the
     // magnitudes involved) cover both the SPU's float32 roundings and ours.
     struct Soa { float x[0x2000], y[0x2000], e[0x2000], p[4][0x2000]; int16_t qx[0x2000], qy[0x2000]; uint8_t f[0x2000]; };
@@ -114,6 +195,22 @@ EdgeCullResult edge_cull_native(uint8_t* ls, uint32_t ctx, uint32_t mode, uint32
         V.f[v] = uint8_t(f | (noArea ? 1 : 0) | (noArea || !snapOk ? 2 : 0));
     }
     uint64_t q2 = __rdtsc(); g_edgeCullCyc[1] += q2 - q1;
+    if (boxOn) {   // every vertex shares an outcode bit (mixed-plane cases the box misses): every triangle is culled
+        uint8_t all = 0xff;
+        for (uint32_t v = 0; v < nv; ++v) all &= V.f[v];
+        if (all & 0xfc) {
+            uint32_t bad = 0;
+            for (uint32_t t = 0; t < ni; ++t) bad |= uint32_t(be16(ls, idx + 2 * t) >= nv);
+            if (!bad) {
+                ++g_edgeCullBox;
+                wr32(ls, ctx + 0x58, idx);
+                wr32(ls, entryR1 + 0x258, 0);
+                res.handled = true;
+                res.count = 0;
+                return res;
+            }
+        }
+    }
     // triangles, compacted in place
     uint32_t kept = 0;
     for (uint32_t t = 0; t < ni; t += 3) {
