@@ -16,6 +16,11 @@ extern uint64_t g_spuSlowEntries;
 void spu_slow_note(uint32_t ea, uint32_t pc);   // SPUPROF=1: where the slow variant is entered ([spuslow] report)
 void spu_slow_report();
 
+// native replacement of SPU routines, per program ((eaBin >> 4) % 64): called by the dispatcher whenever execution
+// crosses into another chunk (calls and returns between routines do); returns the pc to continue at (pc itself = not handled)
+using HleHook = uint32_t (*)(Q* __restrict r, Spu& s, uint32_t pc);
+extern HleHook g_spuHle[64];
+
 // A chunk runs from pc until it leaves its 1 KB of code. Result: next pc, | 0x80000000 = the interpreter must
 // execute the instruction at that pc, | 0x40000000 (fast chunks only) = pc is not an entry point of the fast chunk.
 using FastChunk = uint32_t (*)(Q* __restrict, Spu&, uint32_t pc);

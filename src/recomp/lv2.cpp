@@ -3,6 +3,7 @@
 #include "recomp/settings.h"
 #include "recomp/rsx_gl.h"
 #include "recomp/spu_rt.h"
+#include "recomp/edge_cull.h"
 #include "recomp/hle.h"
 #include "recomp/spu.h"
 #include "recomp/atrac3.h"
@@ -992,7 +993,123 @@ thread_local int t_spuNum = 0;
 Spu* g_workerSpu[16] = {};                     // per worker: its SPU and the job it is running (diagnostics)
 std::atomic<uint32_t> g_workerJob[16] = {};
 std::atomic<uint64_t> g_workerSince[16] = {};   // now_us() when that job started
+// CULLCAP=dir,seconds,n: local store + registers at entry (LS 0x9e68) and return (0x4400) of Edge's triangle culling routine,
+// for n jobs from `seconds` after the first Edge job -> dir/cull_NNNN_in.bin / _out.bin (256 KB local store, then 128 registers of 16 bytes)
+static uint32_t edge_cull_capture(spurt::Q* __restrict r, Spu& s, uint32_t pc) {
+    static char dir[256]; static long left = -1, first = 0; static uint64_t t0 = 0;
+    static std::atomic<long> seq{0};
+    static thread_local long mine = -1;
+    if (left < 0) { left = 0; if (const char* e = std::getenv("CULLCAP")) { long n = 0; if (std::sscanf(e, "%255[^,],%ld,%ld", dir, &first, &n) == 3) left = n; } t0 = now_us(); }
+    if (pc != 0x9e68 && pc != 0x4400) return pc;
+    if (pc == 0x4400 && mine < 0) return pc;
+    if (pc == 0x9e68) { if (now_us() - t0 < uint64_t(first) * 1000000u) return pc; mine = seq++; if (mine >= left) { mine = -1; return pc; } }
+    char fn[300]; std::snprintf(fn, sizeof fn, "%s/cull_%04ld_%s.bin", dir, mine, pc == 0x9e68 ? "in" : "out");
+    if (FILE* f = std::fopen(fn, "wb")) {
+        std::fwrite(s.ls, 1, Spu::LS_SIZE, f);
+        for (int i = 0; i < 128; ++i) for (int k = 0; k < 4; ++k) { const uint32_t v = r[i].w[k]; const uint8_t b[4] = {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)}; std::fwrite(b, 1, 4, f); }
+        std::fclose(f);
+    }
+    if (pc == 0x4400) mine = -1;
+    return pc;
+}
+
+// CULLTIME=1: time spent inside Edge's culling routine, against the whole Edge jobs ([culltime] every 2^16 calls)
+static std::atomic<uint64_t> g_cullNs{0}, g_cullCalls{0};
+static uint32_t edge_cull_time(spurt::Q* __restrict, Spu&, uint32_t pc) {
+    static thread_local std::chrono::steady_clock::time_point t;
+    static thread_local bool in = false;
+    if (pc == 0x9e68) { t = std::chrono::steady_clock::now(); in = true; }
+    else if (pc == 0x4400 && in) { in = false; g_cullNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t).count()); ++g_cullCalls; }
+    return pc;
+}
+
+// Edge's triangle culling done natively (edge_cull.cpp) instead of by the SPU program. EDGENATIVE=0: SPU code;
+// EDGECHECK=1: both, checking that ours keeps every triangle the SPU keeps ([edgecheck]); EDGEPOISON=1: native, and
+// the per-vertex screen data the SPU routine would have written is filled with garbage (nothing later may read it).
+static inline uint32_t rd32ls(const uint8_t* ls, uint32_t a) { const uint8_t* p = ls + (a & 0x3fffc); return uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
+static thread_local uint64_t t_jobSeq = 0;   // jobs run by this worker (pairs the culling routine's entry and return)
+static std::atomic<uint64_t> g_chkUnpaired{0};
+static std::atomic<uint64_t> g_chkJobs{0}, g_chkBad{0}, g_chkUnhandled{0}, g_chkTrisSpu{0}, g_chkTrisOurs{0};
+static uint32_t edge_hle(spurt::Q* __restrict r, Spu& s, uint32_t pc) {
+    if (pc != 0x9e68 && pc != 0x4400) return pc;
+    static const bool timing = std::getenv("CULLTIME") != nullptr, check = std::getenv("EDGECHECK") != nullptr,
+                      poison = std::getenv("EDGEPOISON") != nullptr;
+    static thread_local std::chrono::steady_clock::time_point t;
+    static thread_local bool in = false, pending = false;
+    static thread_local uint8_t* copy = nullptr;
+    static thread_local uint8_t* orig = nullptr;     // EDGECHECK: entry state (local store + registers), dumped when ours misses a triangle
+    static thread_local uint32_t ourCount, ourIdx, entryR1;
+    static thread_local uint64_t entryJob;
+    auto timeEnd = [&] {
+        if (timing && in) { in = false; g_cullNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t).count()); ++g_cullCalls; }
+    };
+    if (pc == 0x9e68) {
+        if (timing) { t = std::chrono::steady_clock::now(); in = true; }
+        const uint32_t ctx = r[3].w[0], mode = r[4].w[0], r1 = r[1].w[0];
+        if (check) {
+            if (!copy) { copy = new uint8_t[Spu::LS_SIZE]; orig = new uint8_t[Spu::LS_SIZE + 128 * 16]; }
+            std::memcpy(copy, s.ls, Spu::LS_SIZE);
+            std::memcpy(orig, s.ls, Spu::LS_SIZE);
+            for (int i = 0; i < 128; ++i) for (int k = 0; k < 4; ++k) { const uint32_t v = r[i].w[k]; uint8_t* d = orig + Spu::LS_SIZE + 16 * i + 4 * k; d[0] = uint8_t(v >> 24); d[1] = uint8_t(v >> 16); d[2] = uint8_t(v >> 8); d[3] = uint8_t(v); }
+            const EdgeCullResult cr = edge_cull_native(copy, ctx, mode, r1);
+            if (pending) ++g_chkUnpaired;
+            pending = cr.handled; entryJob = t_jobSeq; entryR1 = r1; ourCount = cr.count; ourIdx = rd32ls(copy, (ctx & 0x3fff0) + 0x50);
+            if (!cr.handled) ++g_chkUnhandled;
+            return pc;   // the SPU code runs as well
+        }
+        const EdgeCullResult cr = edge_cull_native(s.ls, ctx, mode, r1);
+        if (!cr.handled) return pc;
+        for (int k = 0; k < 4; ++k) r[3].w[k] = cr.count;
+        if (poison) {
+            const uint32_t nv = rd32ls(s.ls, (ctx & 0x3fff0) + 8) >> 16, out = rd32ls(s.ls, (ctx & 0x3fff0) + 0x14) & 0x3fff0;
+            if (out + nv * 16 <= Spu::LS_SIZE) std::memset(s.ls + out, 0xA5, nv * 16);
+        }
+        timeEnd();
+        return r[0].w[0] & 0x3fffc;   // back to the caller (0x4400)
+    }
+    timeEnd();
+    if (pending && (entryJob != t_jobSeq || r[1].w[0] != entryR1)) { pending = false; ++g_chkUnpaired; }
+    if (pending) {   // EDGECHECK: the SPU result is in s.ls / r3, ours in copy
+        pending = false;
+        const uint32_t spuCount = r[3].w[0];
+        uint32_t k = 0; bool sup = true;
+        for (uint32_t i = 0; i < spuCount && sup; i += 3) {
+            while (k < ourCount && std::memcmp(copy + ourIdx + 2 * k, s.ls + ourIdx + 2 * i, 6)) k += 3;
+            if (k >= ourCount) sup = false; else k += 3;
+        }
+        g_chkTrisSpu += spuCount / 3; g_chkTrisOurs += ourCount / 3;
+        if (!sup) {   // EDGECHECK=dir: keep the job (cull_replay format) for analysis
+            const long n = long(g_chkBad.load());
+            const char* dir = std::getenv("EDGECHECK");
+            if (n < 40 && dir && std::strlen(dir) > 1) {
+                char fn[300];
+                std::snprintf(fn, sizeof fn, "%s/cull_%04ld_in.bin", dir, n);
+                if (FILE* f = std::fopen(fn, "wb")) { std::fwrite(orig, 1, Spu::LS_SIZE + 128 * 16, f); std::fclose(f); }
+                std::snprintf(fn, sizeof fn, "%s/cull_%04ld_out.bin", dir, n);
+                if (FILE* f = std::fopen(fn, "wb")) {
+                    std::fwrite(s.ls, 1, Spu::LS_SIZE, f);
+                    for (int i = 0; i < 128; ++i) for (int k = 0; k < 4; ++k) { const uint32_t v = r[i].w[k]; const uint8_t b[4] = {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)}; std::fwrite(b, 1, 4, f); }
+                    std::fclose(f);
+                }
+            }
+        }
+        if (!sup && g_chkBad++ < 20) LOG("[edgecheck] job %llu: a triangle the SPU keeps is missing (SPU %u indices, ours %u)\n", (unsigned long long)g_chkJobs.load(), spuCount, ourCount);
+        if ((++g_chkJobs & 0xffff) == 0)
+            LOG("[edgecheck] %llu jobs, %llu with a missing triangle, %llu unpaired, %llu not handled, triangles SPU %llu ours %llu (+%.2f%%)\n", (unsigned long long)g_chkJobs.load(),
+                (unsigned long long)g_chkBad.load(), (unsigned long long)g_chkUnpaired.load(), (unsigned long long)g_chkUnhandled.load(), (unsigned long long)g_chkTrisSpu.load(), (unsigned long long)g_chkTrisOurs.load(),
+                g_chkTrisSpu ? 100.0 * (double(g_chkTrisOurs) - double(g_chkTrisSpu)) / double(g_chkTrisSpu) : 0.0);
+    }
+    return pc;
+}
+
 void run_job(const JobDesc& J) {
+    static const bool cullCapOn = [] {
+        if (std::getenv("CULLCAP")) spurt::g_spuHle[(0xbaea80u >> 4) % 64] = edge_cull_capture;
+        else if (!std::getenv("EDGENATIVE") || std::atoi(std::getenv("EDGENATIVE")) != 0 || std::getenv("EDGECHECK")) spurt::g_spuHle[(0xbaea80u >> 4) % 64] = edge_hle;
+        else if (std::getenv("CULLTIME")) spurt::g_spuHle[(0xbaea80u >> 4) % 64] = edge_cull_time;
+        return true; }();
+    (void)cullCapOn;
+    ++t_jobSeq;
     const uint32_t jea = J.jea;
     static thread_local Spu* spu = new Spu;
     const uint32_t eaBin = uint32_t(jd32(J, 4)) & ~0xFu;
@@ -1250,6 +1367,7 @@ void run_job(const JobDesc& J) {
         if (std::chrono::steady_clock::now() - last > std::chrono::seconds(4)) {
             last = std::chrono::steady_clock::now();
             for (auto& kv : perBin) LOG("[jobs]   binary %x: %llu jobs, %.1f us/job\n", kv.first, (unsigned long long)kv.second.first, kv.second.second / 1e3 / std::max<uint64_t>(1, kv.second.first));
+            if (g_cullCalls) { LOG("[culltime] %llu culling calls, %.1f us each\n", (unsigned long long)g_cullCalls.load(), g_cullNs.load() / 1e3 / g_cullCalls.load()); g_cullNs = 0; g_cullCalls = 0; }
             perBin.clear();
             if (spurt::g_spuProf) {
                 const int row = int((0xbaea80u >> 4) % 64);
