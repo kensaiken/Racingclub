@@ -123,6 +123,39 @@ bool dec_indexes(uint8_t* ls, uint32_t ctxp, uint32_t src, uint32_t* ret) {
     *ret = ctxp;
     return true;
 }
+
+// LS 0x12628 (called from 0x42c4, first stage of the job): r3 = context, r4 = primary vertex stream, r6 = secondary
+// stream (0 = none), r5 / r7 = their fixed point data. Calls the generic stream decompressor (0xf5e0) for each.
+// The only layout this game's jobs use (checked field by field, anything else goes to the SPU code): one stream
+// holding the position as three floats, 12 bytes per vertex, unpacked to float4 with w = 1 at the buffer the
+// context names at +0x10. It leaves: +0x54 and +0x58 = the stream (its space is free again), +0x5c = the unpacked
+// positions, +0x15c = 1 attribute, table at +0x160: slot 0 = attribute id 1 (position).
+bool dec_vertexes(uint8_t* ls, const uint32_t* a, uint32_t* ret) {
+    const uint32_t ctx = a[0] & 0x3fff0, src = a[1];
+    if (ctx + 0x170 > 0x40000 || a[3] != 0 || a[4] != 0) return false;
+    if (ls[ctx + 2] != 0 || (ls[ctx] & 16)) return false;                 // stream format: default; no extra output stage
+    if (be32(ls, ctx + 0x6c) != 0 || be32(ls, ctx + 0x7c) != 0) return false;   // custom stream descriptions
+    if (be32(ls, ctx + 0x150) != 5 || be32(ls, ctx + 0x154) != 5 || be32(ls, ctx + 0x15c) != 0 || be32(ls, ctx + 0x5c) != 0) return false;
+    for (int i = 0; i < 16; ++i) if (ls[ctx + 0x160 + i]) return false;
+    const uint32_t nv = be16(ls, ctx + 8), dst = be32(ls, ctx + 0x10);
+    if (nv == 0 || (nv & 7) || (src & 15) || (dst & 15) || src >= 0x40000 || dst >= 0x40000) return false;
+    if (src + 12 * nv + 4 > 0x40000 || dst + 16 * nv > 0x40000) return false;
+    if (!(src + 12 * nv + 4 <= dst || dst + 16 * nv <= src)) return false;   // overlapping buffers: order matters
+    const uint8_t* in = ls + src;
+    uint8_t* o = ls + dst;
+    static const uint8_t one[4] = {0x3f, 0x80, 0, 0};
+    for (uint32_t v = 0; v < nv; ++v) {
+        std::memcpy(o + 16 * v, in + 12 * v, 12);
+        std::memcpy(o + 16 * v + 12, one, 4);
+    }
+    wr32(ls, ctx + 0x54, src);
+    wr32(ls, ctx + 0x58, src);
+    wr32(ls, ctx + 0x5c, dst);
+    wr32(ls, ctx + 0x15c, 1);
+    ls[ctx + 0x160] = 1;
+    *ret = a[0];
+    return true;
+}
 }  // namespace
 
 bool edge_native_run(uint32_t entry, uint8_t* ls, const uint32_t* a, uint32_t r1, uint32_t* ret) {
@@ -139,6 +172,11 @@ bool edge_native_run(uint32_t entry, uint8_t* ls, const uint32_t* a, uint32_t r1
         case 0x12780: {
             const bool ok = dec_indexes(ls, a[0], a[1], ret);
             ++(ok ? g_edgeNativeCalls[1] : g_edgeNativeFallbacks[1]);
+            return ok;
+        }
+        case 0x12628: {
+            const bool ok = dec_vertexes(ls, a, ret);
+            ++(ok ? g_edgeNativeCalls[2] : g_edgeNativeFallbacks[2]);
             return ok;
         }
         default: return false;
