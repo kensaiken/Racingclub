@@ -1176,7 +1176,7 @@ void run_job(const JobDesc& J) {
         slot = &slots[k];
         if (!slot->spu) slot->bin = eaBin;
     }
-    if (!slot->spu) slot->spu = new Spu;
+    if (!slot->spu) { slot->spu = new Spu; std::memset(slot->spu->ls, 0, Spu::LS_SIZE); }
     Spu* const spu = slot->spu;
     const uint32_t sizeBin = uint32_t(jd16(J, 8)) * 16, sizeDma = jd16(J, 0xa);
     const uint32_t sizeInOut = jd32(J, 0x14), sizeOut = jd32(J, 0x18);
@@ -1228,7 +1228,10 @@ void run_job(const JobDesc& J) {
     s.mem = G->mem;
     s.reset();
     s.steps = 0;
-    std::memset(s.ls, 0, 0x3000);
+    // the kernel area and the job context/descriptor are rewritten below; the 10 KB between them stay zero from the
+    // creation of the local store (nothing writes there; clearing all 12 KB per job was 2-3 % of the workers). JOBCLEAR=1: as before
+    static const bool clearAll = std::getenv("JOBCLEAR") != nullptr;
+    if (clearAll) std::memset(s.ls, 0, 0x3000); else { std::memset(s.ls, 0, 0x400); std::memset(s.ls + LS_CTX, 0, LS_BIN - LS_CTX); }
     s.lssw(LS_STUB, 0x00003fff);   // stop 0x3fff: the job returned
     // SPURS kernel context (LS 0x100..): spuNum at 0x1C8 (cellSpursGetCurrentSpuId). Edge geometry keeps one output
     // ring per SPU, so every worker must report its own number.

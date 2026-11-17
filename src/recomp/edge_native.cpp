@@ -93,25 +93,29 @@ bool dec_indexes(uint8_t* ls, uint32_t ctxp, uint32_t src, uint32_t* ret) {
     }
     const uint8_t* flags = W.in + 8;
     const uint8_t* codes = W.in + codesOff;
+    // Triangle loop without data-dependent branches (flags and codes are close to random: as branches this was as
+    // slow as the SPU code, which does 8 triangles at a time). `use` = this index is needed; an index not needed
+    // reads its flag bit but consumes nothing.
     uint32_t fi = 0, ei = 0, nxt = 0;
-    auto get = [&]() -> uint16_t {
-        const uint32_t f = (flags[fi >> 3] >> (7 - (fi & 7))) & 1;
-        ++fi;
-        if (f) return W.ex[ei++];
-        return uint16_t(nxt++);
+    auto get = [&](uint32_t use) -> uint32_t {
+        const uint32_t f = (flags[fi >> 3] >> (7 - (fi & 7))) & use;
+        const uint32_t v = f ? uint32_t(W.ex[ei]) : nxt;   // both sides are plain loads: a conditional move
+        fi += use; ei += f; nxt += use & ~f;
+        return v;
     };
+    // previous triangle (p0, p1, p2): code 0 -> (p0, p2, new), 1 -> (p2, p1, new), 2 -> (p1, p0, new)
+    static const uint8_t selQ[4] = {0, 2, 1, 0}, selP[4] = {2, 1, 0, 0};
     uint8_t* o = W.out;
-    uint16_t a = 0, b = 0, c = 0;
+    uint32_t prev[4] = {0, 0, 0, 0};
     for (uint32_t t = 0; t < T; ++t) {
         const uint32_t code = (codes[t >> 2] >> (6 - 2 * (t & 3))) & 3;
-        if (code == 3 || t == 0) { a = get(); b = get(); c = get(); }
-        else {
-            // previous (a, b, c): code 0 -> (a, c, new), 1 -> (c, b, new), 2 -> (b, a, new)
-            uint16_t q, p;
-            if (code == 0) { q = a; p = c; } else if (code == 1) { q = c; p = b; } else { q = b; p = a; }
-            a = q; b = p; c = get();
-        }
-        o[0] = uint8_t(a >> 8); o[1] = uint8_t(a); o[2] = uint8_t(b >> 8); o[3] = uint8_t(b); o[4] = uint8_t(c >> 8); o[5] = uint8_t(c);
+        const uint32_t fresh = uint32_t(code == 3) | uint32_t(t == 0);
+        const uint32_t v1 = get(1), v2 = get(fresh), v3 = get(fresh);
+        const uint32_t q = prev[selQ[code]], p = prev[selP[code]];
+        const uint32_t a = fresh ? v1 : q, b = fresh ? v2 : p, c = fresh ? v3 : v1;
+        prev[0] = a; prev[1] = b; prev[2] = c;
+        const uint64_t be = uint64_t(__builtin_bswap16(uint16_t(a))) | uint64_t(__builtin_bswap16(uint16_t(b))) << 16 | uint64_t(__builtin_bswap16(uint16_t(c))) << 32;
+        std::memcpy(o, &be, 8);   // 6 bytes + 2 the next triangle overwrites (the buffer has room)
         o += 6;
     }
     if (fi > 8 * C || ei > A) return false;   // a stream that does not follow the format: let the SPU code deal with it

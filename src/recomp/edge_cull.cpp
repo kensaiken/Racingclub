@@ -34,7 +34,7 @@ inline void wr32(uint8_t* ls, uint32_t a, uint32_t v) { uint8_t* p = ls + (a & 0
 // position, so holding at the corners means holding inside. Margins: twice the per-vertex error bounds, which
 // are themselves bounded over the box.
 bool box_outside(const uint8_t* ls, uint32_t pos, uint32_t nv, const double T[4][4], const double TA[4][4],
-                 double scX, double scY, double ofX, double ofY, double fW, double fH) {
+                 double scX, double scY, double ofX, double ofY, double fW, double fH, double mbOut[4]) {
     const __m128i bs = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
     const __m256i bs2 = _mm256_broadcastsi128_si256(bs);
     const uint8_t* src = ls + pos;
@@ -63,6 +63,7 @@ bool box_outside(const uint8_t* ls, uint32_t pos, uint32_t nv, const double T[4]
     double A[4] = {std::fmax(std::fabs(lo[0]), std::fabs(hi[0])), std::fmax(std::fabs(lo[1]), std::fabs(hi[1])), std::fmax(std::fabs(lo[2]), std::fabs(hi[2])), 1.0};
     double mb[4];
     for (int i = 0; i < 4; ++i) mb[i] = ((TA[i][0] * A[0] + TA[i][1] * A[1]) + (TA[i][2] * A[2] + TA[i][3])) * 3e-7 * 1.02 + 1e-30;
+    for (int i = 0; i < 4; ++i) mbOut[i] = mb[i];   // also the error bound of every vertex of the job (see the vertex pass)
     double c[8][4];
     for (int k = 0; k < 8; ++k) {
         const double p[4] = {(k & 1) ? hi[0] : lo[0], (k & 2) ? hi[1] : lo[1], (k & 4) ? hi[2] : lo[2], 1.0};
@@ -132,7 +133,8 @@ EdgeCullResult edge_cull_native(uint8_t* ls, uint32_t ctx, uint32_t mode, uint32
             T[i][k] = v; TA[i][k] = va;
         }
     static const bool boxOn = !std::getenv("EDGEBOX") || std::atoi(std::getenv("EDGEBOX")) != 0;
-    if (boxOn && box_outside(ls, pos, nv, T, TA, scX, scY, ofX, ofY, double(sw), double(sh))) {
+    double mbBox[4] = {-1, -1, -1, -1};   // set when the box of the positions is usable
+    if (boxOn && box_outside(ls, pos, nv, T, TA, scX, scY, ofX, ofY, double(sw), double(sh), mbBox)) {
         uint32_t bad = 0;   // like the full path: an index past the vertices means data we do not understand
         for (uint32_t t = 0; t < ni; ++t) bad |= uint32_t(be16(ls, idx + 2 * t) >= nv);
         if (!bad) {
@@ -164,6 +166,12 @@ EdgeCullResult edge_cull_native(uint8_t* ls, uint32_t ctx, uint32_t mode, uint32
     for (int i = 0; i < 4; ++i) for (int k = 0; k < 4; ++k) { Tf[i][k] = float(T[i][k]); TAf[i][k] = float(TA[i][k]); }
     const float fScX = float(scX), fScY = float(scY), fOfX = float(ofX), fOfY = float(ofY);
     const float aScX = std::fabs(fScX), aScY = std::fabs(fScY), fW = float(sw), fH = float(sh);
+    // Error bound of the transformed vertex: per vertex from its own magnitudes, or (constM) the one bound of the
+    // whole job that the box test worked out, which covers every vertex: a third less arithmetic per vertex for
+    // slightly wider margins. EDGECONSTM=0: always per vertex.
+    static const bool constMOn = !std::getenv("EDGECONSTM") || std::atoi(std::getenv("EDGECONSTM")) != 0;
+    const float mC[4] = {float(mbBox[0] * 1.0001), float(mbBox[1] * 1.0001), float(mbBox[2] * 1.0001), float(mbBox[3] * 1.0001)};
+    auto vertexPass = [&](const bool constM) __attribute__((always_inline)) {
 #pragma clang loop vectorize(assume_safety) vectorize_width(8)
     for (uint32_t v = 0; v < nv; ++v) {
         const float p0 = V.p[0][v], p1 = V.p[1][v], p2 = V.p[2][v], p3 = V.p[3][v];
@@ -173,7 +181,7 @@ EdgeCullResult edge_cull_native(uint8_t* ls, uint32_t ctx, uint32_t mode, uint32
             const float t0 = Tf[i][0] * p0, t1 = Tf[i][1] * p1, t2 = Tf[i][2] * p2, t3 = Tf[i][3] * p3;
             c[i] = (t0 + t1) + (t2 + t3);
             // error bound: the SPU may round the matrix product M L and the world position as well as the sums
-            m[i] = ((TAf[i][0] * a0 + TAf[i][1] * a1) + (TAf[i][2] * a2 + TAf[i][3] * a3)) * 3e-7f + 1e-30f;
+            m[i] = constM ? mC[i] : ((TAf[i][0] * a0 + TAf[i][1] * a1) + (TAf[i][2] * a2 + TAf[i][3] * a3)) * 3e-7f + 1e-30f;
         }
         const bool screen = c[3] > m[3] * 4 && c[3] > 1e-20f;
         const float iw = 1.0f / (screen ? c[3] : 1.0f), rw = m[3] * iw;
@@ -194,6 +202,8 @@ EdgeCullResult edge_cull_native(uint8_t* ls, uint32_t ctx, uint32_t mode, uint32
         V.x[v] = x; V.y[v] = y; V.e[v] = e;
         V.f[v] = uint8_t(f | (noArea ? 1 : 0) | (noArea || !snapOk ? 2 : 0));
     }
+    };
+    if (constMOn && mbBox[0] >= 0) vertexPass(true); else vertexPass(false);
     uint64_t q2 = __rdtsc(); g_edgeCullCyc[1] += q2 - q1;
     if (boxOn) {   // every vertex shares an outcode bit (mixed-plane cases the box misses): every triangle is culled
         uint8_t all = 0xff;
