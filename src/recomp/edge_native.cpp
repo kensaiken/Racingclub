@@ -6,7 +6,8 @@
 
 namespace gti::recomp {
 
-uint64_t g_edgeNativeCalls[4], g_edgeNativeFallbacks[4];   // per routine (0: 0x7140)
+uint64_t g_edgeNativeCalls[4], g_edgeNativeFallbacks[4];   // per routine (0: 0x7140, 1: 0x12780)
+thread_local uint32_t g_edgeNativeDead[2];   // local store range the last native call left unlike the SPU code (dead bytes)
 
 namespace {
 inline uint32_t be32(const uint8_t* ls, uint32_t a) { const uint8_t* p = ls + (a & 0x3ffff); return uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
@@ -49,16 +50,95 @@ bool out_positions(uint8_t* ls, uint32_t ctxp, uint32_t* ret) {
     *ret = dst;
     return true;
 }
+
+// LS 0x12780 (called from 0x434c, before the culling): r3 = context, r4 = compressed index block (16-byte aligned).
+// Decompresses Edge's triangle list in place (the list starts where the block was) and sets ctx+0x50 = list,
+// ctx+0x58 = end of what the SPU code wrote. Format (reverse engineered for tools/ep3.py):
+//   header  u16 numDeltas, u16 bias, u16 flagBytes, u8 deltaBits, u8 pad
+//   flagBytes of flags, one bit per index a triangle needs: 1 = next explicit value, 0 = next sequential vertex
+//   2 bits per triangle: 3 = three new indexes, 0/1/2 = shares an edge of the previous triangle + one new index
+//   byte aligned: numDeltas values of deltaBits bits: explicit[i] = value - bias + explicit[i - 8]
+// The SPU code decodes 8 triangles (48 bytes) at a time: what it leaves between the real end of the list and the
+// end of the last group, and in the free space above (its work area), is not reproduced: nothing reads it (the
+// culling compacts the list and resets the end, the output routine writes over it). g_edgeNativeDead tells the
+// test tool where that is.
+struct IdxWork { uint8_t in[0x12000]; uint16_t ex[0x10010]; uint8_t out[0x20010]; };
+bool dec_indexes(uint8_t* ls, uint32_t ctxp, uint32_t src, uint32_t* ret) {
+    const uint32_t ctx = ctxp & 0x3fff0;
+    if (ctx + 0x60 > 0x40000 || (src & 15) || src >= 0x40000) return false;
+    const uint32_t ni = be16(ls, ctx + 10);
+    if (ni == 0 || ni % 3) return false;
+    if (((ls[ctx + 6] >> 4) & 15) != 3) return false;   // index flavour: the only one seen (2 also reaches this code)
+    const uint32_t A = be16(ls, src), B = be16(ls, src + 2), C = be16(ls, src + 4), D = ls[src + 6];
+    if (D > 16) return false;
+    const uint32_t T = ni / 3;
+    const uint32_t codesOff = 8 + C, deltaOff = codesOff + (2 * T + 7) / 8, total = deltaOff + (A * D + 7) / 8;
+    if (total + 8 > sizeof(IdxWork::in) || src + total > 0x40000 || src + 2 * ni + 48 > 0x40000) return false;
+    static thread_local IdxWork* work = nullptr;
+    if (!work) work = new IdxWork;
+    IdxWork& W = *work;
+    std::memcpy(W.in, ls + src, total);
+    std::memset(W.in + total, 0, 8);
+    // explicit values
+    {
+        const uint8_t* dp = W.in + deltaOff;
+        const uint32_t mask = (1u << D) - 1;
+        uint32_t bit = 0;
+        for (uint32_t i = 0; i < A; ++i, bit += D) {
+            const uint8_t* p = dp + (bit >> 3);
+            const uint32_t w = uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+            const uint32_t v = (w >> (32 - D - (bit & 7))) & mask;
+            W.ex[i] = uint16_t(v - B + (i >= 8 ? W.ex[i - 8] : 0));
+        }
+    }
+    const uint8_t* flags = W.in + 8;
+    const uint8_t* codes = W.in + codesOff;
+    uint32_t fi = 0, ei = 0, nxt = 0;
+    auto get = [&]() -> uint16_t {
+        const uint32_t f = (flags[fi >> 3] >> (7 - (fi & 7))) & 1;
+        ++fi;
+        if (f) return W.ex[ei++];
+        return uint16_t(nxt++);
+    };
+    uint8_t* o = W.out;
+    uint16_t a = 0, b = 0, c = 0;
+    for (uint32_t t = 0; t < T; ++t) {
+        const uint32_t code = (codes[t >> 2] >> (6 - 2 * (t & 3))) & 3;
+        if (code == 3 || t == 0) { a = get(); b = get(); c = get(); }
+        else {
+            // previous (a, b, c): code 0 -> (a, c, new), 1 -> (c, b, new), 2 -> (b, a, new)
+            uint16_t q, p;
+            if (code == 0) { q = a; p = c; } else if (code == 1) { q = c; p = b; } else { q = b; p = a; }
+            a = q; b = p; c = get();
+        }
+        o[0] = uint8_t(a >> 8); o[1] = uint8_t(a); o[2] = uint8_t(b >> 8); o[3] = uint8_t(b); o[4] = uint8_t(c >> 8); o[5] = uint8_t(c);
+        o += 6;
+    }
+    if (fi > 8 * C || ei > A) return false;   // a stream that does not follow the format: let the SPU code deal with it
+    std::memcpy(ls + src, W.out, 2 * ni);
+    const uint32_t end = src + 48 * ((T + 7) / 8);
+    wr32(ls, ctx + 0x50, src);
+    wr32(ls, ctx + 0x58, end);
+    g_edgeNativeDead[0] = src + 2 * ni; g_edgeNativeDead[1] = be32(ls, ctx + 0x5c);
+    *ret = ctxp;
+    return true;
+}
 }  // namespace
 
 bool edge_native_run(uint32_t entry, uint8_t* ls, const uint32_t* a, uint32_t r1, uint32_t* ret) {
     (void)r1;
     static const bool off = std::getenv("EDGENATIVE2") && std::atoi(std::getenv("EDGENATIVE2")) == 0;
     if (off) return false;
+    g_edgeNativeDead[0] = g_edgeNativeDead[1] = 0;
     switch (entry) {
         case 0x7140: {
             const bool ok = out_positions(ls, a[0], ret);
             ++(ok ? g_edgeNativeCalls[0] : g_edgeNativeFallbacks[0]);
+            return ok;
+        }
+        case 0x12780: {
+            const bool ok = dec_indexes(ls, a[0], a[1], ret);
+            ++(ok ? g_edgeNativeCalls[1] : g_edgeNativeFallbacks[1]);
             return ok;
         }
         default: return false;

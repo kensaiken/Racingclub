@@ -108,6 +108,10 @@ int main(int argc, char** argv) {
         const uint32_t frameLo = native ? (r1 - 0x800) & 0x3fff0 : 0x40000, frameHi = native ? r1 : 0x40000;
         for (uint32_t o = 0; o < Spu::LS_SIZE; o += 4) {
             if (o >= frameLo && o < frameHi) continue;
+            if (native && o + 4 > g_edgeNativeDead[0] && o < g_edgeNativeDead[1]) {   // dead bytes; a word straddling the start: compare its live bytes
+                if (o < g_edgeNativeDead[0] && std::memcmp(s.ls + o, out.data() + o, g_edgeNativeDead[0] - o)) { if (!diffs++) firstDiff = o; }
+                continue;
+            }
             if (std::memcmp(s.ls + o, out.data() + o, 4)) { if (!diffs++) firstDiff = o; }
         }
         int rdiff = -1;

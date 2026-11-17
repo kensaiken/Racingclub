@@ -12,5 +12,8 @@ bool edge_native_run(uint32_t entry, uint8_t* ls, const uint32_t* a, uint32_t r1
 
 // calls handled natively / left to the SPU code, per routine (0: 0x7140, 1: 0x12780, 2: 0x12628); EDGESTAT2=1 logs them
 extern uint64_t g_edgeNativeCalls[4], g_edgeNativeFallbacks[4];
+// [lo, hi) of the local store where the last native call on this thread did not reproduce what the SPU code leaves
+// (padding and work areas nothing reads); empty when it is exact. For fn_replay.
+extern thread_local uint32_t g_edgeNativeDead[2];
 
 } // namespace gti::recomp

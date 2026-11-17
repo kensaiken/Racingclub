@@ -1061,7 +1061,7 @@ static thread_local uint64_t t_jobSeq = 0;   // jobs run by this worker (pairs t
 static std::atomic<uint64_t> g_chkUnpaired{0};
 static std::atomic<uint64_t> g_chkJobs{0}, g_chkBad{0}, g_chkUnhandled{0}, g_chkTrisSpu{0}, g_chkTrisOurs{0};
 static uint32_t edge_hle(spurt::Q* __restrict r, Spu& s, uint32_t pc) {
-    if (pc == 0x7140 && g_fnCapEntry != pc) {   // edge_native.cpp (FNCAP of the routine itself: keep the SPU code)
+    if ((pc == 0x7140 || pc == 0x12780) && g_fnCapEntry != pc) {   // edge_native.cpp (FNCAP of the routine itself: keep the SPU code)
         uint32_t a[8], ret = 0;
         for (int i = 0; i < 8; ++i) a[i] = r[3 + i].w[0];
         if (!edge_native_run(pc, s.ls, a, r[1].w[0], &ret)) return pc;
@@ -1150,7 +1150,7 @@ void run_job(const JobDesc& J) {
         // all three hooks only look at the culling routine's entry and its return
         uint32_t* pcs = spurt::g_spuHlePcs[(0xbaea80u >> 4) % 64];
         pcs[0] = 0x9e68; pcs[1] = 0x4400;
-        pcs[2] = 0x7140;   // native routines of edge_native.cpp (edge_hle)
+        pcs[2] = 0x7140; pcs[3] = 0x12780;   // native routines of edge_native.cpp (edge_hle)
         if (std::getenv("FNCAP")) {
             spurt::g_spuHle[(0xbaea80u >> 4) % 64] = edge_fn_capture;
             uint32_t e = 0, rt = 0;
