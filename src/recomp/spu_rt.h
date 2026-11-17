@@ -20,12 +20,14 @@ void spu_slow_report();
 // crosses into another chunk (calls and returns between routines do); returns the pc to continue at (pc itself = not handled)
 using HleHook = uint32_t (*)(Q* __restrict r, Spu& s, uint32_t pc);
 extern HleHook g_spuHle[64];
-// the pcs a hook wants (up to 4; all 0 = every crossing): the dispatcher calls it only there (an indirect call on
+// the pcs a hook wants (up to 8; all 0 = every crossing): the dispatcher calls it only there (an indirect call on
 // every chunk crossing was 2-3 % of the Edge jobs)
-extern uint32_t g_spuHlePcs[64][4];
+extern uint32_t g_spuHlePcs[64][8];
 inline bool spu_hle_wants(int k, uint32_t pc) {
     const uint32_t* p = g_spuHlePcs[k];
-    return pc == p[0] || pc == p[1] || pc == p[2] || pc == p[3] || (p[0] | p[1] | p[2] | p[3]) == 0;
+    uint32_t any = 0; bool hit = false;
+    for (int i = 0; i < 8; ++i) { hit |= pc == p[i]; any |= p[i]; }
+    return hit || any == 0;
 }
 
 // A chunk runs from pc until it leaves its 1 KB of code. Result: next pc, | 0x80000000 = the interpreter must

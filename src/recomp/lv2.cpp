@@ -4,6 +4,7 @@
 #include "recomp/rsx_gl.h"
 #include "recomp/spu_rt.h"
 #include "recomp/edge_cull.h"
+#include "recomp/edge_native.h"
 #include "recomp/hle.h"
 #include "recomp/spu.h"
 #include "recomp/atrac3.h"
@@ -1012,6 +1013,35 @@ static uint32_t edge_cull_capture(spurt::Q* __restrict r, Spu& s, uint32_t pc) {
     if (pc == 0x4400) mine = -1;
     return pc;
 }
+// FNCAP=entry,return,dir,seconds,n (hex LS addresses): the same capture for any Edge routine that only works on the
+// local store -> dir/fn_NNNN_in.bin / _out.bin (tool: fn_replay). Native culling keeps running around it.
+static uint32_t g_fnCapEntry = 0, g_fnCapRet = 0;
+static uint32_t edge_hle(spurt::Q* __restrict r, Spu& s, uint32_t pc);
+static uint32_t edge_fn_capture(spurt::Q* __restrict r, Spu& s, uint32_t pc) {
+    static char dir[256]; static long left = 0, first = 0; static uint64_t t0 = 0;
+    static std::atomic<long> seq{0};
+    static std::once_flag once;
+    static thread_local long mine = -1;
+    static thread_local uint32_t entryR1 = 0;
+    std::call_once(once, [] { long n = 0; if (std::sscanf(std::getenv("FNCAP"), "%x,%x,%255[^,],%ld,%ld", &g_fnCapEntry, &g_fnCapRet, dir, &first, &n) == 5) left = n; t0 = now_us(); });
+    if (pc == g_fnCapEntry || (pc == g_fnCapRet && mine >= 0 && r[1].w[0] == entryR1)) {
+        bool take = true;
+        if (pc == g_fnCapEntry) {
+            if (now_us() - t0 < uint64_t(first) * 1000000u) take = false;
+            else { mine = seq++; if (mine >= left) { mine = -1; take = false; } else entryR1 = r[1].w[0]; }
+        }
+        if (take) {
+            char fn[300]; std::snprintf(fn, sizeof fn, "%s/fn_%04ld_%s.bin", dir, mine, pc == g_fnCapEntry ? "in" : "out");
+            if (FILE* f = std::fopen(fn, "wb")) {
+                std::fwrite(s.ls, 1, Spu::LS_SIZE, f);
+                for (int i = 0; i < 128; ++i) for (int k = 0; k < 4; ++k) { const uint32_t v = r[i].w[k]; const uint8_t b[4] = {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)}; std::fwrite(b, 1, 4, f); }
+                std::fclose(f);
+            }
+            if (pc == g_fnCapRet) mine = -1;
+        }
+    }
+    return edge_hle(r, s, pc);
+}
 
 // CULLTIME=1: time spent inside Edge's culling routine, against the whole Edge jobs ([culltime] every 2^16 calls)
 static std::atomic<uint64_t> g_cullNs{0}, g_cullCalls{0};
@@ -1031,6 +1061,16 @@ static thread_local uint64_t t_jobSeq = 0;   // jobs run by this worker (pairs t
 static std::atomic<uint64_t> g_chkUnpaired{0};
 static std::atomic<uint64_t> g_chkJobs{0}, g_chkBad{0}, g_chkUnhandled{0}, g_chkTrisSpu{0}, g_chkTrisOurs{0};
 static uint32_t edge_hle(spurt::Q* __restrict r, Spu& s, uint32_t pc) {
+    if (pc == 0x7140 && g_fnCapEntry != pc) {   // edge_native.cpp (FNCAP of the routine itself: keep the SPU code)
+        uint32_t a[8], ret = 0;
+        for (int i = 0; i < 8; ++i) a[i] = r[3 + i].w[0];
+        if (!edge_native_run(pc, s.ls, a, r[1].w[0], &ret)) return pc;
+        // what the SPU routine leaves that may matter: r3, and its prologue's link register save at r1 + 16
+        r[3].w[0] = ret;
+        uint8_t* d = s.ls + ((r[1].w[0] + 16) & 0x3fff0);
+        for (int k = 0; k < 4; ++k) { const uint32_t v = r[0].w[k]; d[4 * k] = uint8_t(v >> 24); d[4 * k + 1] = uint8_t(v >> 16); d[4 * k + 2] = uint8_t(v >> 8); d[4 * k + 3] = uint8_t(v); }
+        return r[0].w[0] & 0x3fffc;
+    }
     if (pc != 0x9e68 && pc != 0x4400) return pc;
     static const bool timing = std::getenv("CULLTIME") != nullptr, check = std::getenv("EDGECHECK") != nullptr,
                       poison = std::getenv("EDGEPOISON") != nullptr;
@@ -1108,7 +1148,15 @@ void run_job(const JobDesc& J) {
         else if (!std::getenv("EDGENATIVE") || std::atoi(std::getenv("EDGENATIVE")) != 0 || std::getenv("EDGECHECK")) spurt::g_spuHle[(0xbaea80u >> 4) % 64] = edge_hle;
         else if (std::getenv("CULLTIME")) spurt::g_spuHle[(0xbaea80u >> 4) % 64] = edge_cull_time;
         // all three hooks only look at the culling routine's entry and its return
-        spurt::g_spuHlePcs[(0xbaea80u >> 4) % 64][0] = 0x9e68; spurt::g_spuHlePcs[(0xbaea80u >> 4) % 64][1] = 0x4400;
+        uint32_t* pcs = spurt::g_spuHlePcs[(0xbaea80u >> 4) % 64];
+        pcs[0] = 0x9e68; pcs[1] = 0x4400;
+        pcs[2] = 0x7140;   // native routines of edge_native.cpp (edge_hle)
+        if (std::getenv("FNCAP")) {
+            spurt::g_spuHle[(0xbaea80u >> 4) % 64] = edge_fn_capture;
+            uint32_t e = 0, rt = 0;
+            std::sscanf(std::getenv("FNCAP"), "%x,%x", &e, &rt);
+            pcs[6] = e; pcs[7] = rt;
+        }
         return true; }();
     (void)cullCapOn;
     ++t_jobSeq;
@@ -1388,6 +1436,8 @@ void run_job(const JobDesc& J) {
         if (std::chrono::steady_clock::now() - last > std::chrono::seconds(4)) {
             last = std::chrono::steady_clock::now();
             for (auto& kv : perBin) LOG("[jobs]   binary %x: %llu jobs, %.1f us/job\n", kv.first, (unsigned long long)kv.second.first, kv.second.second / 1e3 / std::max<uint64_t>(1, kv.second.first));
+            if (std::getenv("EDGESTAT2")) LOG("[edgenative] native / left to the SPU: 0x7140 %llu/%llu, 0x12780 %llu/%llu, 0x12628 %llu/%llu\n", (unsigned long long)g_edgeNativeCalls[0], (unsigned long long)g_edgeNativeFallbacks[0],
+                (unsigned long long)g_edgeNativeCalls[1], (unsigned long long)g_edgeNativeFallbacks[1], (unsigned long long)g_edgeNativeCalls[2], (unsigned long long)g_edgeNativeFallbacks[2]);
             if (g_cullCalls) { LOG("[culltime] %llu culling calls, %.1f us each\n", (unsigned long long)g_cullCalls.load(), g_cullNs.load() / 1e3 / g_cullCalls.load()); g_cullNs = 0; g_cullCalls = 0; }
             perBin.clear();
             if (spurt::g_spuProf) {

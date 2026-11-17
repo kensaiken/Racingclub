@@ -561,7 +561,7 @@ def main():
     for (ea, base, size, fn) in table:
         t.append(f'void {fn}(Spu& s);')
         t.append(f'extern const SlowChunk k_{fn}_slow[];')
-    t += ['', 'bool g_spuProf = false;', 'uint64_t g_spuProfCnt[64][256];', 'uint64_t g_spuSlowEntries = 0;', 'HleHook g_spuHle[64];', 'uint32_t g_spuHlePcs[64][4];']
+    t += ['', 'bool g_spuProf = false;', 'uint64_t g_spuProfCnt[64][256];', 'uint64_t g_spuSlowEntries = 0;', 'HleHook g_spuHle[64];', 'uint32_t g_spuHlePcs[64][8];']
     t += ['', 'static const Compiled k_table[] = {']
     for (ea, base, size, fn) in table:
         t.append(f'    {{0x{ea:x}, 0x{base:x}, 0x{size:x}, {fn}, k_{fn}_slow}},')
