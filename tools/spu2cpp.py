@@ -515,7 +515,7 @@ def gen(read, ea, size, base):
              '    uint64_t n = 0;',
              f'    while (pc >= 0x{base:x}u && pc < 0x{end:x}u) {{',
              '        ++n;',
-             f'        if (HleHook h = g_spuHle[(0x{ea:x}u >> 4) % 64]) {{ pc = h(r, s, pc); if (pc < 0x{base:x}u || pc >= 0x{end:x}u) break; }}',
+             f'        if (HleHook h = g_spuHle[(0x{ea:x}u >> 4) % 64]; h && spu_hle_wants((0x{ea:x}u >> 4) % 64, pc)) {{ pc = h(r, s, pc); if (pc < 0x{base:x}u || pc >= 0x{end:x}u) break; }}',
              f'        const uint32_t c = (pc - 0x{base:x}u) >> 10;',
              f'        if (g_spuProf) ++g_spuProfCnt[(0x{ea:x}u >> 4) % 64][c & 255];',
              f'        pc = k_{fn}_fast[c](r, s, pc);',
@@ -561,7 +561,7 @@ def main():
     for (ea, base, size, fn) in table:
         t.append(f'void {fn}(Spu& s);')
         t.append(f'extern const SlowChunk k_{fn}_slow[];')
-    t += ['', 'bool g_spuProf = false;', 'uint64_t g_spuProfCnt[64][256];', 'uint64_t g_spuSlowEntries = 0;', 'HleHook g_spuHle[64];']
+    t += ['', 'bool g_spuProf = false;', 'uint64_t g_spuProfCnt[64][256];', 'uint64_t g_spuSlowEntries = 0;', 'HleHook g_spuHle[64];', 'uint32_t g_spuHlePcs[64][4];']
     t += ['', 'static const Compiled k_table[] = {']
     for (ea, base, size, fn) in table:
         t.append(f'    {{0x{ea:x}, 0x{base:x}, 0x{size:x}, {fn}, k_{fn}_slow}},')

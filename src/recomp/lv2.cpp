@@ -1107,6 +1107,8 @@ void run_job(const JobDesc& J) {
         if (std::getenv("CULLCAP")) spurt::g_spuHle[(0xbaea80u >> 4) % 64] = edge_cull_capture;
         else if (!std::getenv("EDGENATIVE") || std::atoi(std::getenv("EDGENATIVE")) != 0 || std::getenv("EDGECHECK")) spurt::g_spuHle[(0xbaea80u >> 4) % 64] = edge_hle;
         else if (std::getenv("CULLTIME")) spurt::g_spuHle[(0xbaea80u >> 4) % 64] = edge_cull_time;
+        // all three hooks only look at the culling routine's entry and its return
+        spurt::g_spuHlePcs[(0xbaea80u >> 4) % 64][0] = 0x9e68; spurt::g_spuHlePcs[(0xbaea80u >> 4) % 64][1] = 0x4400;
         return true; }();
     (void)cullCapOn;
     ++t_jobSeq;
