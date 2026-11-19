@@ -945,10 +945,18 @@ constexpr VkDeviceSize kFcRange = 8192;   // fragment program constants: up to 5
 std::vector<uint32_t> idx;
 uint64_t skippedDraws = 0;
 // what the current command buffer has bound (reset with each frame and after fixed-function passes)
-struct Bound { VkPipeline pipe = VK_NULL_HANDLE; VkDescriptorSet set = VK_NULL_HANDLE; uint32_t offs[3] = {~0u, ~0u, ~0u}; } bound;
+struct Bound { VkPipeline pipe = VK_NULL_HANDLE; VkDescriptorSet set = VK_NULL_HANDLE; uint32_t offs[3] = {~0u, ~0u, ~0u}; bool dyn = false; uint32_t dynKey[28] = {}; } bound;
 VkDeviceSize vcOff = 0, dcOff = 0, fcOff = 0; uint64_t vcFrame = ~0ull, dcFrame = ~0ull, fcFrame = ~0ull;
 
 void apply_dynamic_state(uint32_t topoPrim) {
+    {   // the registers this state comes from: nothing to record when they are what the last draw set
+        static const uint16_t regs[] = {0x183c, 0x1830, 0x1834, 0xa74, 0xa70, 0xa6c, 0x328, 0x33c, 0x340, 0x344, 0x330, 0x338, 0x32c, 0x334, 0xa68, 0xa78, 0xa7c, 0x31c, 0x8c0, 0x8c4, 0xa00, 0xa04};
+        uint32_t k[28];
+        for (size_t i = 0; i < sizeof regs / sizeof regs[0]; ++i) k[i] = R[regs[i] >> 2];
+        k[22] = topoPrim; k[23] = cur.aaX; k[24] = cur.aaY; k[25] = cur.w; k[26] = cur.h; k[27] = 0;
+        if (bound.dyn && std::memcmp(k, bound.dynKey, sizeof k) == 0) return;
+        std::memcpy(bound.dynKey, k, sizeof k); bound.dyn = true;
+    }
     VkCommandBuffer c = cmd();
     static const bool noCull = std::getenv("RSXNOCULL") != nullptr;
     const bool cull = !noCull && (R[0x183c >> 2] & 1);
