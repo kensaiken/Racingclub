@@ -2,7 +2,9 @@
 // FNCAP + build-test/fn_replay.exe (NATIVE=1), which compares the whole local store outside the routine's stack frame.
 #include "recomp/edge_native.h"
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
+#include <x86intrin.h>
 
 namespace gti::recomp {
 
@@ -42,7 +44,9 @@ bool out_positions(uint8_t* ls, uint32_t ctxp, uint32_t* ret) {
     std::memcpy(lastYZ, ls + src + 16 * (nv - 1) + 4, 8);
     uint8_t* o = ls + dst;
     const uint8_t* in = ls + src;
-    for (uint32_t v = 0; v < nv; ++v) std::memmove(o + 12 * v, in + 16 * v, 12);
+    // 16 bytes per store, 12 kept: the extra 4 are overwritten by the next vertex (and by the tail after the last);
+    // with dst below src (or apart) no store reaches a vertex not read yet
+    for (uint32_t v = 0; v < nv; ++v) _mm_storeu_si128(reinterpret_cast<__m128i*>(o + 12 * v), _mm_load_si128(reinterpret_cast<const __m128i*>(in + 16 * v)));
     std::memset(ls + end, 0, 8);
     std::memcpy(ls + end + 8, lastYZ, 8);
     wr32(ls, ctx + 0x54, dst);
@@ -62,7 +66,7 @@ bool out_positions(uint8_t* ls, uint32_t ctxp, uint32_t* ret) {
 // end of the last group, and in the free space above (its work area), is not reproduced: nothing reads it (the
 // culling compacts the list and resets the end, the output routine writes over it). g_edgeNativeDead tells the
 // test tool where that is.
-struct IdxWork { uint8_t in[0x12000]; uint16_t ex[0x10010]; uint8_t out[0x20010]; };
+struct IdxWork { uint8_t in[0x12000]; uint16_t ex[0x10010]; uint16_t val[0x10010]; uint8_t out[0x20010]; };
 bool dec_indexes(uint8_t* ls, uint32_t ctxp, uint32_t src, uint32_t* ret) {
     const uint32_t ctx = ctxp & 0x3fff0;
     if (ctx + 0x60 > 0x40000 || (src & 15) || src >= 0x40000) return false;
@@ -93,32 +97,41 @@ bool dec_indexes(uint8_t* ls, uint32_t ctxp, uint32_t src, uint32_t* ret) {
     }
     const uint8_t* flags = W.in + 8;
     const uint8_t* codes = W.in + codesOff;
-    // Triangle loop without data-dependent branches (flags and codes are close to random: as branches this was as
-    // slow as the SPU code, which does 8 triangles at a time). `use` = this index is needed; an index not needed
-    // reads its flag bit but consumes nothing.
-    uint32_t fi = 0, ei = 0, nxt = 0;
-    auto get = [&](uint32_t use) -> uint32_t {
-        const uint32_t f = (flags[fi >> 3] >> (7 - (fi & 7))) & use;
-        const uint32_t v = f ? uint32_t(W.ex[ei]) : nxt;   // both sides are plain loads: a conditional move
-        fi += use; ei += f; nxt += use & ~f;
-        return v;
-    };
-    // previous triangle (p0, p1, p2): code 0 -> (p0, p2, new), 1 -> (p2, p1, new), 2 -> (p1, p0, new)
-    static const uint8_t selQ[4] = {0, 2, 1, 0}, selP[4] = {2, 1, 0, 0};
+    // Two passes, neither with data-dependent branches or counters chained through memory (flags and codes are close
+    // to random; one pass with branches was as slow as the SPU code, which does 8 triangles at a time).
+    // Pass 1: the value each flag bit stands for (already byte-swapped): explicit values and sequential vertices
+    // are consumed in flag order whatever triangle asks for them.
+    const uint32_t nf = std::min(8 * C, 3 * T);
+    {
+        uint32_t e = 0, n = 0;
+        for (uint32_t k = 0; k < nf; ++k) {
+            const uint32_t f = (flags[k >> 3] >> (7 - (k & 7))) & 1;
+            const uint32_t v = f ? uint32_t(W.ex[e]) : n;
+            W.val[k] = __builtin_bswap16(uint16_t(v));
+            e += f; n += 1 - f;
+        }
+    }
+    // Pass 2: triangles. Previous (a, b, c): code 0 -> (a, c, new), 1 -> (c, b, new), 2 -> (b, a, new), 3 -> three new.
     uint8_t* o = W.out;
-    uint32_t prev[4] = {0, 0, 0, 0};
+    uint32_t fi = 0, a = 0, b = 0, c = 0;
     for (uint32_t t = 0; t < T; ++t) {
         const uint32_t code = (codes[t >> 2] >> (6 - 2 * (t & 3))) & 3;
-        const uint32_t fresh = uint32_t(code == 3) | uint32_t(t == 0);
-        const uint32_t v1 = get(1), v2 = get(fresh), v3 = get(fresh);
-        const uint32_t q = prev[selQ[code]], p = prev[selP[code]];
-        const uint32_t a = fresh ? v1 : q, b = fresh ? v2 : p, c = fresh ? v3 : v1;
-        prev[0] = a; prev[1] = b; prev[2] = c;
-        const uint64_t be = uint64_t(__builtin_bswap16(uint16_t(a))) | uint64_t(__builtin_bswap16(uint16_t(b))) << 16 | uint64_t(__builtin_bswap16(uint16_t(c))) << 32;
+        const bool fresh = code == 3 || t == 0;
+        const uint32_t v1 = W.val[fi], v2 = W.val[fi + 1], v3 = W.val[fi + 2];
+        const uint32_t q = code == 0 ? a : (code == 1 ? c : b), p = code == 0 ? c : (code == 1 ? b : a);
+        a = fresh ? v1 : q; b = fresh ? v2 : p; c = fresh ? v3 : v1;
+        fi += fresh ? 3 : 1;
+        const uint64_t be = uint64_t(a) | uint64_t(b) << 16 | uint64_t(c) << 32;
         std::memcpy(o, &be, 8);   // 6 bytes + 2 the next triangle overwrites (the buffer has room)
         o += 6;
     }
-    if (fi > 8 * C || ei > A) return false;   // a stream that does not follow the format: let the SPU code deal with it
+    // a stream that does not follow the format (more indexes than flags, or than explicit values): the SPU code deals with it
+    if (fi > nf) return false;
+    {
+        uint32_t e = 0;
+        for (uint32_t k = 0; k < fi; ++k) e += (flags[k >> 3] >> (7 - (k & 7))) & 1;
+        if (e > A) return false;
+    }
     std::memcpy(ls + src, W.out, 2 * ni);
     const uint32_t end = src + 48 * ((T + 7) / 8);
     wr32(ls, ctx + 0x50, src);
@@ -147,10 +160,9 @@ bool dec_vertexes(uint8_t* ls, const uint32_t* a, uint32_t* ret) {
     if (!(src + 12 * nv + 4 <= dst || dst + 16 * nv <= src)) return false;   // overlapping buffers: order matters
     const uint8_t* in = ls + src;
     uint8_t* o = ls + dst;
-    static const uint8_t one[4] = {0x3f, 0x80, 0, 0};
+    const __m128i w1 = _mm_set_epi32(0x0000803f, 0, 0, 0);   // bytes 12..15 = 3f 80 00 00 (1.0f big-endian)
     for (uint32_t v = 0; v < nv; ++v) {
-        std::memcpy(o + 16 * v, in + 12 * v, 12);
-        std::memcpy(o + 16 * v + 12, one, 4);
+        _mm_store_si128(reinterpret_cast<__m128i*>(o + 16 * v), _mm_blend_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(in + 12 * v)), w1, 0xC0));
     }
     wr32(ls, ctx + 0x54, src);
     wr32(ls, ctx + 0x58, src);
