@@ -642,6 +642,7 @@ static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, u
     p.key = key;
     ++g_progBuilds;
     TickScope progTime(g_progTicks);
+    const uint64_t pt0 = SDL_GetPerformanceCounter();
     const VpInfo vi = translate_vp(vpCode, vpStart);
     const FpInfo fi = translate_fp(fpEa, texDims, control);
     p.vpInputs = vi.inputs;
@@ -662,8 +663,10 @@ static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, u
     if (binCache && !dirMade) { dirMade = true; SDL_CreateDirectory("glcache"); }
     char cacheName[96];
     std::snprintf(cacheName, sizeof cacheName, "glcache/%016llx.bin", (unsigned long long)(fnv(vi.glsl.data(), vi.glsl.size(), fnv(fi.glsl.data(), fi.glsl.size()))));
+    const uint64_t pt1 = SDL_GetPerformanceCounter();
     p.prog = glCreateProgram();
     GLint ok = 0;
+    bool fromCache = false;
     GLuint vs = 0, fs = 0;
     if (binCache)
         if (FILE* f = std::fopen(cacheName, "rb")) {
@@ -676,6 +679,7 @@ static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, u
                 glProgramBinary(p.prog, fmt, bin.data() + 4, GLsizei(bin.size() - 4));
                 glGetProgramiv(p.prog, GL_LINK_STATUS, &ok);
                 while (glGetError()) {}
+                fromCache = ok != 0;
             }
         }
     if (!ok) {
@@ -702,6 +706,7 @@ static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, u
         RLOG("[rsx] link error: %s\n", log);
         p.bad = true;
     }
+    const uint64_t pt2 = SDL_GetPerformanceCounter();
     glDeleteShader(vs); glDeleteShader(fs);
     p.uVs = glGetUniformLocation(p.prog, "u_vscale");
     p.uVo = glGetUniformLocation(p.prog, "u_voffset");
@@ -710,6 +715,14 @@ static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, u
     p.uAlpha = glGetUniformLocation(p.prog, "u_alpha");
     p.uWpos = glGetUniformLocation(p.prog, "u_wpos");
     p.uFc = glGetUniformLocation(p.prog, "fc");
+    {   // [prog]: where a slow program build goes. Loads from glcache/ also take 5-30 ms when the driver's own shader
+        // cache is cold (after a driver update; first play on a new PC): the driver finishes each binary per context,
+        // so loading them early on another thread does not help (tried 19/11)
+        const uint64_t pt3 = SDL_GetPerformanceCounter(), fq = SDL_GetPerformanceFrequency();
+        const double ms = double(pt3 - pt0) * 1000.0 / double(fq);
+        if (ms > 2.0) RLOG("[prog] %016llx %.1f ms (%s): translate %.1f, gl %.1f, uniforms %.1f\n", (unsigned long long)key, ms, fromCache ? "cache" : "compiled",
+                           double(pt1 - pt0) * 1000.0 / double(fq), double(pt2 - pt1) * 1000.0 / double(fq), double(pt3 - pt2) * 1000.0 / double(fq));
+    }
     static int nProg = 0;
     if (++nProg % 50 == 0) RLOG("[rsx] %d programs compiled\n", nProg);
     return &p;
