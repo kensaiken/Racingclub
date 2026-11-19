@@ -90,6 +90,7 @@ struct Backend {
     virtual void set_vsync(bool on) = 0;
     virtual void textures_changed() = 0;   // an option that changes sampler state (anisotropy)
     virtual const char* gpu_name() = 0;
+    virtual const char* api_name() = 0;     // "OpenGL", "DirectX 11" (window title, problem report)
 };
 Backend* make_gl_backend();
 Backend* make_d3d11_backend();   // nullptr-free: init() fails when Direct3D 11 is not available

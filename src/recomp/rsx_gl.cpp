@@ -1549,6 +1549,7 @@ struct GlBackend final : Backend {
     void set_vsync(bool on) override { SDL_GL_SetSwapInterval(on); }
     void textures_changed() override { ++g_texGen; }
     const char* gpu_name() override { return reinterpret_cast<const char*>(glGetString(0x1F01 /* GL_RENDERER */)); }
+    const char* api_name() override { return "OpenGL"; }
 };
 Backend* make_gl_backend() { static GlBackend b; return &b; }
 

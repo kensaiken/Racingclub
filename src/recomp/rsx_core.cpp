@@ -730,7 +730,7 @@ static void menu_change(int dir) {
         case 13: { const int n = int(g_menuCams.size()) + 1; s.camera = (s.camera + (dir ? dir : 1) + n) % n; host_camera_stop(); break; }   // the game opens it again with the new one
         case 14: s.renderer ^= 1; break;
         case 15: if (dir >= 0) { settings_save(); host_restart(); } break;
-        case 16: if (dir >= 0) { settings_save(); host_report(B->gpu_name()); } break;
+        case 16: if (dir >= 0) { settings_save(); const std::string g = std::string(B->api_name()) + " / " + B->gpu_name(); host_report(g.c_str()); } break;
         case 17: if (dir >= 0) { settings_save(); SDL_Event q{}; q.type = SDL_EVENT_QUIT; SDL_PushEvent(&q); } break;   // same as closing the window   // the options marked * are read once at start
         case 12: s.sharpen = (s.sharpen + (dir ? dir : 1) + 4) % 4; break;   // the texture cache keeps sampler state: rebuild it
     }
@@ -953,7 +953,7 @@ void flip(uint32_t id) {
         static const bool fpsLog = std::getenv("FPSLOG") != nullptr;   // FPSLOG=1: frame rate every 2 s in the log (benchmarks)
         if (fpsLog) RLOG("[fps] %.1f s: %.1f\n", now / 1000.0, (frameNo - lastF) * 1000.0 / (now - lastT));
         char title[160];
-        std::snprintf(title, sizeof title, "Racing Club+ - %.1f fps (F1: opciones)", (frameNo - lastF) * 1000.0 / (now - lastT));
+        std::snprintf(title, sizeof title, "Racing Club+ - %.1f fps - %s (F1: opciones)", (frameNo - lastF) * 1000.0 / (now - lastT), B->api_name());
         SDL_SetWindowTitle(win, title);
         lastT = now; lastF = frameNo;
     }

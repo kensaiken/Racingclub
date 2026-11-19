@@ -949,11 +949,15 @@ void do_draw() {
             std::memcpy(boundSrv, srv, sizeof srv); std::memcpy(boundSmp, smp, sizeof smp);
         }
     }
-    write_cb(cbDc, &dc, sizeof dc);
+    {   // most draws repeat the previous values: rewriting the buffer only on change saves a map per draw
+        static DrawCb last; static bool have = false;
+        if (!have || std::memcmp(&last, &dc, sizeof dc) != 0) { write_cb(cbDc, &dc, sizeof dc); last = dc; have = true; }
+    }
     if (p->nConst && !fpConsts.empty()) {
         const size_t bytes = fpConsts.size() * 4;
         if (bytes > cbFcSize) { release(cbFc); cbFcSize = std::max<size_t>(bytes, 4096); cbFc = make_cb(cbFcSize); ctx->PSSetConstantBuffers(2, 1, &cbFc); }
-        write_cb(cbFc, fpConsts.data(), bytes);
+        static std::vector<float> lastFc; static ID3D11Buffer* lastFcBuf = nullptr;
+        if (lastFcBuf != cbFc || lastFc != fpConsts) { write_cb(cbFc, fpConsts.data(), bytes); lastFc = fpConsts; lastFcBuf = cbFc; }
     }
     // indices
     uint32_t vmin, vmax;
@@ -1271,10 +1275,57 @@ void present_d3d(const Display& d, int ww, int wh, const Overlay* ovl, int nOvl)
         if (o.changed || !uploaded[k]) { ctx->UpdateSubresource(ovlTex[k], 0, nullptr, o.px, UINT(o.w * 4), 0); uploaded[k] = true; }
         post_pass(backRtv, blitPs, ovlSrv[k], float(o.dx), float(o.dy), float(o.dw), float(o.dh), nullptr);
     }
+    {   // D3DWINSHOT=seconds[,seconds...]: the final window image (game + menu + notification) as d3dwin_<s>.bmp (debug)
+        static std::vector<double> at; static bool parsed = false;
+        if (!parsed) { parsed = true; if (const char* e = std::getenv("D3DWINSHOT")) for (const char* q = e; *q;) { at.push_back(std::atof(q)); while (*q && *q != ',') ++q; if (*q) ++q; } }
+        if (!at.empty() && SDL_GetTicks() >= at.front() * 1000) {
+            ID3D11Texture2D* bb = nullptr;
+            if (SUCCEEDED(swap->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&bb)))) {
+                D3D11_TEXTURE2D_DESC d{}; bb->GetDesc(&d);
+                d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+                ID3D11Texture2D* st = nullptr;
+                if (SUCCEEDED(dev->CreateTexture2D(&d, nullptr, &st))) {
+                    ctx->CopyResource(st, bb);
+                    D3D11_MAPPED_SUBRESOURCE m{};
+                    if (SUCCEEDED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
+                        if (SDL_Surface* srf = SDL_CreateSurfaceFrom(int(d.Width), int(d.Height), SDL_PIXELFORMAT_ARGB8888, m.pData, int(m.RowPitch))) {
+                            char fn[64]; std::snprintf(fn, sizeof fn, "d3dwin_%03d.bmp", int(at.front()));
+                            SDL_SaveBMP(srf, fn); SDL_DestroySurface(srf);
+                        }
+                        ctx->Unmap(st, 0);
+                    }
+                    st->Release();
+                }
+                bb->Release();
+            }
+            at.erase(at.begin());
+        }
+    }
     const uint64_t ts = SDL_GetTicksNS();
-    const UINT flags = (!vsyncOn && tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    // without V-Sync the image still goes through the compositor at the next refresh (no tearing), like OpenGL in a
+    // window; D3DTEARING=1 shows it at once (tearing) where the system allows it
+    static const bool allowTear = std::getenv("D3DTEARING") != nullptr;
+    const UINT flags = (!vsyncOn && tearing && allowTear) ? DXGI_PRESENT_ALLOW_TEARING : 0;
     swap->Present(vsyncOn ? 1 : 0, flags);
     g_swapUs += (SDL_GetTicksNS() - ts) / 1000;
+    {   // D3DDEBUG=1: the debug layer's messages into the log (each distinct one once)
+        static ID3D11InfoQueue* iq = nullptr; static bool tried = false;
+        if (!tried) { tried = true; if (std::getenv("D3DDEBUG")) dev->QueryInterface(__uuidof(ID3D11InfoQueue), reinterpret_cast<void**>(&iq)); }
+        if (iq) {
+            static std::unordered_map<uint64_t, int> seen;
+            const UINT64 n = iq->GetNumStoredMessages();
+            for (UINT64 k = 0; k < n; ++k) {
+                SIZE_T len = 0;
+                if (FAILED(iq->GetMessage(k, nullptr, &len)) || !len) continue;
+                std::vector<uint8_t> buf(len);
+                D3D11_MESSAGE* msg = reinterpret_cast<D3D11_MESSAGE*>(buf.data());
+                if (FAILED(iq->GetMessage(k, msg, &len))) continue;
+                if (msg->Severity > D3D11_MESSAGE_SEVERITY_WARNING) continue;
+                if (seen[uint64_t(msg->ID)]++ == 0) RLOG("[d3ddebug] %s (frame %llu)\n", msg->pDescription, (unsigned long long)frameNo);
+            }
+            iq->ClearStoredMessages();
+        }
+    }
     // everything the draw path caches as "already set" is stale now
     forget_pipeline();
     ID3D11Buffer* vcb[2] = {cbVc, cbDc};
@@ -1296,6 +1347,12 @@ bool init_d3d() {
     D3D_FEATURE_LEVEL got{};
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels, 2, D3D11_SDK_VERSION, &dev, &got, &ctx);
     if (hr == E_INVALIDARG) hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels + 1, 1, D3D11_SDK_VERSION, &dev, &got, &ctx);
+    if (FAILED(hr) && (flags & D3D11_CREATE_DEVICE_DEBUG)) {   // the debug layer is an optional Windows component ("Graphics Tools")
+        RLOG("[d3d] debug layer not installed: running without it\n");
+        flags &= ~UINT(D3D11_CREATE_DEVICE_DEBUG);
+        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels, 2, D3D11_SDK_VERSION, &dev, &got, &ctx);
+        if (hr == E_INVALIDARG) hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels + 1, 1, D3D11_SDK_VERSION, &dev, &got, &ctx);
+    }
     if (FAILED(hr)) { RLOG("[d3d] D3D11CreateDevice failed 0x%08lx\n", static_cast<unsigned long>(hr)); return false; }
     IDXGIDevice* dxd = nullptr; IDXGIAdapter* ad = nullptr; IDXGIFactory2* fac = nullptr;
     dev->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxd));
@@ -1373,6 +1430,7 @@ struct D3d11Backend final : Backend {
     void set_vsync(bool on) override { vsyncOn = on; }
     void textures_changed() override {}
     const char* gpu_name() override { return gpuName; }
+    const char* api_name() override { return "DirectX 11"; }
 };
 Backend* make_d3d11_backend() { static D3d11Backend b; return &b; }
 
@@ -1390,6 +1448,7 @@ struct NoD3d final : Backend {
     void set_vsync(bool) override {}
     void textures_changed() override {}
     const char* gpu_name() override { return "none"; }
+    const char* api_name() override { return "none"; }
 };
 Backend* make_d3d11_backend() { static NoD3d b; return &b; }
 } // namespace gti::recomp::rsx
