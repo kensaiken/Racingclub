@@ -176,9 +176,12 @@ def main():
     env = dict(os.environ)
     env['PATH'] = os.path.join(tc, 'bin') + os.pathsep + env.get('PATH', '')
     build = os.path.join(ROOT, 'build-inst')
-    run(['cmake', '-S', ROOT, '-B', build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_C_COMPILER=clang', '-DCMAKE_CXX_COMPILER=clang++',
+    cmake = os.path.join(tc, 'bin', 'cmake.exe')   # full path: Windows looks the program up in our own PATH, not env's
+    if not os.path.exists(cmake): fail('falta cmake.exe en ' + os.path.join(tc, 'bin'))
+    tool = lambda n: os.path.join(tc, 'bin', n).replace('\\', '/')
+    run([cmake, '-S', ROOT, '-B', build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_C_COMPILER=' + tool('clang.exe'), '-DCMAKE_CXX_COMPILER=' + tool('clang++.exe'), '-DCMAKE_MAKE_PROGRAM=' + tool('ninja.exe'),
          '-DCMAKE_PREFIX_PATH=' + os.path.join(tc, 'deps').replace('\\', '/')], env=env, quiet=True)
-    run(['cmake', '--build', build, '--target', 'recomp_boot', '-j', str(a.jobs)], env=env)
+    run([cmake, '--build', build, '--target', 'recomp_boot', '-j', str(a.jobs)], env=env)
 
     step(7, 'Preparando la carpeta del juego')
     out = os.path.abspath(a.out)
