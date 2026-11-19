@@ -606,15 +606,80 @@ void convert_attr(int a, uint32_t first, uint32_t count, float* out, uint32_t co
 }
 
 
+// The indices of the current draw (all its ranges) into idx, 0xffffffff = primitive restart, and the lowest and
+// highest vertex they use (vmin > vmax: nothing to draw). Quads become triangles. With triFans (APIs without fans
+// and line loops: Direct3D) fans and polygons become triangle lists and line loops closed line strips.
+void gather_draw_indices(std::vector<uint32_t>& idx, uint32_t& vmin, uint32_t& vmax, bool triFans) {
+    vmin = 0xffffffffu; vmax = 0;
+    idx.clear();
+    const uint32_t ia = R[0x1820 >> 2];
+    const bool i16 = (ia >> 4) & 1;
+    const uint32_t ibase = ea_of(R[0x181c >> 2], ia & 1);
+    const bool restart = R[0x1dac >> 2] & 1;
+    const uint32_t restartIdx = R[0x1db0 >> 2];
+    const bool fan = triFans && (prim == 7 || prim == 10), loop = triFans && prim == 3;
+    const bool joinStrips = prim == 3 || prim == 4 || prim == 6 || prim == 9 || (!triFans && (prim == 7 || prim == 10));
+    const uint32_t add = rangesIndexed ? R[0x173c >> 2] : 0;
+    size_t total = 0;
+    for (const Range& r : ranges) total += size_t(r.count) + 2;
+    idx.resize(prim == 8 ? total * 3 / 2 + 8 : fan ? total * 3 + 8 : total);
+    static std::vector<uint32_t> seq;
+    uint32_t* o = idx.data();
+    for (const Range& r : ranges) {
+        const bool viaSeq = prim == 8 || fan || loop;
+        if (viaSeq) seq.resize(r.count);
+        uint32_t* d = viaSeq ? seq.data() : o;
+        if (!rangesIndexed) for (uint32_t k = 0; k < r.count; ++k) d[k] = r.first + k;
+        else if (i16) gather_i16(d, C.mem + ibase + 2 * size_t(r.first), r.count, add);
+        else {
+            const uint8_t* q = C.mem + ibase + 4 * size_t(r.first);
+            for (uint32_t k = 0; k < r.count; ++k) { uint32_t w; std::memcpy(&w, q + 4 * size_t(k), 4); d[k] = __builtin_bswap32(w) + add; }
+        }
+        if (restart && rangesIndexed) for (uint32_t k = 0; k < r.count; ++k) d[k] = d[k] == restartIdx ? 0xffffffffu : d[k];
+        if (prim == 8) {   // quads -> triangles
+            for (size_t q = 0; q + 3 < seq.size(); q += 4) { o[0] = seq[q]; o[1] = seq[q + 1]; o[2] = seq[q + 2]; o[3] = seq[q]; o[4] = seq[q + 2]; o[5] = seq[q + 3]; o += 6; }
+        } else if (fan) {  // each restart-separated fan: (first, k, k + 1)
+            size_t s0 = 0;
+            while (s0 < seq.size()) {
+                size_t e = s0;
+                while (e < seq.size() && seq[e] != 0xffffffffu) ++e;
+                for (size_t k = s0 + 1; k + 1 < e; ++k) { o[0] = seq[s0]; o[1] = seq[k]; o[2] = seq[k + 1]; o += 3; }
+                s0 = e + 1;
+            }
+        } else if (loop) { // line loop -> strip back to its first vertex
+            for (uint32_t v : seq) *o++ = v;
+            if (!seq.empty()) *o++ = seq[0];
+            if (&r != &ranges.back()) *o++ = 0xffffffffu;
+        } else {
+            o += r.count;
+            if (&r != &ranges.back() && joinStrips) *o++ = 0xffffffffu;
+        }
+    }
+    idx.resize(size_t(o - idx.data()));
+    uint32_t lo = 0xffffffffu, hi1 = 0;   // hi1 = highest index + 1 (the restart value wraps to 0 and drops out)
+    index_range(idx.data(), idx.size(), lo, hi1);
+    if (hi1 == 0) { vmin = 1; vmax = 0; return; }
+    vmin = lo; vmax = hi1 - 1;
+}
+
 // ------------------------------------------------------------------ window
 // The back end: OpenGL (0) or Direct3D 11 (1), menu option "Renderizador" (read at start).
 static void init_window() {
     initTried = true;
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) { RLOG("[rsx] SDL_Init failed: %s\n", SDL_GetError()); return; }
-    B = make_gl_backend();
-    win = SDL_CreateWindow("Racing Club+ (F1: opciones)", 1280, 720, B->window_flags() | SDL_WINDOW_RESIZABLE);
-    if (!win) { RLOG("[rsx] window: %s\n", SDL_GetError()); return; }
-    if (!B->init()) return;
+    const char* env = std::getenv("RENDERER");
+    const bool d3d = env ? (std::strcmp(env, "d3d11") == 0 || std::strcmp(env, "dx11") == 0) : settings().renderer == 1;
+    B = d3d ? make_d3d11_backend() : make_gl_backend();
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        win = SDL_CreateWindow("Racing Club+ (F1: opciones)", 1280, 720, B->window_flags() | SDL_WINDOW_RESIZABLE);
+        if (!win) { RLOG("[rsx] window: %s\n", SDL_GetError()); return; }
+        if (B->init()) break;
+        if (B == make_gl_backend()) return;
+        RLOG("[rsx] Direct3D 11 not available: back to OpenGL\n");   // the window is made again (OpenGL needs its flag)
+        SDL_DestroyWindow(win); win = nullptr;
+        B = make_gl_backend();
+    }
+    if (!win) return;
     if (settings().fullscreen) set_display_mode(settings().fullscreen);
     ready = true;
 }
@@ -646,7 +711,7 @@ static void set_display_mode(int mode) {
 // ------------------------------------------------------------------ options menu (F1)
 static bool menuOpen = std::getenv("MENUTEST") != nullptr, menuDirty = true;   // MENUTEST=1 (debug): open from the start
 static int menuSel = 1;
-static const int kMenuLines = 19, kMenuFirst = 1, kMenuLast = 16;   // title, 13 options, "apply" (restarts the game), problem report, "quit", 2 notes
+static const int kMenuLines = 20, kMenuFirst = 1, kMenuLast = 17;   // title, 13 options, "apply" (restarts the game), problem report, "quit", 2 notes
 static std::vector<std::string> g_menuCams;   // the host cameras, listed when the menu is drawn first
 static void menu_change(int dir) {
     Settings& s = settings();
@@ -663,9 +728,10 @@ static void menu_change(int dir) {
         case 10: s.streaming ^= 1; break;
         case 11: s.fxaa ^= 1; break;
         case 13: { const int n = int(g_menuCams.size()) + 1; s.camera = (s.camera + (dir ? dir : 1) + n) % n; host_camera_stop(); break; }   // the game opens it again with the new one
-        case 14: if (dir >= 0) { settings_save(); host_restart(); } break;
-        case 15: if (dir >= 0) { settings_save(); host_report(B->gpu_name()); } break;
-        case 16: if (dir >= 0) { settings_save(); SDL_Event q{}; q.type = SDL_EVENT_QUIT; SDL_PushEvent(&q); } break;   // same as closing the window   // the options marked * are read once at start
+        case 14: s.renderer ^= 1; break;
+        case 15: if (dir >= 0) { settings_save(); host_restart(); } break;
+        case 16: if (dir >= 0) { settings_save(); host_report(B->gpu_name()); } break;
+        case 17: if (dir >= 0) { settings_save(); SDL_Event q{}; q.type = SDL_EVENT_QUIT; SDL_PushEvent(&q); } break;   // same as closing the window   // the options marked * are read once at start
         case 12: s.sharpen = (s.sharpen + (dir ? dir : 1) + 4) % 4; break;   // the texture cache keeps sampler state: rebuild it
     }
     menuDirty = true;
@@ -673,7 +739,7 @@ static void menu_change(int dir) {
 
 // the menu bitmap and where it goes (the window's middle, 70 % of its height)
 static void menu_overlay(int ww, int wh, Overlay& o) {
-    const int W = 880, H = 800;
+    const int W = 880, H = 840;
     static std::vector<uint32_t> px;
     static bool have = false;
     o.changed = false;
@@ -708,11 +774,12 @@ static void menu_overlay(int ww, int wh, Overlay& o) {
             if (s.camera > 0 && s.camera <= int(g_menuCams.size())) { name.clear(); for (unsigned char ch : g_menuCams[size_t(s.camera - 1)]) name += wchar_t(ch); }
             std::swprintf(l[13], 96, L"Cámara (EyeToy)\t‹ %ls ›", name.c_str());
         }
-        std::swprintf(l[14], 96, L"Aplicar cambios\t‹ Reiniciar el juego ›");
-        std::swprintf(l[15], 96, L"Informe de problemas\t‹ Crear y abrir GitHub ›");
-        std::swprintf(l[16], 96, L"Salir del juego\t‹ Salir ›");
-        std::swprintf(l[17], 96, L"* se aplica al reiniciar el juego (Aplicar cambios + Intro)");
-        std::swprintf(l[18], 96, L"Teclado: flechas, Intro, F1 o Esc   ·   Mando: panel táctil o botón PS, cruceta, cruz, círculo");
+        std::swprintf(l[14], 96, L"Gráficos (API) *\t‹ %ls ›", s.renderer ? L"DirectX 11" : L"OpenGL");
+        std::swprintf(l[15], 96, L"Aplicar cambios\t‹ Reiniciar el juego ›");
+        std::swprintf(l[16], 96, L"Informe de problemas\t‹ Crear y abrir GitHub ›");
+        std::swprintf(l[17], 96, L"Salir del juego\t‹ Salir ›");
+        std::swprintf(l[18], 96, L"* se aplica al reiniciar el juego (Aplicar cambios + Intro)");
+        std::swprintf(l[19], 96, L"Teclado: flechas, Intro, F1 o Esc   ·   Mando: panel táctil o botón PS, cruceta, cruz, círculo");
         const wchar_t* lines[kMenuLines];
         for (int i = 0; i < kMenuLines; ++i) lines[i] = l[i];
         px.resize(size_t(W) * H);

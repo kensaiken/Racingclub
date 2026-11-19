@@ -16,6 +16,7 @@ struct Settings {
     int camera = 1;       // the EyeToy / PlayStation Eye: 0 none, k = the k-th camera of the host
     int sound = 1;        // sound effects (the game's MultiStream mixer runs on a host thread)
     int showFps = 1;      // frame rate in the window title
+    int renderer = 0;     // graphics API: 0 OpenGL, 1 Direct3D 11 (read at start; RENDERER=gl|d3d11 overrides)
 };
 Settings& settings();     // loaded from gtiport.ini on first use
 void settings_save();

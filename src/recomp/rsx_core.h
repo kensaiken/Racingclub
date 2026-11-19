@@ -92,6 +92,8 @@ struct Backend {
     virtual const char* gpu_name() = 0;
 };
 Backend* make_gl_backend();
+Backend* make_d3d11_backend();   // nullptr-free: init() fails when Direct3D 11 is not available
+void gather_draw_indices(std::vector<uint32_t>& idx, uint32_t& vmin, uint32_t& vmax, bool triFans);
 extern Backend* B;
 
 } // namespace gti::recomp::rsx
