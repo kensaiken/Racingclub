@@ -1106,9 +1106,10 @@ void clear_surface(uint32_t mask) {
 
 // ------------------------------------------------------------------ present
 ID3D11VertexShader* fsVs = nullptr;
-ID3D11PixelShader* blitPs = nullptr; ID3D11PixelShader* fxaaPs = nullptr; ID3D11PixelShader* sharpPs = nullptr;
+ID3D11PixelShader* blitPs = nullptr; ID3D11PixelShader* overPs = nullptr; ID3D11PixelShader* fxaaPs = nullptr; ID3D11PixelShader* sharpPs = nullptr;
 ID3D11Buffer* cbPost = nullptr;
 ID3D11RasterizerState* postRs = nullptr; ID3D11BlendState* postBs = nullptr; ID3D11DepthStencilState* postDs = nullptr;
+ID3D11BlendState* overBs = nullptr;   // the overlays: premultiplied alpha over the image
 ID3D11Texture2D* midTex = nullptr; ID3D11RenderTargetView* midRtv = nullptr; ID3D11ShaderResourceView* midSrv = nullptr; int midW = 0, midH = 0;
 ID3D11Texture2D* ovlTex[2] = {}; ID3D11ShaderResourceView* ovlSrv[2] = {}; int ovlW[2] = {}, ovlH[2] = {};
 
@@ -1123,6 +1124,9 @@ const char* const kClearPs =
 const char* const kBlitPs =
     "Texture2D src : register(t0); SamplerState smp : register(s0);\n"
     "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { return float4(src.Sample(smp, uv).rgb, 1.0); }\n";
+const char* const kOverPs =   // the overlays: premultiplied alpha kept
+    "Texture2D src : register(t0); SamplerState smp : register(s0);\n"
+    "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target { return src.Sample(smp, uv); }\n";
 const char* const kFxaaPs =
     "Texture2D src : register(t0); SamplerState smp : register(s0);\n"
     "cbuffer P : register(b0) { float4 u_p; };\n"
@@ -1277,7 +1281,9 @@ void present_d3d(const Display& d, int ww, int wh, const Overlay* ovl, int nOvl)
         }
         static bool uploaded[2] = {};
         if (o.changed || !uploaded[k]) { ctx->UpdateSubresource(ovlTex[k], 0, nullptr, o.px, UINT(o.w * 4), 0); uploaded[k] = true; }
-        post_pass(backRtv, blitPs, ovlSrv[k], float(o.dx), float(o.dy), float(o.dw), float(o.dh), nullptr);
+        ctx->OMSetBlendState(overBs ? overBs : postBs, nullptr, 0xffffffffu);
+        post_pass(backRtv, overPs ? overPs : blitPs, ovlSrv[k], float(o.dx), float(o.dy), float(o.dw), float(o.dh), nullptr);
+        ctx->OMSetBlendState(postBs, nullptr, 0xffffffffu);
     }
     {   // D3DWINSHOT=seconds[,seconds...]: the final window image (game + menu + notification) as d3dwin_<s>.bmp (debug)
         static std::vector<double> at; static bool parsed = false;
@@ -1401,6 +1407,8 @@ bool init_d3d() {
         D3D11_BLEND_DESC b{}; b.RenderTarget[0].SrcBlend = b.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE; b.RenderTarget[0].DestBlend = b.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
         b.RenderTarget[0].BlendOp = b.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD; b.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
         dev->CreateBlendState(&b, &postBs);
+        b.RenderTarget[0].BlendEnable = TRUE; b.RenderTarget[0].DestBlend = b.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+        dev->CreateBlendState(&b, &overBs);
         D3D11_DEPTH_STENCIL_DESC z{}; z.DepthEnable = FALSE; z.StencilEnable = FALSE;
         dev->CreateDepthStencilState(&z, &postDs);
     }
@@ -1409,6 +1417,7 @@ bool init_d3d() {
     clearVs = fsVs;
     clearPs = make_ps(kClearPs);
     blitPs = make_ps(kBlitPs);
+    overPs = make_ps(kOverPs);
     fxaaPs = make_ps(kFxaaPs);
     sharpPs = make_ps(kSharpPs);
     if (!fsVs || !clearPs || !blitPs) { RLOG("[d3d] fixed shaders failed\n"); return false; }

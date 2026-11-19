@@ -1218,11 +1218,11 @@ void do_draw() {
 // ------------------------------------------------------------------ fixed passes (clear quads, present)
 VkPipelineLayout fixedLayout = VK_NULL_HANDLE;   // push constants (16 floats) + one texture
 VkDescriptorSetLayout fixedSetLayout = VK_NULL_HANDLE;
-VkShaderModule fsVs = VK_NULL_HANDLE, clearFs = VK_NULL_HANDLE, blitFs = VK_NULL_HANDLE, fxaaFs = VK_NULL_HANDLE, sharpFs = VK_NULL_HANDLE;
+VkShaderModule fsVs = VK_NULL_HANDLE, clearFs = VK_NULL_HANDLE, blitFs = VK_NULL_HANDLE, overFs = VK_NULL_HANDLE, fxaaFs = VK_NULL_HANDLE, sharpFs = VK_NULL_HANDLE;
 std::unordered_map<uint64_t, VkPipeline> fixedPipes;
 PFN_vkCmdPushConstants vkCmdPushConstants_ = nullptr;
-VkPipeline fixed_pipeline(VkShaderModule fs, uint32_t nColor, const VkFormat* fmts, VkFormat depthFmt, uint32_t writeMask) {
-    uint64_t k[8] = {uint64_t(reinterpret_cast<uintptr_t>(fs)), nColor, writeMask, uint64_t(depthFmt), 0, 0, 0, 0};
+VkPipeline fixed_pipeline(VkShaderModule fs, uint32_t nColor, const VkFormat* fmts, VkFormat depthFmt, uint32_t writeMask, bool over = false) {
+    uint64_t k[8] = {uint64_t(reinterpret_cast<uintptr_t>(fs)), nColor, writeMask | (over ? 0x100u : 0u), uint64_t(depthFmt), 0, 0, 0, 0};
     for (uint32_t i = 0; i < nColor && i < 4; ++i) k[4 + i] = uint64_t(fmts[i]);
     const uint64_t h = fnv(k, sizeof k);
     VkPipeline& p = fixedPipes[h];
@@ -1233,6 +1233,7 @@ VkPipeline fixed_pipeline(VkShaderModule fs, uint32_t nColor, const VkFormat* fm
     for (uint32_t i = 0; i < nColor; ++i) pk.colorFmt[i] = uint32_t(fmts[i]);
     pk.depthFmt = uint32_t(depthFmt);
     pk.blend[4] = ((writeMask & 1) << 16) | (((writeMask >> 1) & 1) << 8) | ((writeMask >> 2) & 1) | (((writeMask >> 3) & 1) << 24);
+    if (over) { pk.blend[0] = 1; pk.blend[1] = 1u | (1u << 16); pk.blend[2] = 0x303u | (0x303u << 16); pk.blend[3] = 0x8006u | (0x8006u << 16); }   // premultiplied alpha (overlays)
     pk.topoClass = 2;
     p = create_pipeline(fsVs, fs, pk, fixedLayout, false);
     return p;
@@ -1395,12 +1396,12 @@ VkDescriptorSet fixed_set(VkImageView view, VkImageLayout layout) {
     return s;
 }
 // one full-screen triangle into (view, fmt) over the rectangle, sampling src
-void post_pass(VkImageView target, VkFormat fmt, uint32_t tw, uint32_t th, VkShaderModule fs, VkImageView src, VkImageLayout srcLayout, VkRect2D r, const float* params) {
+void post_pass(VkImageView target, VkFormat fmt, uint32_t tw, uint32_t th, VkShaderModule fs, VkImageView src, VkImageLayout srcLayout, VkRect2D r, const float* params, bool over = false) {
     VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     ca.imageView = target; ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL; ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea = {{0, 0}, {tw, th}}; ri.layerCount = 1; ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca;
-    VkPipeline pl = fixed_pipeline(fs, 1, &fmt, VK_FORMAT_UNDEFINED, 0xf);
+    VkPipeline pl = fixed_pipeline(fs, 1, &fmt, VK_FORMAT_UNDEFINED, 0xf, over);
     VkDescriptorSet s = fixed_set(src, srcLayout);
     if (!pl || !s) return;
     vkCmdBeginRendering(cmd(), &ri);
@@ -1513,7 +1514,7 @@ void present_vk(const Display& d, int ww, int wh, const Overlay* ovl, int nOvl) 
                 t.uploaded = true;
             }
         }
-        post_pass(swapViews[imgIndex], swapFmt, swapW, swapH, blitFs, t.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, {{o.dx, o.dy}, {uint32_t(std::max(1, o.dw)), uint32_t(std::max(1, o.dh))}}, nullptr);
+        post_pass(swapViews[imgIndex], swapFmt, swapW, swapH, overFs, t.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, {{o.dx, o.dy}, {uint32_t(std::max(1, o.dw)), uint32_t(std::max(1, o.dh))}}, nullptr, true);
     }
     {   // VKWINSHOT=seconds[,...]: the final window image (debug)
         static std::vector<double> at; static bool parsed = false;
@@ -1573,6 +1574,11 @@ const char* const kBlitFsSrc =
     "layout(set = 0, binding = 0) uniform sampler2D src;\n"
     "layout(location = 0) in vec2 uv; layout(location = 0) out vec4 o;\n"
     "void main() { o = vec4(texture(src, uv).rgb, 1.0); }\n";
+const char* const kOverFsSrc =   // the overlays: premultiplied alpha kept
+    "#version 450\n"
+    "layout(set = 0, binding = 0) uniform sampler2D src;\n"
+    "layout(location = 0) in vec2 uv; layout(location = 0) out vec4 o;\n"
+    "void main() { o = texture(src, uv); }\n";
 const char* const kFxaaFsSrc =
     "#version 450\n"
     "layout(set = 0, binding = 0) uniform sampler2D src;\n"
@@ -1762,9 +1768,10 @@ bool init_vk() {
     fsVs = shader_module(kFsVsSrc, EShLangVertex, "fixed vertex");
     clearFs = shader_module(kClearFsSrc, EShLangFragment, "clear");
     blitFs = shader_module(kBlitFsSrc, EShLangFragment, "blit");
+    overFs = shader_module(kOverFsSrc, EShLangFragment, "overlay");
     fxaaFs = shader_module(kFxaaFsSrc, EShLangFragment, "fxaa");
     sharpFs = shader_module(kSharpFsSrc, EShLangFragment, "sharpen");
-    if (!fsVs || !clearFs || !blitFs || !fxaaFs || !sharpFs) { RLOG("[vk] fixed shaders failed\n"); return false; }
+    if (!fsVs || !clearFs || !blitFs || !overFs || !fxaaFs || !sharpFs) { RLOG("[vk] fixed shaders failed\n"); return false; }
     vsyncOn = settings().vsync != 0;
     int ww = 1280, wh = 720;
     SDL_GetWindowSizeInPixels(win, &ww, &wh);

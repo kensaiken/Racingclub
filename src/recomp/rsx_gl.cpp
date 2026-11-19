@@ -1377,27 +1377,44 @@ static bool init_gl() {
 }
 
 // ------------------------------------------------------------------ overlays (menu, notifications)
+static const char* const kOverlayFs =
+    "#version 450 core\n"
+    "layout(binding = 15) uniform sampler2D src;\n"
+    "in vec2 uv;\n"
+    "out vec4 o;\n"
+    "void main() { o = texture(src, vec2(uv.x, 1.0 - uv.y)); }\n";   // bitmap row 0 is its top
+// a bitmap (premultiplied BGRA) over the window image, blended by its alpha
 static void draw_overlay(int k, const Overlay& o, int wh) {
-    static GLuint tex[2] = {}, fbo[2] = {};
+    static GLuint tex[2] = {}, prog = 0, ovao = 0;
+    static bool tried = false;
     if (!o.px) return;
+    if (!tried) { tried = true; prog = post_program(kOverlayFs); glGenVertexArrays(1, &ovao); }
+    if (!prog) return;
+    glActiveTexture(GL_TEXTURE0 + 15); ++g_texGen;
     if (!tex[k]) {
-        glGenTextures(1, &tex[k]); glGenFramebuffers(1, &fbo[k]);
-        glActiveTexture(GL_TEXTURE0 + 15); ++g_texGen;
+        glGenTextures(1, &tex[k]);
         glBindTexture(GL_TEXTURE_2D, tex[k]);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
+    glBindTexture(GL_TEXTURE_2D, tex[k]);
     if (o.changed) {
-        glActiveTexture(GL_TEXTURE0 + 15); ++g_texGen;
-        glBindTexture(GL_TEXTURE_2D, tex[k]);
         glPixelStorei(0x0CF5 /* GL_UNPACK_ALIGNMENT */, 4);
         glTexImage2D(GL_TEXTURE_2D, 0, 0x8058 /* GL_RGBA8 */, o.w, o.h, 0, 0x80E1 /* GL_BGRA */, GL_UNSIGNED_BYTE, o.px);
     }
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo[k]);
-    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex[k], 0);
-    // bitmap row 0 is its top; the window's GL rows count from the bottom
-    glBlitFramebuffer(0, 0, o.w, o.h, o.dx, wh - o.dy, o.dx + o.dw, wh - o.dy - o.dh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    stateValid = false;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDisable(GL_DEPTH_TEST); glDisable(GL_STENCIL_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(1, 0x303, 1, 0x303);   // ONE, ONE_MINUS_SRC_ALPHA
+    glBlendEquationSeparate(0x8006, 0x8006);
+    glViewport(o.dx, wh - o.dy - o.dh, o.dw, o.dh);
+    glBindVertexArray(ovao);
+    glUseProgram(prog);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glDisable(GL_BLEND);
+    glBindVertexArray(vao);
 }
 
 // ------------------------------------------------------------------ present

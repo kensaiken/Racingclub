@@ -1,5 +1,6 @@
 // RSX front end (see rsx_core.h): NV4097 method stream, register state, microcode translation, vertex and index
 // conversion, window, input, options menu and notifications. Drawing is done by the back end in B.
+#include "recomp/host_ui.h"
 #include "recomp/rsx_core.h"
 #include "recomp/settings.h"
 #include "recomp/lv2.h"
@@ -11,7 +12,7 @@
 #include <map>
 #include <immintrin.h>
 
-namespace gti::recomp { bool host_menu_bitmap(const wchar_t* const* lines, int n, int sel, int w, int h, uint32_t* out); void host_restart(); void host_report(const char* gpu); std::vector<std::string> host_camera_list(); void host_camera_stop(); bool host_toast_bitmap(const wchar_t* title, const wchar_t* name, const wchar_t* detail, uint32_t rgb, const uint8_t* png, size_t pngSize, int w, int h, uint32_t* out); }   // host_win.cpp
+namespace gti::recomp { void host_restart(); void host_report(const char* gpu); std::vector<std::string> host_camera_list(); void host_camera_stop(); bool host_toast_bitmap(const wchar_t* title, const wchar_t* name, const wchar_t* detail, uint32_t rgb, const uint8_t* png, size_t pngSize, int w, int h, uint32_t* out); }   // host_win.cpp
 namespace gti::recomp::rsx {
 
 std::mutex g_logMx;
@@ -709,96 +710,140 @@ static void set_display_mode(int mode) {
     if (mode != 0 && std::getenv("FSTOP")) SDL_SetWindowAlwaysOnTop(win, true);   // debug: tests started from a background process
     cur = mode;
 }
+static SDL_Gamepad* pad = nullptr;
 // ------------------------------------------------------------------ options menu (F1)
+// Four tabs; up/down walks every option in order (and so across the tabs), Q/E or L1/R1 jump to the previous/next
+// tab. The ids are those of menu_change.
 static bool menuOpen = std::getenv("MENUTEST") != nullptr, menuDirty = true;   // MENUTEST=1 (debug): open from the start
-static int menuSel = 1;
-static const int kMenuLines = 20, kMenuFirst = 1, kMenuLast = 17;   // title, 13 options, "apply" (restarts the game), problem report, "quit", 2 notes
+enum MenuId { mScreen = 1, mScale, mHz, mRefresh, mLang, mFps, mVsync, mSound, mAniso, mStream, mFxaa, mSharpen, mCamera, mApi, mApply, mReport, mQuit };
+static const int kMenuOrder[] = {mScreen, mScale, mHz, mRefresh, mVsync,   mApi, mFxaa, mSharpen, mAniso,   mLang, mSound, mCamera, mStream, mFps,   mApply, mReport, mQuit};
+static const int kMenuTabStart[] = {0, 5, 9, 14, 17};
+static const wchar_t* const kMenuTabs[] = {L"Pantalla", L"Gráficos", L"Juego", L"Sistema"};
+static const int kMenuCount = int(sizeof kMenuOrder / sizeof kMenuOrder[0]), kMenuTabCount = 4;
+static int menuSel = std::getenv("MENUTEST") ? std::clamp(std::atoi(std::getenv("MENUTEST")) - 1, 0, int(sizeof kMenuOrder / sizeof kMenuOrder[0]) - 1) : 0;   // index in kMenuOrder (MENUTEST=n: the n-th)
+static int menu_tab_of(int idx) { int t = 0; while (t + 1 < kMenuTabCount && idx >= kMenuTabStart[t + 1]) ++t; return t; }
+static void menu_move(int d) { menuSel = (menuSel + d + kMenuCount) % kMenuCount; menuDirty = true; }
+static void menu_tab(int d) { menuSel = kMenuTabStart[(menu_tab_of(menuSel) + d + kMenuTabCount) % kMenuTabCount]; menuDirty = true; }
 static std::vector<std::string> g_menuCams;   // the host cameras, listed when the menu is drawn first
+// the settings as the game started (the options read only at start show "waiting for the restart" when they differ)
+static const Settings& boot_settings() { static const Settings b = settings(); return b; }
 static void menu_change(int dir) {
+    (void)boot_settings();
     Settings& s = settings();
-    switch (menuSel) {
-        case 1: s.fullscreen = (s.fullscreen + (dir ? dir : 1) + 3) % 3; if (s.fullscreen) g_lastFull = s.fullscreen; set_display_mode(s.fullscreen); break;
-        case 2: s.scale = std::clamp(s.scale + dir, 1, 3); break;
-        case 3: { static const int r[4] = {60, 72, 120, 144}; int i = 0; while (i < 3 && r[i] != s.gameHz) ++i; s.gameHz = r[(i + dir + 4) % 4]; break; }
-        case 4: s.refresh ^= 1; break;
-        case 5: s.language = 1 + (s.language - 1 + dir + 5) % 5; break;
-        case 6: s.showFps ^= 1; if (!s.showFps) SDL_SetWindowTitle(win, "Racing Club+"); break;
-        case 7: s.vsync ^= 1; B->set_vsync(s.vsync); break;
-        case 8: s.sound ^= 1; break;
-        case 9: s.aniso = std::clamp(s.aniso + (dir ? dir : 1), 0, 4); B->textures_changed(); break;
-        case 10: s.streaming ^= 1; break;
-        case 11: s.fxaa ^= 1; break;
-        case 13: { const int n = int(g_menuCams.size()) + 1; s.camera = (s.camera + (dir ? dir : 1) + n) % n; host_camera_stop(); break; }   // the game opens it again with the new one
-        case 14: s.renderer = (s.renderer + (dir ? dir : 1) + 3) % 3; break;
-        case 15: if (dir >= 0) { settings_save(); host_restart(); } break;
-        case 16: if (dir >= 0) { settings_save(); const std::string g = std::string(B->api_name()) + " / " + B->gpu_name(); host_report(g.c_str()); } break;
-        case 17: if (dir >= 0) { settings_save(); SDL_Event q{}; q.type = SDL_EVENT_QUIT; SDL_PushEvent(&q); } break;   // same as closing the window   // the options marked * are read once at start
-        case 12: s.sharpen = (s.sharpen + (dir ? dir : 1) + 4) % 4; break;   // the texture cache keeps sampler state: rebuild it
+    switch (kMenuOrder[menuSel]) {
+        case mScreen: s.fullscreen = (s.fullscreen + (dir ? dir : 1) + 3) % 3; if (s.fullscreen) g_lastFull = s.fullscreen; set_display_mode(s.fullscreen); break;
+        case mScale: s.scale = dir ? std::clamp(s.scale + dir, 1, 3) : s.scale % 3 + 1; break;
+        case mHz: { static const int r[4] = {60, 72, 120, 144}; int i = 0; while (i < 3 && r[i] != s.gameHz) ++i; s.gameHz = r[(i + (dir ? dir : 1) + 4) % 4]; break; }
+        case mRefresh: s.refresh ^= 1; break;
+        case mLang: s.language = 1 + (s.language - 1 + (dir ? dir : 1) + 5) % 5; break;
+        case mFps: s.showFps ^= 1; if (!s.showFps) SDL_SetWindowTitle(win, "Racing Club+"); break;
+        case mVsync: s.vsync ^= 1; B->set_vsync(s.vsync); break;
+        case mSound: s.sound ^= 1; break;
+        case mAniso: s.aniso = dir ? std::clamp(s.aniso + dir, 0, 4) : (s.aniso + 1) % 5; B->textures_changed(); break;   // the texture cache keeps sampler state: rebuild it
+        case mStream: s.streaming ^= 1; break;
+        case mFxaa: s.fxaa ^= 1; break;
+        case mSharpen: s.sharpen = (s.sharpen + (dir ? dir : 1) + 4) % 4; break;
+        case mCamera: { const int n = int(g_menuCams.size()) + 1; s.camera = (s.camera + (dir ? dir : 1) + n) % n; host_camera_stop(); break; }   // the game opens it again with the new one
+        case mApi: s.renderer = (s.renderer + (dir ? dir : 1) + 3) % 3; break;
+        case mApply: if (dir >= 0) { settings_save(); host_restart(); } break;
+        case mReport: if (dir >= 0) { settings_save(); const std::string g = std::string(B->api_name()) + " / " + B->gpu_name(); host_report(g.c_str()); } break;
+        case mQuit: if (dir >= 0) { settings_save(); SDL_Event q{}; q.type = SDL_EVENT_QUIT; SDL_PushEvent(&q); } break;   // same as closing the window
     }
     menuDirty = true;
 }
 
-// the menu bitmap and where it goes (the window's middle, 70 % of its height)
+// the menu bitmap, drawn at the size it is shown: 16:9, 80 % of the window height, in its middle
 static void menu_overlay(int ww, int wh, Overlay& o) {
-    const int W = 880, H = 840;
+    int dh = wh * 80 / 100, dw = dh * 16 / 9;
+    if (dw > ww * 94 / 100) { dw = ww * 94 / 100; dh = dw * 9 / 16; }
+    dw = std::max(dw, 64); dh = std::max(dh, 64);
     static std::vector<uint32_t> px;
-    static bool have = false;
+    static int haveW = 0, haveH = 0;
     o.changed = false;
-    if (menuDirty || !have) {
+    if (menuDirty || haveW != dw || haveH != dh) {
         menuDirty = false;
         const Settings& s = settings();
-        static const wchar_t* const res[3] = {L"1280 x 720 (original)", L"2560 x 1440", L"3840 x 2160"};
+        const Settings& b0 = boot_settings();
+        static const wchar_t* const res[3] = {L"1280 × 720 (original)", L"2560 × 1440", L"3840 × 2160"};
         static const wchar_t* const lang[5] = {L"English", L"Français", L"Español", L"Deutsch", L"Italiano"};
-        wchar_t l[kMenuLines][96];
-        std::swprintf(l[0], 96, L"OPCIONES");
-        std::swprintf(l[1], 96, L"Modo de pantalla\t‹ %ls ›", s.fullscreen == 0 ? L"Ventana" : s.fullscreen == 1 ? L"Ventana sin bordes" : L"Pantalla completa");
-        std::swprintf(l[2], 96, L"Resolución interna\t‹ %ls ›", res[std::clamp(s.scale, 1, 3) - 1]);
-        std::swprintf(l[3], 96, L"Imágenes por segundo *\t‹ %ls ›", s.gameHz == 60 ? L"60 (original)" : s.gameHz == 72 ? L"72 (ideal en 144 Hz)" : s.gameHz == 120 ? L"120 (experimental)" : L"144 (experimental)");
-        std::swprintf(l[4], 96, L"Adaptar la pantalla al juego *\t‹ %ls ›", s.refresh ? L"Sí" : L"No");
-        std::swprintf(l[5], 96, L"Idioma del juego *\t‹ %ls ›", lang[std::clamp(s.language, 1, 5) - 1]);
-        std::swprintf(l[6], 96, L"Contador de FPS en el título\t‹ %ls ›", s.showFps ? L"Sí" : L"No");
-        std::swprintf(l[7], 96, L"V-Sync\t‹ %ls ›", s.vsync ? L"Sí" : L"No");
-        std::swprintf(l[8], 96, L"Sonido *\t‹ %ls ›", s.sound ? L"Sí" : L"No");
-        {
-            static const wchar_t* const an[5] = {L"No", L"2x", L"4x", L"8x", L"16x"};
-            std::swprintf(l[9], 96, L"Filtrado anisótropo\t‹ %ls ›", an[std::clamp(s.aniso, 0, 4)]);
-        }
-        std::swprintf(l[10], 96, L"Modo directo (60 para OBS/Twitch) *\t‹ %ls ›", s.streaming ? L"Sí" : L"No");
-        std::swprintf(l[11], 96, L"Antialiasing (FXAA)\t‹ %ls ›", s.fxaa ? L"Sí" : L"No");
-        {
-            static const wchar_t* const sh[4] = {L"No", L"Baja", L"Media", L"Alta"};
-            std::swprintf(l[12], 96, L"Nitidez\t‹ %ls ›", sh[std::clamp(s.sharpen, 0, 3)]);
-        }
-        {
-            if (g_menuCams.empty()) g_menuCams = host_camera_list();
-            std::wstring name = L"Ninguna";
-            if (s.camera > 0 && s.camera <= int(g_menuCams.size())) { name.clear(); for (unsigned char ch : g_menuCams[size_t(s.camera - 1)]) name += wchar_t(ch); }
-            std::swprintf(l[13], 96, L"Cámara (EyeToy)\t‹ %ls ›", name.c_str());
-        }
-        std::swprintf(l[14], 96, L"Gráficos (API) *\t‹ %ls ›", s.renderer == 1 ? L"DirectX 11" : s.renderer == 2 ? L"Vulkan" : L"OpenGL");
-        {   // the one running now, when the option says another (it applies at the next start)
+        static const wchar_t* const an[5] = {L"Solo el del juego", L"2x", L"4x", L"8x", L"16x"};
+        static const wchar_t* const sh[4] = {L"No", L"Baja", L"Media", L"Alta"};
+        static const wchar_t* const api[3] = {L"OpenGL", L"DirectX 11", L"Vulkan"};
+        if (g_menuCams.empty()) g_menuCams = host_camera_list();
+        static std::wstring cam, note, status;
+        cam = L"Ninguna";
+        if (s.camera > 0 && s.camera <= int(g_menuCams.size())) { cam.clear(); for (unsigned char ch : g_menuCams[size_t(s.camera - 1)]) cam += wchar_t(ch); }
+        if (cam.size() > 34) cam = cam.substr(0, 33) + L"…";
+        note.clear();
+        {   // the API running now, when the option says another (it applies at the next start)
             const char* now = B ? B->api_name() : "";
-            const char* opt = s.renderer == 1 ? "DirectX 11" : s.renderer == 2 ? "Vulkan" : "OpenGL";
-            if (B && std::strcmp(now, opt) != 0) {
-                wchar_t extra[48]; std::swprintf(extra, 48, L"  (en uso: %hs)", now);
-                std::wstring line = l[14]; const size_t k = line.rfind(L" \x203a");
-                if (k != std::wstring::npos) line.insert(k, extra);
-                std::swprintf(l[14], 96, L"%ls", line.c_str());
+            char opt[16]; std::snprintf(opt, sizeof opt, "%ls", api[std::clamp(s.renderer, 0, 2)]);
+            if (B && std::strcmp(now, opt) != 0) { note = L"en uso: "; for (const char* q = now; *q; ++q) note += wchar_t(*q); }
+            status.clear();
+            if (B) { for (const char* q = B->api_name(); *q; ++q) status += wchar_t(*q); status += L"  ·  "; for (const char* q = B->gpu_name(); *q && *q != '/'; ++q) status += wchar_t((unsigned char)*q); }
+        }
+        using K = MenuRow::Kind;
+        auto choice = [](const wchar_t* l, const wchar_t* v, bool restart = false, bool pending = false, const wchar_t* n = L"") { MenuRow r; r.kind = K::Choice; r.label = l; r.value = v; r.restart = restart; r.pending = pending; r.note = n; return r; };
+        auto toggle = [](const wchar_t* l, bool on, bool restart = false, bool pending = false) { MenuRow r; r.kind = K::Toggle; r.label = l; r.on = on; r.restart = restart; r.pending = pending; return r; };
+        auto action = [](const wchar_t* l, const wchar_t* v) { MenuRow r; r.kind = K::Action; r.label = l; r.value = v; return r; };
+        MenuRow rows[kMenuCount + 1];
+        const wchar_t* help[kMenuCount + 1] = {};
+        for (int i = 0; i < kMenuCount; ++i) {
+            MenuRow& r = rows[i]; const wchar_t*& hp = help[i];
+            switch (kMenuOrder[i]) {
+                case mScreen: r = choice(L"Modo de pantalla", s.fullscreen == 0 ? L"Ventana" : s.fullscreen == 1 ? L"Ventana sin bordes" : L"Pantalla completa");
+                    hp = L"Ventana sin bordes ocupa todo el monitor y se puede capturar con OBS. Pantalla completa es el modo exclusivo. F11 o Alt+Intro alternan con la ventana."; break;
+                case mScale: r = choice(L"Resolución interna", res[std::clamp(s.scale, 1, 3) - 1]);
+                    hp = L"Resolución a la que se dibuja el juego antes de ajustarlo a la ventana. Más alta se ve más nítida y pide más a la tarjeta gráfica."; break;
+                case mHz: r = choice(L"Imágenes por segundo", s.gameHz == 60 ? L"60 (original)" : s.gameHz == 72 ? L"72 (ideal en 144 Hz)" : s.gameHz == 120 ? L"120 (experimental)" : L"144 (experimental)", true, s.gameHz != b0.gameHz);
+                    hp = L"Velocidad a la que corre el juego. 60 es la de la consola; 72 encaja con monitores de 144 Hz. 120 y 144 son experimentales."; break;
+                case mRefresh: r = toggle(L"Adaptar la pantalla al juego", s.refresh, true, s.refresh != b0.refresh);
+                    hp = L"Cambia la frecuencia del monitor mientras juegas (por ejemplo de 144 a 120 Hz) para que cada imagen dure lo mismo y el movimiento sea suave."; break;
+                case mVsync: r = toggle(L"V-Sync", s.vsync);
+                    hp = L"Sincroniza cada imagen con el refresco del monitor: sin cortes horizontales (tearing), a cambio de un poco más de retardo."; break;
+                case mApi: r = choice(L"API gráfica", api[std::clamp(s.renderer, 0, 2)], true, s.renderer != b0.renderer, note.c_str());
+                    hp = L"Con qué se dibuja el juego. Las tres se ven igual; si una da problemas con tu tarjeta gráfica, prueba otra."; break;
+                case mFxaa: r = toggle(L"Antialiasing (FXAA)", s.fxaa);
+                    hp = L"Suaviza los dientes de sierra de los bordes en la imagen final."; break;
+                case mSharpen: r = choice(L"Nitidez", sh[std::clamp(s.sharpen, 0, 3)]);
+                    hp = L"Realza los detalles de la imagen final. Va bien junto al antialiasing, que la suaviza un poco."; break;
+                case mAniso: r = choice(L"Filtrado anisótropo", an[std::clamp(s.aniso, 0, 4)]);
+                    hp = L"Mantiene nítidas las texturas del suelo y la carretera vistas de lejos o en ángulo. Apenas cuesta rendimiento."; break;
+                case mLang: r = choice(L"Idioma del juego", lang[std::clamp(s.language, 1, 5) - 1], true, s.language != b0.language);
+                    hp = L"Idioma de los textos y menús del juego."; break;
+                case mSound: r = toggle(L"Sonido", s.sound, true, s.sound != b0.sound);
+                    hp = L"Música y efectos de sonido del juego."; break;
+                case mCamera: r = choice(L"Cámara (EyeToy)", cam.c_str());
+                    hp = L"La cámara que el juego usa como EyeToy, para la foto del piloto."; break;
+                case mStream: r = toggle(L"Modo directo (OBS / Twitch)", s.streaming, true, s.streaming != b0.streaming);
+                    hp = L"Para grabar o emitir: el juego va a 60 imágenes por segundo y el monitor a 120 Hz, sea cual sea la opción de imágenes por segundo."; break;
+                case mFps: r = toggle(L"Contador de FPS en el título", s.showFps);
+                    hp = L"Muestra las imágenes por segundo en el título de la ventana."; break;
+                case mApply: r = action(L"Aplicar cambios", L"Reiniciar el juego");
+                    hp = L"Guarda las opciones y reinicia el juego, para aplicar las marcadas con REINICIO."; break;
+                case mReport: r = action(L"Informe de problemas", L"Crear y abrir GitHub");
+                    hp = L"Crea informe_problema.txt (equipo, opciones y registro, sin tu nombre de usuario) y abre la página para adjuntarlo."; break;
+                case mQuit: r = action(L"Salir del juego", L"Salir");
+                    hp = L"Guarda las opciones y cierra el juego."; break;
             }
         }
-        std::swprintf(l[15], 96, L"Aplicar cambios\t‹ Reiniciar el juego ›");
-        std::swprintf(l[16], 96, L"Informe de problemas\t‹ Crear y abrir GitHub ›");
-        std::swprintf(l[17], 96, L"Salir del juego\t‹ Salir ›");
-        std::swprintf(l[18], 96, L"* se aplica al reiniciar el juego (Aplicar cambios + Intro)");
-        std::swprintf(l[19], 96, L"Teclado: flechas, Intro, F1 o Esc   ·   Mando: panel táctil o botón PS, cruceta, cruz, círculo");
-        const wchar_t* lines[kMenuLines];
-        for (int i = 0; i < kMenuLines; ++i) lines[i] = l[i];
-        px.resize(size_t(W) * H);
-        if (!host_menu_bitmap(lines, kMenuLines, menuSel, W, H, px.data())) { o.px = nullptr; return; }
-        have = true; o.changed = true;
+        bool pending = false;
+        for (int i = 0; i < kMenuCount; ++i) pending |= rows[i].pending;
+        const int tab = menu_tab_of(menuSel);
+        MenuPage pg;
+        for (int t = 0; t < kMenuTabCount; ++t) pg.tabs[t] = kMenuTabs[t];
+        pg.nTabs = kMenuTabCount; pg.tab = tab;
+        pg.rows = rows + kMenuTabStart[tab]; pg.nRows = kMenuTabStart[tab + 1] - kMenuTabStart[tab]; pg.sel = menuSel - kMenuTabStart[tab];
+        pg.help = help[menuSel] ? help[menuSel] : L"";
+        pg.status = status.c_str();
+        pg.pending = pending;
+        pg.pad = pad != nullptr;
+        px.resize(size_t(dw) * dh);
+        if (!host_menu_bitmap(pg, dw, dh, px.data())) { o.px = nullptr; haveW = haveH = 0; return; }
+        haveW = dw; haveH = dh; o.changed = true;
     }
-    o.px = px.data(); o.w = W; o.h = H;
-    o.dh = std::min(wh * 7 / 10, H * 2); o.dw = o.dh * W / H; o.dx = (ww - o.dw) / 2; o.dy = (wh - o.dh) / 2;
+    o.px = px.data(); o.w = dw; o.h = dh;
+    o.dw = dw; o.dh = dh; o.dx = (ww - dw) / 2; o.dy = (wh - dh) / 2;
 }
 
 // ------------------------------------------------------------------ notifications (trophies)
@@ -835,18 +880,19 @@ static void toast_overlay(int ww, int wh, Overlay& o) {
     o.dx = ww - m - o.dw; o.dy = m;
 }
 
-static SDL_Gamepad* pad = nullptr;
 static bool padHold = false;   // the menu was closed with the controller: the game sees no buttons until they are released
 static void pump_events() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) quitFlag = true;
-        if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad) pad = SDL_OpenGamepad(e.gdevice.which);
+        if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad) { pad = SDL_OpenGamepad(e.gdevice.which); menuDirty = true; }
         if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {   // the menu with the controller: touchpad click or PS button opens and closes it
             const int b = e.gbutton.button;
             if (b == SDL_GAMEPAD_BUTTON_TOUCHPAD || b == SDL_GAMEPAD_BUTTON_GUIDE || (menuOpen && b == SDL_GAMEPAD_BUTTON_EAST)) { menuOpen = !menuOpen; menuDirty = true; if (!menuOpen) { settings_save(); padHold = true; } }
-            else if (menuOpen && b == SDL_GAMEPAD_BUTTON_DPAD_UP) { menuSel = menuSel > kMenuFirst ? menuSel - 1 : kMenuLast; menuDirty = true; }
-            else if (menuOpen && b == SDL_GAMEPAD_BUTTON_DPAD_DOWN) { menuSel = menuSel < kMenuLast ? menuSel + 1 : kMenuFirst; menuDirty = true; }
+            else if (menuOpen && b == SDL_GAMEPAD_BUTTON_DPAD_UP) menu_move(-1);
+            else if (menuOpen && b == SDL_GAMEPAD_BUTTON_DPAD_DOWN) menu_move(1);
+            else if (menuOpen && b == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) menu_tab(-1);
+            else if (menuOpen && b == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) menu_tab(1);
             else if (menuOpen && b == SDL_GAMEPAD_BUTTON_DPAD_LEFT) menu_change(-1);
             else if (menuOpen && (b == SDL_GAMEPAD_BUTTON_DPAD_RIGHT || b == SDL_GAMEPAD_BUTTON_SOUTH)) menu_change(1);
         }
@@ -854,8 +900,10 @@ static void pump_events() {
             const SDL_Scancode sc = e.key.scancode;
             if (sc == SDL_SCANCODE_F11 || (sc == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT))) { Settings& st = settings(); if (st.fullscreen) { g_lastFull = st.fullscreen; st.fullscreen = 0; } else st.fullscreen = g_lastFull; set_display_mode(st.fullscreen); menuDirty = true; settings_save(); }
             else if (sc == SDL_SCANCODE_F1 || (menuOpen && sc == SDL_SCANCODE_ESCAPE)) { menuOpen = !menuOpen; menuDirty = true; if (!menuOpen) settings_save(); }
-            else if (menuOpen && sc == SDL_SCANCODE_UP) { menuSel = menuSel > kMenuFirst ? menuSel - 1 : kMenuLast; menuDirty = true; }
-            else if (menuOpen && sc == SDL_SCANCODE_DOWN) { menuSel = menuSel < kMenuLast ? menuSel + 1 : kMenuFirst; menuDirty = true; }
+            else if (menuOpen && sc == SDL_SCANCODE_UP) menu_move(-1);
+            else if (menuOpen && sc == SDL_SCANCODE_DOWN) menu_move(1);
+            else if (menuOpen && (sc == SDL_SCANCODE_Q || sc == SDL_SCANCODE_PAGEUP || (sc == SDL_SCANCODE_TAB && (e.key.mod & SDL_KMOD_SHIFT)))) menu_tab(-1);
+            else if (menuOpen && (sc == SDL_SCANCODE_E || sc == SDL_SCANCODE_PAGEDOWN || sc == SDL_SCANCODE_TAB)) menu_tab(1);
             else if (menuOpen && sc == SDL_SCANCODE_LEFT) menu_change(-1);
             else if (menuOpen && (sc == SDL_SCANCODE_RIGHT || sc == SDL_SCANCODE_RETURN || sc == SDL_SCANCODE_SPACE)) menu_change(1);
         }
