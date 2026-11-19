@@ -100,7 +100,7 @@ if(SPU_GEN_SRC)
 endif()
 if(RECOMP_FULL_SRC)
   # whole game booted natively from its entry point (system layer: src/recomp/lv2.cpp)
-  add_executable(recomp_boot src/tools/recomp_boot.cpp src/recomp/guest.cpp src/recomp/lv2.cpp src/recomp/spu.cpp src/recomp/rsx_gl.cpp src/recomp/ripprof.cpp src/recomp/host_win.cpp src/recomp/settings.cpp src/recomp/audio_out.cpp src/recomp/atrac3.cpp src/recomp/host_camera.cpp src/recomp/edge_cull.cpp src/recomp/edge_native.cpp ${SPU_GEN_SRC})
+  add_executable(recomp_boot src/tools/recomp_boot.cpp src/recomp/guest.cpp src/recomp/lv2.cpp src/recomp/spu.cpp src/recomp/rsx_core.cpp src/recomp/rsx_gl.cpp src/recomp/ripprof.cpp src/recomp/host_win.cpp src/recomp/settings.cpp src/recomp/audio_out.cpp src/recomp/atrac3.cpp src/recomp/host_camera.cpp src/recomp/edge_cull.cpp src/recomp/edge_native.cpp ${SPU_GEN_SRC})
   target_link_libraries(recomp_boot PRIVATE recomp_full gti_formats SDL3::SDL3-static opengl32)
   # the game's icon (assets/racing_club.ico is the user's own artwork and is not in the repository) and a copy of the
   # executable under the game's name: started with a double click it finds the game files by itself
@@ -113,7 +113,7 @@ if(RECOMP_FULL_SRC)
     add_custom_command(TARGET recomp_boot POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:recomp_boot> "$<TARGET_FILE_DIR:recomp_boot>/Racing Club+.exe" VERBATIM)
   endif()
   # line tables (no effect on speed) so the RIPPROF samples of the system layer resolve to source lines
-  set_source_files_properties(src/recomp/lv2.cpp src/recomp/rsx_gl.cpp PROPERTIES COMPILE_OPTIONS "-gline-tables-only")
+  set_source_files_properties(src/recomp/lv2.cpp src/recomp/rsx_core.cpp src/recomp/rsx_gl.cpp PROPERTIES COMPILE_OPTIONS "-gline-tables-only")
   if(WIN32)
     target_link_libraries(recomp_boot PRIVATE dwmapi gdiplus shlwapi)
   endif()
