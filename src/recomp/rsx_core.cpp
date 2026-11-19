@@ -795,9 +795,9 @@ static void menu_overlay(int ww, int wh, Overlay& o) {
                     hp = L"Ventana sin bordes ocupa todo el monitor y se puede capturar con OBS. Pantalla completa es el modo exclusivo. F11 o Alt+Intro alternan con la ventana."; break;
                 case mScale: r = choice(L"Resolución interna", res[std::clamp(s.scale, 1, 3) - 1]);
                     hp = L"Resolución a la que se dibuja el juego antes de ajustarlo a la ventana. Más alta se ve más nítida y pide más a la tarjeta gráfica."; break;
-                case mHz: r = choice(L"Imágenes por segundo", s.gameHz == 60 ? L"60 (original)" : s.gameHz == 72 ? L"72 (ideal en 144 Hz)" : s.gameHz == 120 ? L"120 (experimental)" : L"144 (experimental)", true, s.gameHz != b0.gameHz);
+                case mHz: r = choice(L"Imágenes por segundo", s.gameHz == 60 ? L"60 (original)" : s.gameHz == 72 ? L"72 (ideal en 144 Hz)" : s.gameHz == 120 ? L"120 (experimental)" : L"144 (experimental)");
                     hp = L"Velocidad a la que corre el juego. 60 es la de la consola; 72 encaja con monitores de 144 Hz. 120 y 144 son experimentales."; break;
-                case mRefresh: r = toggle(L"Adaptar la pantalla al juego", s.refresh, true, s.refresh != b0.refresh);
+                case mRefresh: r = toggle(L"Adaptar la pantalla al juego", s.refresh);
                     hp = L"Cambia la frecuencia del monitor mientras juegas (por ejemplo de 144 a 120 Hz) para que cada imagen dure lo mismo y el movimiento sea suave."; break;
                 case mVsync: r = toggle(L"V-Sync", s.vsync);
                     hp = L"Sincroniza cada imagen con el refresco del monitor: sin cortes horizontales (tearing), a cambio de un poco más de retardo."; break;
@@ -811,11 +811,11 @@ static void menu_overlay(int ww, int wh, Overlay& o) {
                     hp = L"Mantiene nítidas las texturas del suelo y la carretera vistas de lejos o en ángulo. Apenas cuesta rendimiento."; break;
                 case mLang: r = choice(L"Idioma del juego", lang[std::clamp(s.language, 1, 5) - 1], true, s.language != b0.language);
                     hp = L"Idioma de los textos y menús del juego."; break;
-                case mSound: r = toggle(L"Sonido", s.sound, true, s.sound != b0.sound);
+                case mSound: r = toggle(L"Sonido", s.sound);
                     hp = L"Música y efectos de sonido del juego."; break;
                 case mCamera: r = choice(L"Cámara (EyeToy)", cam.c_str());
                     hp = L"La cámara que el juego usa como EyeToy, para la foto del piloto."; break;
-                case mStream: r = toggle(L"Modo directo (OBS / Twitch)", s.streaming, true, s.streaming != b0.streaming);
+                case mStream: r = toggle(L"Modo directo (OBS / Twitch)", s.streaming);
                     hp = L"Para grabar o emitir: el juego va a 60 imágenes por segundo y el monitor a 120 Hz, sea cual sea la opción de imágenes por segundo."; break;
                 case mFps: r = toggle(L"Contador de FPS en el título", s.showFps);
                     hp = L"Muestra las imágenes por segundo en el título de la ventana."; break;

@@ -593,31 +593,55 @@ void fifo_thread() {
 
 // GAMEHZ=n: rate of the emulated vblank (experiment: the console has 60)
 // streaming mode: 60 per second like the video (OBS, Twitch), so every game image is exactly one video frame
-const int g_gameHz = settings().streaming && !std::getenv("GAMEHZ") ? 60 : settings().gameHz;
+// Both follow the options menu while the game runs (vblank_thread checks them every vblank).
+static int wanted_hz() { return settings().streaming && !std::getenv("GAMEHZ") ? 60 : settings().gameHz; }
+static bool wanted_refresh() { return settings().refresh || settings().streaming; }
+int g_gameHz = wanted_hz();
 // The game was written for 60 images per second: parts of its logic advance a fixed step per image. Patched code
 // scales that step by g_frameStep (FRAMESTEP=0: off).
-const bool g_frameStepInit = (g_frameStep = std::getenv("FRAMESTEP") && std::getenv("FRAMESTEP")[0] == '0' ? 1.0f : 60.0f / float(g_gameHz), true);
+static const bool g_noFrameStep = std::getenv("FRAMESTEP") && std::getenv("FRAMESTEP")[0] == '0';
+const bool g_frameStepInit = (g_frameStep = g_noFrameStep ? 1.0f : 60.0f / float(g_gameHz), true);
 void vblank_thread() {
     t_tid = 0x01000201;
     // Pacing of the emulated 60 Hz vblank. When the display refreshes at a multiple of 60 the vblank follows the real
     // refreshes (every image is then shown for the same number of them); a display at another rate (144 Hz) is
     // switched to 120 Hz while the game runs. REFRESCO=0 leaves the display alone, VBLANKTIMER=1 forces the timer.
     int perVblank = 0;   // display refreshes per vblank; 0 = timer
-    {
-        int hz = host_display_hz();
+    bool refreshNow = wanted_refresh();
+    int switchedTo = 0;   // the rate the display was switched to (0: its own)
+    bool waitBroken = false;   // host_wait_refresh() does not wait (see below)
+    const int nativeHz = host_display_hz();
+    auto setup = [&] {   // at start, and again when the options menu changes the rate or the display switch
         const char* e = std::getenv("REFRESCO");
-        if (hz > 0 && hz % g_gameHz != 0 && (settings().refresh || settings().streaming) && !(e && !std::strcmp(e, "0"))) {
-            const int want = e && std::atoi(e) > 0 ? std::atoi(e) : 120;
-            if (host_set_refresh(want)) { LOG("[vblank] display switched from %d to %d Hz while the game runs\n", hz, want); hz = want; }
+        const int want = e && std::atoi(e) > 0 ? std::atoi(e) : 120;
+        const bool needSwitch = nativeHz > 0 && nativeHz % g_gameHz != 0 && refreshNow && !(e && !std::strcmp(e, "0")) && want % g_gameHz == 0;
+        if (switchedTo && (!needSwitch || switchedTo != want)) { host_restore_refresh(); switchedTo = 0; LOG("[vblank] display back to %d Hz\n", nativeHz); }
+        int hz = switchedTo ? switchedTo : host_display_hz();
+        perVblank = 0;
+        if (needSwitch && !switchedTo) {
+            if (host_set_refresh(want)) { LOG("[vblank] display switched from %d to %d Hz while the game runs\n", hz, want); hz = switchedTo = want; }
             else LOG("[vblank] the display has no %d Hz mode: staying at %d Hz\n", want, hz);
         }
-        if (hz > 0 && hz % g_gameHz == 0 && !std::getenv("VBLANKTIMER")) perVblank = hz / g_gameHz;
-        LOG("[vblank] display %d Hz: vblank %s\n", hz, perVblank ? "follows the display refresh" : "on a 60 Hz timer");
-    }
+        if (hz > 0 && hz % g_gameHz == 0 && !std::getenv("VBLANKTIMER") && !waitBroken) perVblank = hz / g_gameHz;
+        LOG("[vblank] %d images per second, display %d Hz: vblank %s\n", g_gameHz, hz, perVblank ? "follows the display refresh" : "on a timer");
+    };
+    setup();
     auto next = std::chrono::steady_clock::now();
     uint64_t lastTick = now_us();
     int odd = 0;
     for (;;) {
+        {   // HZSWITCH=seconds:rate,... (debug): what the options menu does, at those times
+            static std::vector<std::pair<double, int>> sw; static bool parsed = false;
+            if (!parsed) { parsed = true; if (const char* e = std::getenv("HZSWITCH")) for (const char* q = e; *q;) { double t; int r; if (std::sscanf(q, "%lf:%d", &t, &r) == 2) sw.push_back({t, r}); while (*q && *q != ',') ++q; if (*q) ++q; } }
+            static const auto t0 = std::chrono::steady_clock::now();
+            if (!sw.empty() && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() >= sw.front().first) { settings().gameHz = sw.front().second; sw.erase(sw.begin()); }
+        }
+        if (const int hz = wanted_hz(); hz > 0 && (hz != g_gameHz || wanted_refresh() != refreshNow)) {   // options menu
+            g_gameHz = hz; refreshNow = wanted_refresh();
+            if (!g_noFrameStep) g_frameStep = 60.0f / float(g_gameHz);
+            setup();
+            next = std::chrono::steady_clock::now(); lastTick = now_us();
+        }
         if (perVblank) {
             for (int k = 0; k < perVblank && perVblank; ++k) if (!host_wait_refresh()) perVblank = 0;
             // VBLANKFASE=us: the game's vblank comes that long after the real refresh, so its image is presented in the
@@ -625,7 +649,8 @@ void vblank_thread() {
             // picks the image up: one image a refresh at 120 Hz has no slack for a present landing on either side of it
             // Default: half a refresh when every refresh carries a new image (120 on 120 Hz, 144 on 144 Hz); with two or
             // more refreshes per image (72 on 144 Hz) there is slack and nothing changes. VBLANKFASE=0 turns it off.
-            {   static const long fase = std::getenv("VBLANKFASE") ? std::atol(std::getenv("VBLANKFASE")) : (perVblank == 1 ? 500000 / g_gameHz : 0);
+            {   static const char* const faseEnv = std::getenv("VBLANKFASE");
+                const long fase = faseEnv ? std::atol(faseEnv) : (perVblank == 1 ? 500000 / g_gameHz : 0);
                 if (fase > 0 && perVblank) host_sleep_us(uint64_t(fase)); }
             const uint64_t t = now_us(), dt = t - lastTick;
             lastTick = t;
@@ -634,8 +659,14 @@ void vblank_thread() {
             static int good = 0, seen = 0;
             (void)odd;
             if (dt * g_gameHz > 936000 && dt * g_gameHz < 1062000) ++good;
-            if (++seen == 240) {
-                if (good < 160) { LOG("[vblank] only %d of 240 vblanks were 16.67 ms apart (display reports %d Hz): back to the 60 Hz timer\n", good, host_display_hz()); perVblank = 0; host_restore_refresh(); }
+            {   // the wait returning at once (seen with the NVIDIA 621 driver: ~2 us): the vblanks would come in a burst.
+                // The timer then, for the rest of the run; the display keeps the rate it was switched to.
+                static int instant = 0;
+                instant = dt * g_gameHz < 100000 ? instant + 1 : 0;
+                if (instant >= 8) { LOG("[vblank] the display's vblank wait returns at once: vblank on a timer\n"); waitBroken = true; perVblank = 0; instant = good = seen = 0; }
+            }
+            if (perVblank && ++seen == 240) {
+                if (good < 160) { LOG("[vblank] only %d of 240 vblanks were 16.67 ms apart (display reports %d Hz): back to the 60 Hz timer\n", good, host_display_hz()); perVblank = 0; host_restore_refresh(); switchedTo = 0; }
                 good = seen = 0;
             }
             next = std::chrono::steady_clock::now();
@@ -2160,7 +2191,9 @@ constexpr uint32_t kUnwritten = 0x7fc0dead;
 std::atomic<uint64_t> g_holes{0}, g_waited{0};
 void port_thread() {
     // The game waits for its mixer even with the sound off: the port then runs on its clock and nothing is played.
-    const bool play = settings().sound && !std::getenv("NOSOUND") && audio_out_open();
+    // settings().sound is followed while the game runs (options menu): the device is opened the first time it is on
+    static const bool noSound = std::getenv("NOSOUND") != nullptr;
+    bool play = settings().sound && !noSound && audio_out_open(), openFailed = settings().sound && !noSound && !play;
     host_thread_priority_high();
     LOG("[snd] audio port %s: %u channels, %u blocks\n", play ? "playing" : "running silent (sound off)", g_ch, g_blocks);
     std::vector<float> out(512);
@@ -2171,6 +2204,11 @@ void port_thread() {
         // index and must see it advance evenly (bursts make it miss blocks). The SDL queue absorbs the jitter; the
         // clock is nudged to keep about 6 blocks queued, which also follows the sound card's real rate.
         next += std::chrono::nanoseconds(5333333);
+        if (const bool want = settings().sound && !noSound; want != play && !(want && openFailed)) {
+            if (want) { play = audio_out_open(); openFailed = !play; }
+            else { play = false; audio_out_clear(); }
+            LOG("[snd] sound %s\n", play ? "on" : "off");
+        }
         {
             const int q = play ? audio_out_queued() : 12 * 256;
             if (q > 16 * 256) next += std::chrono::microseconds(300); else if (q < 10 * 256) next -= std::chrono::microseconds(300);   // about 70 ms queued: room for a late mixer pass when another program (OBS) takes CPU time
