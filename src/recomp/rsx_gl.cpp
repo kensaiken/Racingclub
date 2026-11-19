@@ -96,14 +96,24 @@ static std::vector<float> vtx;
 static std::vector<uint32_t> idx;
 
 // ------------------------------------------------------------------ programs
-struct Program { uint64_t key = 0; GLuint prog = 0; GLint uVs, uVo, uSurf, uTsc, uAlpha, uWpos, uFc; uint32_t nConst = 0; uint32_t vpInputs = 0; uint32_t texUsed = 0; bool bad = false; };
+// With GL_KHR_parallel_shader_compile the driver links (and finishes cached binaries) on its own threads: a new
+// program is started here and its draws are skipped until GL_COMPLETION_STATUS_KHR says it is done, instead of
+// stalling the frame 5-30 ms per program (first play, or a driver update that emptied the driver's own cache).
+// GLSYNC=1: wait as before.
+struct Program { uint64_t key = 0; GLuint prog = 0; GLint uVs, uVo, uSurf, uTsc, uAlpha, uWpos, uFc; uint32_t nConst = 0; uint32_t vpInputs = 0; uint32_t texUsed = 0; bool bad = false;
+                 bool pending = false; int kind = 0; /* 1 binary from glcache, 2 compiled */ GLuint vsSh = 0, fsSh = 0; std::string vsSrc, fsSrc, cacheName; uint64_t t0 = 0; };
+typedef void (*PFN_glMaxShaderCompilerThreadsKHR)(GLuint);
+static PFN_glMaxShaderCompilerThreadsKHR glMaxShaderCompilerThreadsKHR = nullptr;
+static bool g_parallel = false;
+static uint64_t g_skippedDraws = 0;
 static std::unordered_map<uint64_t, Program> programs;
 
-static GLuint compile(GLenum type, const std::string& src, const char* what) {
+static GLuint compile(GLenum type, const std::string& src, const char* what, bool async = false) {
     const GLuint s = glCreateShader(type);
     const char* p = src.c_str();
     glShaderSource(s, 1, &p, nullptr);
     glCompileShader(s);
+    if (async) return s;   // the link reports errors (checked when it completes)
     GLint ok = 0;
     glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
     if (!ok) {
@@ -114,6 +124,58 @@ static GLuint compile(GLenum type, const std::string& src, const char* what) {
     return s;
 }
 
+// completes a program started by get_program: false while the driver is still working on it (wait = false)
+static bool finish_program(Program& p, bool wait) {
+    if (!wait) { GLint done = 0; glGetProgramiv(p.prog, 0x91B1 /* GL_COMPLETION_STATUS_KHR */, &done); if (!done) return false; }
+    const uint64_t pt1 = SDL_GetPerformanceCounter();
+    GLint ok = 0;
+    glGetProgramiv(p.prog, GL_LINK_STATUS, &ok);
+    while (glGetError()) {}
+    const bool fromCache = p.kind == 1 && ok;
+    if (!ok && p.kind == 1) {   // the driver rejected the cached binary (other driver version): compile, waiting this once
+        p.vsSh = compile(GL_VERTEX_SHADER, p.vsSrc, "vertex"); p.fsSh = compile(GL_FRAGMENT_SHADER, p.fsSrc, "fragment");
+        glAttachShader(p.prog, p.vsSh); glAttachShader(p.prog, p.fsSh);
+        glLinkProgram(p.prog);
+        glGetProgramiv(p.prog, GL_LINK_STATUS, &ok);
+        p.kind = 2;
+    }
+    if (ok && p.kind == 2 && !p.cacheName.empty()) {
+        GLint len = 0;
+        glGetProgramiv(p.prog, 0x8741 /* GL_PROGRAM_BINARY_LENGTH */, &len);
+        if (len > 0) {
+            std::vector<uint8_t> bin(size_t(len) + 4);
+            GLsizei got = 0; GLenum fmt = 0;
+            glGetProgramBinary(p.prog, len, &got, &fmt, bin.data() + 4);
+            const uint32_t f32v = fmt; std::memcpy(bin.data(), &f32v, 4);
+            if (got > 0) if (FILE* f = std::fopen(p.cacheName.c_str(), "wb")) { std::fwrite(bin.data(), 1, size_t(got) + 4, f); std::fclose(f); }
+        }
+    }
+    if (!ok) {
+        char log[4096]; GLsizei ln = 0;
+        glGetProgramInfoLog(p.prog, sizeof log, &ln, log);
+        RLOG("[rsx] link error: %s\n", log);
+        if (p.vsSh) { GLint c = 0; glGetShaderiv(p.vsSh, GL_COMPILE_STATUS, &c); if (!c) { glGetShaderInfoLog(p.vsSh, sizeof log, &ln, log); RLOG("[rsx] vertex shader: %s\n", log); } }
+        if (p.fsSh) { GLint c = 0; glGetShaderiv(p.fsSh, GL_COMPILE_STATUS, &c); if (!c) { glGetShaderInfoLog(p.fsSh, sizeof log, &ln, log); RLOG("[rsx] fragment shader: %s\n", log); } }
+        p.bad = true;
+    }
+    glDeleteShader(p.vsSh); glDeleteShader(p.fsSh); p.vsSh = p.fsSh = 0;
+    p.vsSrc.clear(); p.vsSrc.shrink_to_fit(); p.fsSrc.clear(); p.fsSrc.shrink_to_fit();
+    p.uVs = glGetUniformLocation(p.prog, "u_vscale");
+    p.uVo = glGetUniformLocation(p.prog, "u_voffset");
+    p.uSurf = glGetUniformLocation(p.prog, "u_surf");
+    p.uTsc = glGetUniformLocation(p.prog, "u_tsc");
+    p.uAlpha = glGetUniformLocation(p.prog, "u_alpha");
+    p.uWpos = glGetUniformLocation(p.prog, "u_wpos");
+    p.uFc = glGetUniformLocation(p.prog, "fc");
+    p.pending = false;
+    {   // [prog]: a program that cost the frame time (waiting) or took long to be ready (parallel)
+        const uint64_t now = SDL_GetPerformanceCounter(), fq = SDL_GetPerformanceFrequency();
+        const double here = double(now - pt1) * 1000.0 / double(fq), total = double(now - p.t0) * 1000.0 / double(fq);
+        if (wait ? total > 2.0 : here > 2.0) RLOG("[prog] %016llx %.1f ms in this frame (%s)\n", (unsigned long long)p.key, wait ? total : here, fromCache ? "cache" : "compiled");
+        else if (!wait && total > 50.0) RLOG("[prog] %016llx ready %.0f ms after first use (%s, in parallel)\n", (unsigned long long)p.key, total, fromCache ? "cache" : "compiled");
+    }
+    return true;
+}
 static std::vector<float> g_fpConsts;   // constants of the fragment program of the current draw (filled by get_program)
 static uint64_t vpGen = 1;              // bumped whenever vertex program words are uploaded
 static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, uint32_t control) {
@@ -168,9 +230,7 @@ static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, u
     std::snprintf(cacheName, sizeof cacheName, "glcache/%016llx.bin", (unsigned long long)(fnv(vi.glsl.data(), vi.glsl.size(), fnv(fi.glsl.data(), fi.glsl.size()))));
     const uint64_t pt1 = SDL_GetPerformanceCounter();
     p.prog = glCreateProgram();
-    GLint ok = 0;
-    bool fromCache = false;
-    GLuint vs = 0, fs = 0;
+    p.vsSrc = vi.glsl; p.fsSrc = fi.glsl; p.cacheName = binCache ? cacheName : ""; p.t0 = pt0;
     if (binCache)
         if (FILE* f = std::fopen(cacheName, "rb")) {
             std::vector<uint8_t> bin;
@@ -180,52 +240,20 @@ static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, u
             if (bin.size() > 4) {
                 uint32_t fmt; std::memcpy(&fmt, bin.data(), 4);
                 glProgramBinary(p.prog, fmt, bin.data() + 4, GLsizei(bin.size() - 4));
-                glGetProgramiv(p.prog, GL_LINK_STATUS, &ok);
                 while (glGetError()) {}
-                fromCache = ok != 0;
+                p.kind = 1;
             }
         }
-    if (!ok) {
-        vs = compile(GL_VERTEX_SHADER, vi.glsl, "vertex"); fs = compile(GL_FRAGMENT_SHADER, fi.glsl, "fragment");
-        glAttachShader(p.prog, vs);
-        glAttachShader(p.prog, fs);
+    if (!p.kind) {
+        p.vsSh = compile(GL_VERTEX_SHADER, vi.glsl, "vertex", g_parallel); p.fsSh = compile(GL_FRAGMENT_SHADER, fi.glsl, "fragment", g_parallel);
+        glAttachShader(p.prog, p.vsSh);
+        glAttachShader(p.prog, p.fsSh);
         glLinkProgram(p.prog);
-        glGetProgramiv(p.prog, GL_LINK_STATUS, &ok);
-        if (ok && binCache) {
-            GLint len = 0;
-            glGetProgramiv(p.prog, 0x8741 /* GL_PROGRAM_BINARY_LENGTH */, &len);
-            if (len > 0) {
-                std::vector<uint8_t> bin(size_t(len) + 4);
-                GLsizei got = 0; GLenum fmt = 0;
-                glGetProgramBinary(p.prog, len, &got, &fmt, bin.data() + 4);
-                const uint32_t f32v = fmt; std::memcpy(bin.data(), &f32v, 4);
-                if (got > 0) if (FILE* f = std::fopen(cacheName, "wb")) { std::fwrite(bin.data(), 1, size_t(got) + 4, f); std::fclose(f); }
-            }
-        }
+        p.kind = 2;
     }
-    if (!ok) {
-        char log[4096]; GLsizei ln = 0;
-        glGetProgramInfoLog(p.prog, sizeof log, &ln, log);
-        RLOG("[rsx] link error: %s\n", log);
-        p.bad = true;
-    }
-    const uint64_t pt2 = SDL_GetPerformanceCounter();
-    glDeleteShader(vs); glDeleteShader(fs);
-    p.uVs = glGetUniformLocation(p.prog, "u_vscale");
-    p.uVo = glGetUniformLocation(p.prog, "u_voffset");
-    p.uSurf = glGetUniformLocation(p.prog, "u_surf");
-    p.uTsc = glGetUniformLocation(p.prog, "u_tsc");
-    p.uAlpha = glGetUniformLocation(p.prog, "u_alpha");
-    p.uWpos = glGetUniformLocation(p.prog, "u_wpos");
-    p.uFc = glGetUniformLocation(p.prog, "fc");
-    {   // [prog]: where a slow program build goes. Loads from glcache/ also take 5-30 ms when the driver's own shader
-        // cache is cold (after a driver update; first play on a new PC): the driver finishes each binary per context,
-        // so loading them early on another thread does not help (tried 19/11)
-        const uint64_t pt3 = SDL_GetPerformanceCounter(), fq = SDL_GetPerformanceFrequency();
-        const double ms = double(pt3 - pt0) * 1000.0 / double(fq);
-        if (ms > 2.0) RLOG("[prog] %016llx %.1f ms (%s): translate %.1f, gl %.1f, uniforms %.1f\n", (unsigned long long)key, ms, fromCache ? "cache" : "compiled",
-                           double(pt1 - pt0) * 1000.0 / double(fq), double(pt2 - pt1) * 1000.0 / double(fq), double(pt3 - pt2) * 1000.0 / double(fq));
-    }
+    p.pending = true;
+    (void)pt1;
+    if (!g_parallel) finish_program(p, true);
     static int nProg = 0;
     if (++nProg % 50 == 0) RLOG("[rsx] %d programs compiled\n", nProg);
     return &p;
@@ -892,7 +920,9 @@ static void do_draw() {
     uint32_t texDims = 0;
     for (int i = 0; i < 16; ++i) texDims |= texDimsOf(i) << (2 * i);
     Program* p = get_program(R[0x1ea0 >> 2] & 511, fpEa, texDims, R[0x1d60 >> 2]);
-    if (!p || p->bad) return;
+    if (!p) return;
+    if (p->pending && !finish_program(*p, false)) { ++g_skippedDraws; return; }
+    if (p->bad) return;
     mark();
     glUseProgram(p->prog);
     apply_state();
@@ -1334,6 +1364,11 @@ static bool init_gl() {
     glEnable(GL_PROGRAM_POINT_SIZE);
     if (std::getenv("RSXCLAMP")) glEnable(GL_DEPTH_CLAMP);
     if (dumpShaders) SDL_CreateDirectory("rsxdump");
+    glMaxShaderCompilerThreadsKHR = reinterpret_cast<PFN_glMaxShaderCompilerThreadsKHR>(SDL_GL_GetProcAddress("glMaxShaderCompilerThreadsKHR"));
+    if (!glMaxShaderCompilerThreadsKHR) glMaxShaderCompilerThreadsKHR = reinterpret_cast<PFN_glMaxShaderCompilerThreadsKHR>(SDL_GL_GetProcAddress("glMaxShaderCompilerThreadsARB"));
+    g_parallel = glMaxShaderCompilerThreadsKHR && !std::getenv("GLSYNC");
+    if (g_parallel) glMaxShaderCompilerThreadsKHR(0xFFFFFFFFu);
+    RLOG("[rsx] shader programs: %s\n", g_parallel ? "built in parallel by the driver (draws wait for them)" : "built when first used");
     glOk = true;
     return true;
 }

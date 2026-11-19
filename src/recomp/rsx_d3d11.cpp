@@ -13,6 +13,9 @@
 #include <cmath>
 #include <cstdlib>
 #include <map>
+#include <condition_variable>
+#include <deque>
+#include <functional>
 #include <unordered_map>
 
 #define WIN32_LEAN_AND_MEAN
@@ -227,11 +230,17 @@ static std::string hlsl_ps(const FpInfo& fi, uint32_t texDims, uint32_t control)
 }
 
 // HLSL -> bytecode, kept on disk (d3dcache/): FXC takes tens of milliseconds per shader
-static ID3DBlob* compile_hlsl(const std::string& src, const char* profile, const char* what) {
-    static bool dirMade = false;
-    if (!dirMade) { dirMade = true; SDL_CreateDirectory("d3dcache"); }
+static void cache_name(char* name, size_t n, const std::string& src, const char* profile) {
+    std::snprintf(name, n, "d3dcache/%016llx_%s.bin", (unsigned long long)fnv(src.data(), src.size(), fnv(profile, std::strlen(profile))), profile);
+}
+static bool in_cache(const std::string& src, const char* profile) {
+    char name[96]; cache_name(name, sizeof name, src, profile);
+    if (FILE* f = std::fopen(name, "rb")) { std::fclose(f); return true; }
+    return false;
+}
+static ID3DBlob* compile_hlsl(const std::string& src, const char* profile, const char* what) {   // any thread
     char name[96];
-    std::snprintf(name, sizeof name, "d3dcache/%016llx_%s.bin", (unsigned long long)fnv(src.data(), src.size(), fnv(profile, std::strlen(profile))), profile);
+    cache_name(name, sizeof name, src, profile);
     ID3DBlob* blob = nullptr;
     if (FILE* f = std::fopen(name, "rb")) {
         std::fseek(f, 0, SEEK_END); const long n = std::ftell(f); std::fseek(f, 0, SEEK_SET);
@@ -254,8 +263,49 @@ static ID3DBlob* compile_hlsl(const std::string& src, const char* profile, const
 }
 
 // ------------------------------------------------------------------ programs
-struct Program { ID3D11VertexShader* vs = nullptr; ID3D11PixelShader* ps = nullptr; ID3DBlob* vsCode = nullptr; uint32_t vpInputs = 0, texUsed = 0, nConst = 0; bool bad = false; };
+// A program whose shaders are not in d3dcache/ yet is compiled by a worker thread (FXC takes 20-60 ms per program,
+// a visible hitch every time a new effect appears on a first play); its draws are skipped until it is ready, which
+// only shows as an object missing for a frame or two. D3DSYNC=1: compile on the spot as before.
+struct Program { ID3D11VertexShader* vs = nullptr; ID3D11PixelShader* ps = nullptr; ID3DBlob* vsCode = nullptr; uint32_t vpInputs = 0, texUsed = 0, nConst = 0;
+                 std::atomic<int> state{0};   // 0 compiling, 1 ready, 2 failed
+                 bool bad() const { return state.load(std::memory_order_acquire) != 1; } };
 std::unordered_map<uint64_t, Program> programs;
+// builds p's shaders from the HLSL (any thread: D3D11 devices are free-threaded)
+void build_program(Program& p, const std::string& vsrc, const std::string& psrc) {
+    ID3DBlob* vsCode = compile_hlsl(vsrc, "vs_5_0", "vertex");
+    ID3DBlob* psCode = compile_hlsl(psrc, "ps_5_0", "pixel");
+    bool ok = vsCode && psCode && SUCCEEDED(dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &p.vs)) &&
+              SUCCEEDED(dev->CreatePixelShader(psCode->GetBufferPointer(), psCode->GetBufferSize(), nullptr, &p.ps));
+    release(psCode);
+    p.vsCode = vsCode;
+    p.state.store(ok ? 1 : 2, std::memory_order_release);
+}
+struct CompileQueue {
+    std::mutex mx; std::condition_variable cv; std::deque<std::function<void()>> jobs; bool started = false;
+    std::atomic<int> pending{0};
+    void push(std::function<void()> f) {
+        {
+            std::lock_guard<std::mutex> lk(mx);
+            if (!started) {
+                started = true;
+                const int n = std::clamp(int(SDL_GetNumLogicalCPUCores()) / 4, 1, 3);
+                for (int i = 0; i < n; ++i)
+                    if (SDL_Thread* t = SDL_CreateThread([](void* q) -> int { static_cast<CompileQueue*>(q)->run(); return 0; }, "shaders", this)) SDL_DetachThread(t);
+            }
+            jobs.push_back(std::move(f)); ++pending;
+        }
+        cv.notify_one();
+    }
+    void run() {
+        SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_LOW);
+        for (;;) {
+            std::function<void()> f;
+            { std::unique_lock<std::mutex> lk(mx); cv.wait(lk, [&] { return !jobs.empty(); }); f = std::move(jobs.front()); jobs.pop_front(); }
+            f(); --pending;
+        }
+    }
+} compileQueue;
+uint64_t skippedDraws = 0;
 std::vector<float> fpConsts;
 Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, uint32_t control) {
     uint32_t n = 0;
@@ -293,13 +343,19 @@ Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, uint32_t
         std::snprintf(fn, sizeof fn, "rsxdump/d3d_%04d_%016llx.hlsl", nShader++, (unsigned long long)key);
         if (FILE* f = std::fopen(fn, "wb")) { std::fprintf(f, "%s\n// ---- pixel\n%s", vsrc.c_str(), psrc.c_str()); std::fclose(f); }
     }
-    p.vsCode = compile_hlsl(vsrc, "vs_5_0", "vertex");
-    ID3DBlob* psCode = compile_hlsl(psrc, "ps_5_0", "pixel");
-    if (!p.vsCode || !psCode || FAILED(dev->CreateVertexShader(p.vsCode->GetBufferPointer(), p.vsCode->GetBufferSize(), nullptr, &p.vs)) ||
-        FAILED(dev->CreatePixelShader(psCode->GetBufferPointer(), psCode->GetBufferSize(), nullptr, &p.ps))) p.bad = true;
-    release(psCode);
-    const double ms = double(SDL_GetPerformanceCounter() - t0) * 1000.0 / double(SDL_GetPerformanceFrequency());
-    if (ms > 2.0) RLOG("[prog] %016llx %.1f ms (d3d11)\n", (unsigned long long)key, ms);
+    static const bool sync = std::getenv("D3DSYNC") != nullptr;
+    if (sync || (in_cache(vsrc, "vs_5_0") && in_cache(psrc, "ps_5_0"))) {
+        build_program(p, vsrc, psrc);
+        const double ms = double(SDL_GetPerformanceCounter() - t0) * 1000.0 / double(SDL_GetPerformanceFrequency());
+        if (ms > 2.0) RLOG("[prog] %016llx %.1f ms (d3d11)\n", (unsigned long long)key, ms);
+    } else {
+        Program* pp = &p;   // (unordered_map nodes do not move)
+        compileQueue.push([pp, vsrc, psrc, key, t0] {
+            build_program(*pp, vsrc, psrc);
+            RLOG("[prog] %016llx compiled in the background, ready %.0f ms after first use\n", (unsigned long long)key,
+                 double(SDL_GetPerformanceCounter() - t0) * 1000.0 / double(SDL_GetPerformanceFrequency()));
+        });
+    }
     return &p;
 }
 
@@ -862,7 +918,7 @@ void do_draw() {
     uint32_t texDims = 0;
     for (int i = 0; i < 16; ++i) texDims |= texDimsOf(i) << (2 * i);
     Program* p = get_program(R[0x1ea0 >> 2] & 511, fpEa, texDims, R[0x1d60 >> 2]);
-    if (!p || p->bad) return;
+    if (!p || p->bad()) { if (p && p->state.load() == 0) ++skippedDraws; return; }
     if (p->vs != lastVs) { ctx->VSSetShader(p->vs, nullptr, 0); lastVs = p->vs; }
     if (p->ps != lastPs) { ctx->PSSetShader(p->ps, nullptr, 0); lastPs = p->ps; }
     apply_state();
@@ -1287,6 +1343,7 @@ bool init_d3d() {
         D3D11_DEPTH_STENCIL_DESC z{}; z.DepthEnable = FALSE; z.StencilEnable = FALSE;
         dev->CreateDepthStencilState(&z, &postDs);
     }
+    SDL_CreateDirectory("d3dcache");
     fsVs = make_vs(kFsVs);
     clearVs = fsVs;
     clearPs = make_ps(kClearPs);
