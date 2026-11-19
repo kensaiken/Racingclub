@@ -613,7 +613,7 @@ static void bind_texture_impl(int i, float* tsc) {
     const uint64_t key = (uint64_t(loc) << 32 | off) ^ (uint64_t(cube) << 63);
     Tex& tx = texCache[key];
     g_bindMemoOk = true;
-    const uint64_t regSig = fnv(&fmtReg, 4) ^ (uint64_t(rect) << 20) ^ (uint64_t(pitch) << 3) ^ remap * 0x100000001b3ull;
+    const uint64_t regSig = fnv(&fmtReg, 4) ^ (uint64_t(rect) << 20) ^ (uint64_t(pitch) << 3) ^ remap * 0x100000001b3ull ^ uint64_t(texture_epoch()) * 0x9E3779B97F4A7C15ull;
     uint64_t sig = tx.sig;
     // The content is re-sampled every 4th frame only (and whenever the registers change): textures are rarely
     // rewritten in place (render targets are handled apart), and this sampling was a third of the RSX thread.

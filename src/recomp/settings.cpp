@@ -37,6 +37,7 @@ const Field kFields[] = {
     {"filtrado_anisotropo", &Settings::aniso, 0, 4},
     {"camara", &Settings::camera, 0, 16},
     {"renderizador", &Settings::renderer, 0, 2},
+    {"iconos_botones", &Settings::buttons, 0, 3},
 };
 }
 

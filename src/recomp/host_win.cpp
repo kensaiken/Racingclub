@@ -12,6 +12,7 @@
 #include <thread>
 #include <chrono>
 #include <utility>
+#include <vector>
 #include <initializer_list>
 #include "recomp/host_ui.h"
 #ifdef _WIN32
@@ -348,6 +349,53 @@ float keycap(Gdiplus::Graphics& g, const wchar_t* s, int symbol, const Gdiplus::
 }
 }
 
+// A button icon like the game's PlayStation ones (dark disc, coloured symbol) for another controller: style 2 Xbox
+// (A green, B red, X blue, Y yellow), 3 Nintendo (white letters); symbol = the PlayStation button at that place
+// (0 cross = bottom, 1 circle = right, 2 square = left, 3 triangle = top). w x h straight-alpha RGBA.
+bool host_button_glyph(int style, int symbol, int w, int h, uint8_t* rgba) {
+    if (style != 2 && style != 3) return false;
+    gdip_start();
+    const int S = 4, W = w * S, H = h * S;
+    std::vector<uint32_t> big(size_t(W) * H, 0);
+    {
+        Gdiplus::Bitmap bmp(W, H, W * 4, PixelFormat32bppPARGB, reinterpret_cast<BYTE*>(big.data()));
+        Gdiplus::Graphics g(&bmp);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+        const float d = float(std::min(W, H)) - 1.f, x = (W - d) / 2, y = (H - d) / 2;
+        Gdiplus::SolidBrush rim(Color(255, 8, 8, 10));
+        g.FillEllipse(&rim, x, y, d, d);
+        const float in = 1.3f * S;
+        Gdiplus::LinearGradientBrush fill(PointF(0, y), PointF(0, y + d), Color(255, 84, 86, 92), Color(255, 30, 31, 35));
+        g.FillEllipse(&fill, x + in, y + in, d - 2 * in, d - 2 * in);
+        static const wchar_t* const xbox[4] = {L"A", L"B", L"X", L"Y"};
+        static const wchar_t* const nin[4] = {L"B", L"A", L"Y", L"X"};
+        static const Color xcol[4] = {Color(255, 110, 205, 60), Color(255, 245, 70, 60), Color(255, 70, 150, 255), Color(255, 250, 205, 40)};
+        const wchar_t* t = style == 2 ? xbox[symbol & 3] : nin[symbol & 3];
+        const Color c = style == 2 ? xcol[symbol & 3] : Color(255, 245, 245, 245);
+        Gdiplus::FontFamily fam(L"Segoe UI");
+        Gdiplus::Font f(&fam, d * 0.68f, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+        text(g, t, f, c, W / 2.f, H / 2.f + d * 0.01f, 1);
+        g.Flush(Gdiplus::FlushIntentionSync);
+    }
+    for (int yy = 0; yy < h; ++yy)   // box filter down to w x h, premultiplied BGRA -> straight RGBA
+        for (int xx = 0; xx < w; ++xx) {
+            uint32_t sb = 0, sg = 0, sr = 0, sa = 0;
+            for (int j = 0; j < S; ++j)
+                for (int i = 0; i < S; ++i) {
+                    const uint32_t p = big[size_t(yy * S + j) * W + xx * S + i];
+                    sb += p & 255; sg += (p >> 8) & 255; sr += (p >> 16) & 255; sa += p >> 24;
+                }
+            uint8_t* o = rgba + (size_t(yy) * w + xx) * 4;
+            const uint32_t a = sa / (S * S);
+            o[3] = uint8_t(a);
+            o[0] = uint8_t(a ? std::min<uint32_t>(255, sr * 255 / sa) : 0);
+            o[1] = uint8_t(a ? std::min<uint32_t>(255, sg * 255 / sa) : 0);
+            o[2] = uint8_t(a ? std::min<uint32_t>(255, sb * 255 / sa) : 0);
+        }
+    return true;
+}
+
 bool host_menu_bitmap(const MenuPage& pg, int w, int h, uint32_t* out) {
     if (w < 64 || h < 64) return false;
     gdip_start();
@@ -526,6 +574,7 @@ bool host_set_refresh(int) { return false; }
 void host_restore_refresh() {}
 bool host_wait_refresh() { return false; }
 bool host_menu_bitmap(const MenuPage&, int, int, uint32_t*) { return false; }
+bool host_button_glyph(int, int, int, int, uint8_t*) { return false; }
 void host_restart() {}
 void host_report(const char*) {}
 bool host_toast_bitmap(const wchar_t*, const wchar_t*, const wchar_t*, uint32_t, const uint8_t*, size_t, int, int, uint32_t*) { return false; }

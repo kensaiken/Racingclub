@@ -826,7 +826,7 @@ void bind_texture(int i, UnitBind& u) {
     if (uint64_t(ea) + total > 0x100000000ull) return;
     const uint64_t key = (uint64_t(loc) << 32 | off) ^ (uint64_t(cube) << 63);
     Tex& tx = texCache[key];
-    const uint64_t regSig = fnv(&fmtReg, 4) ^ (uint64_t(rect) << 20) ^ (uint64_t(pitch) << 3);
+    const uint64_t regSig = fnv(&fmtReg, 4) ^ (uint64_t(rect) << 20) ^ (uint64_t(pitch) << 3) ^ uint64_t(texture_epoch()) * 0x9E3779B97F4A7C15ull;
     uint64_t sig = tx.sig;
     if (!tx.srv || tx.regSig != regSig || frameNo - tx.checked >= 4 || tx.checked > frameNo) {
         sig = regSig;

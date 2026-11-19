@@ -27,6 +27,7 @@
 #include <thread>
 #include <vector>
 
+namespace gti::recomp { void glyphs_patch_read(const std::string& hostPath, uint64_t fileOff, uint8_t* dst, size_t n); }   // button_glyphs.cpp
 namespace gti::recomp { bool host_camera_available(int choice); bool host_camera_start(int choice); void host_camera_stop(); uint32_t host_camera_read(uint8_t* dst, uint32_t cap, int format, int w, int h, uint32_t& frame); }   // host_camera.cpp
 namespace gti::recomp { void ripprof_register_thread(const char* name); void host_sleep_us(uint64_t us); void host_thread_priority_high(); void host_thread_core(bool own); void host_timer_init(); int host_display_hz(); bool host_set_refresh(int hz); void host_restore_refresh(); bool host_wait_refresh(); }   // ripprof.cpp, host_win.cpp   // ripprof.cpp
 namespace gti::recomp {
@@ -2877,8 +2878,13 @@ bool imports(PPU& c, const char* module, const char* name) {
         { std::lock_guard<std::mutex> lk(g_fsMx); auto it = g_files.find(a32(c, 0)); if (it != g_files.end()) f = it->second.f; }
         if (!f) { ret(c, 0x80010009); return true; }
         const uint64_t tio = now_us();
+        const int64_t pos = _ftelli64(f);
         const size_t k = n == "cellFsRead" ? std::fread(c.mem + a32(c, 1), 1, size_t(c.r[5]), f) : std::fwrite(c.mem + a32(c, 1), 1, size_t(c.r[5]), f);
         if (g_loadLog && now_us() - tio > 3000) LOG("[load] thread %x: %s of %llu bytes took %.1f ms (flip %llu)%c", t_tid, n.c_str(), (unsigned long long)c.r[5], (now_us() - tio) / 1000.0, (unsigned long long)gcm::flips.load(), 10);
+        if (n == "cellFsRead" && pos >= 0) {   // menu screens: the button icons of the controller in use
+            std::string hp; { std::lock_guard<std::mutex> lk(g_fsMx); auto it = g_files.find(a32(c, 0)); if (it != g_files.end()) hp = it->second.path; }
+            glyphs_patch_read(hp, uint64_t(pos), c.mem + a32(c, 1), k);
+        }
         if (a32(c, 3)) c.wr64(a32(c, 3), k);
         ret(c, CELL_OK); return true;
     }

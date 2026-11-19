@@ -12,6 +12,7 @@
 #include <map>
 #include <immintrin.h>
 
+namespace gti::recomp { void glyphs_update(); }   // button_glyphs.cpp
 namespace gti::recomp { void host_restart(); void host_report(const char* gpu); std::vector<std::string> host_camera_list(); void host_camera_stop(); bool host_toast_bitmap(const wchar_t* title, const wchar_t* name, const wchar_t* detail, uint32_t rgb, const uint8_t* png, size_t pngSize, int w, int h, uint32_t* out); }   // host_win.cpp
 namespace gti::recomp::rsx {
 
@@ -711,13 +712,29 @@ static void set_display_mode(int mode) {
     cur = mode;
 }
 static SDL_Gamepad* pad = nullptr;
+static std::atomic<int> g_padKind{0};   // pad_kind() for other threads (file reads)
+static void pad_opened() {
+    int k = 0;
+    if (pad) switch (SDL_GetGamepadType(pad)) {
+        case SDL_GAMEPAD_TYPE_PS3: case SDL_GAMEPAD_TYPE_PS4: case SDL_GAMEPAD_TYPE_PS5: k = 1; break;
+        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+        case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR: k = 3; break;
+        default: k = 2;
+    }
+    g_padKind = k;
+    RLOG("[pad] %s%s\n", pad ? "controller: " : "no controller", pad ? SDL_GetGamepadName(pad) : "");
+}
+int pad_kind() { return g_padKind.load(); }
+static std::atomic<uint32_t> g_texEpoch{0};
+void textures_rewritten() { ++g_texEpoch; }
+uint32_t texture_epoch() { return g_texEpoch.load(std::memory_order_relaxed); }
 // ------------------------------------------------------------------ options menu (F1)
 // Four tabs; up/down walks every option in order (and so across the tabs), Q/E or L1/R1 jump to the previous/next
 // tab. The ids are those of menu_change.
 static bool menuOpen = std::getenv("MENUTEST") != nullptr, menuDirty = true;   // MENUTEST=1 (debug): open from the start
-enum MenuId { mScreen = 1, mScale, mHz, mRefresh, mLang, mFps, mVsync, mSound, mAniso, mStream, mFxaa, mSharpen, mCamera, mApi, mApply, mReport, mQuit };
-static const int kMenuOrder[] = {mScreen, mScale, mHz, mRefresh, mVsync,   mApi, mFxaa, mSharpen, mAniso,   mLang, mSound, mCamera, mStream, mFps,   mApply, mReport, mQuit};
-static const int kMenuTabStart[] = {0, 5, 9, 14, 17};
+enum MenuId { mScreen = 1, mScale, mHz, mRefresh, mLang, mFps, mVsync, mSound, mAniso, mStream, mFxaa, mSharpen, mCamera, mApi, mApply, mReport, mQuit, mButtons };
+static const int kMenuOrder[] = {mScreen, mScale, mHz, mRefresh, mVsync,   mApi, mFxaa, mSharpen, mAniso,   mLang, mSound, mButtons, mCamera, mStream, mFps,   mApply, mReport, mQuit};
+static const int kMenuTabStart[] = {0, 5, 9, 15, 18};
 static const wchar_t* const kMenuTabs[] = {L"Pantalla", L"Gráficos", L"Juego", L"Sistema"};
 static const int kMenuCount = int(sizeof kMenuOrder / sizeof kMenuOrder[0]), kMenuTabCount = 4;
 static int menuSel = std::getenv("MENUTEST") ? std::clamp(std::atoi(std::getenv("MENUTEST")) - 1, 0, int(sizeof kMenuOrder / sizeof kMenuOrder[0]) - 1) : 0;   // index in kMenuOrder (MENUTEST=n: the n-th)
@@ -745,6 +762,7 @@ static void menu_change(int dir) {
         case mSharpen: s.sharpen = (s.sharpen + (dir ? dir : 1) + 4) % 4; break;
         case mCamera: { const int n = int(g_menuCams.size()) + 1; s.camera = (s.camera + (dir ? dir : 1) + n) % n; host_camera_stop(); break; }   // the game opens it again with the new one
         case mApi: s.renderer = (s.renderer + (dir ? dir : 1) + 3) % 3; break;
+        case mButtons: s.buttons = (s.buttons + (dir ? dir : 1) + 4) % 4; break;   // the icons change at the next image (glyphs_update)
         case mApply: if (dir >= 0) { settings_save(); host_restart(); } break;
         case mReport: if (dir >= 0) { settings_save(); const std::string g = std::string(B->api_name()) + " / " + B->gpu_name(); host_report(g.c_str()); } break;
         case mQuit: if (dir >= 0) { settings_save(); SDL_Event q{}; q.type = SDL_EVENT_QUIT; SDL_PushEvent(&q); } break;   // same as closing the window
@@ -813,6 +831,11 @@ static void menu_overlay(int ww, int wh, Overlay& o) {
                     hp = L"Idioma de los textos y menús del juego."; break;
                 case mSound: r = toggle(L"Sonido", s.sound);
                     hp = L"Música y efectos de sonido del juego."; break;
+                case mButtons: {
+                    static const wchar_t* const bn[4] = {L"Según el mando", L"PlayStation", L"Xbox", L"Nintendo"};
+                    static const wchar_t* const kn[4] = {L"sin mando: PlayStation", L"detectado: PlayStation", L"detectado: Xbox", L"detectado: Nintendo"};
+                    r = choice(L"Iconos de botones", bn[std::clamp(s.buttons, 0, 3)], false, false, s.buttons == 0 ? kn[std::clamp(pad_kind(), 0, 3)] : L"");
+                    hp = L"Los botones que muestran los menús del juego: los del mando conectado (Xbox, Nintendo o PlayStation) o los que elijas."; break; }
                 case mCamera: r = choice(L"Cámara (EyeToy)", cam.c_str());
                     hp = L"La cámara que el juego usa como EyeToy, para la foto del piloto."; break;
                 case mStream: r = toggle(L"Modo directo (OBS / Twitch)", s.streaming);
@@ -885,7 +908,14 @@ static void pump_events() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) quitFlag = true;
-        if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad) { pad = SDL_OpenGamepad(e.gdevice.which); menuDirty = true; }
+        if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad) { pad = SDL_OpenGamepad(e.gdevice.which); pad_opened(); menuDirty = true; }
+        if (e.type == SDL_EVENT_GAMEPAD_REMOVED && pad && e.gdevice.which == SDL_GetGamepadID(pad)) {   // another one connected takes over
+            SDL_CloseGamepad(pad); pad = nullptr;
+            int n = 0; SDL_JoystickID* ids = SDL_GetGamepads(&n);
+            for (int k = 0; k < n && !pad; ++k) if (ids[k] != e.gdevice.which) pad = SDL_OpenGamepad(ids[k]);
+            SDL_free(ids);
+            pad_opened(); menuDirty = true;
+        }
         if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {   // the menu with the controller: touchpad click or PS button opens and closes it
             const int b = e.gbutton.button;
             if (b == SDL_GAMEPAD_BUTTON_TOUCHPAD || b == SDL_GAMEPAD_BUTTON_GUIDE || (menuOpen && b == SDL_GAMEPAD_BUTTON_EAST)) { menuOpen = !menuOpen; menuDirty = true; if (!menuOpen) { settings_save(); padHold = true; } }
@@ -1000,6 +1030,7 @@ void flip(uint32_t id) {
     }
     int ww = 1280, wh = 720;
     SDL_GetWindowSizeInPixels(win, &ww, &wh);
+    glyphs_update();
     Overlay ovl[2];
     toast_overlay(ww, wh, ovl[0]);
     if (menuOpen) menu_overlay(ww, wh, ovl[1]);

@@ -22,6 +22,9 @@ void set_display_buffer(uint32_t id, uint32_t offset, uint32_t pitch, uint32_t w
 void flip(uint32_t bufferId);                         // shows a display buffer and pumps window events
 void toast(const std::wstring& title, const std::wstring& name, const std::wstring& detail, uint32_t rgb, const std::string& png = {});   // a notification (trophy) for 5 s
 bool quit_requested();
+int pad_kind();                                       // the controller connected: 0 none, 1 PlayStation, 2 Xbox or other, 3 Nintendo
+void textures_rewritten();                            // texture data changed in place (button icons): every texture is read again
+uint32_t texture_epoch();                             // bumped by textures_rewritten (part of the texture signatures)
 // running work counters of the RSX thread (MISSLOG: what a late frame had to build)
 struct Counters { uint64_t progs, texUploads, texBytes, streams, swapUs, draws, drawUs, progUs, texUs, convUs, bufUs, streamVerts; };
 Counters counters();

@@ -113,7 +113,7 @@ if(RECOMP_FULL_SRC AND EXISTS ${CMAKE_SOURCE_DIR}/third_party/glslang/CMakeLists
 endif()
 if(RECOMP_FULL_SRC)
   # whole game booted natively from its entry point (system layer: src/recomp/lv2.cpp)
-  add_executable(recomp_boot src/tools/recomp_boot.cpp src/recomp/guest.cpp src/recomp/lv2.cpp src/recomp/spu.cpp src/recomp/rsx_core.cpp src/recomp/rsx_gl.cpp src/recomp/rsx_d3d11.cpp src/recomp/rsx_vulkan.cpp src/recomp/ripprof.cpp src/recomp/host_win.cpp src/recomp/settings.cpp src/recomp/audio_out.cpp src/recomp/atrac3.cpp src/recomp/host_camera.cpp src/recomp/edge_cull.cpp src/recomp/edge_native.cpp ${SPU_GEN_SRC})
+  add_executable(recomp_boot src/tools/recomp_boot.cpp src/recomp/guest.cpp src/recomp/lv2.cpp src/recomp/spu.cpp src/recomp/rsx_core.cpp src/recomp/rsx_gl.cpp src/recomp/rsx_d3d11.cpp src/recomp/rsx_vulkan.cpp src/recomp/ripprof.cpp src/recomp/host_win.cpp src/recomp/button_glyphs.cpp src/recomp/settings.cpp src/recomp/audio_out.cpp src/recomp/atrac3.cpp src/recomp/host_camera.cpp src/recomp/edge_cull.cpp src/recomp/edge_native.cpp ${SPU_GEN_SRC})
   target_link_libraries(recomp_boot PRIVATE recomp_full gti_formats SDL3::SDL3-static opengl32)
   target_include_directories(recomp_boot PRIVATE third_party/vulkan/include third_party/glslang)
   target_link_libraries(recomp_boot PRIVATE glslang SPIRV glslang-default-resource-limits)
