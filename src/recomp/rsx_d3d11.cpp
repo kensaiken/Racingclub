@@ -918,6 +918,10 @@ void do_draw() {
     uint32_t texDims = 0;
     for (int i = 0; i < 16; ++i) texDims |= texDimsOf(i) << (2 * i);
     Program* p = get_program(R[0x1ea0 >> 2] & 511, fpEa, texDims, R[0x1d60 >> 2]);
+// Only draws into the full-screen image may be skipped while their shaders are being built (it is drawn again
+// next frame); a draw into anything else (paint layers composed once when a race loads, shadow maps, cube faces)
+// waits: skipped, it would leave that texture wrong for good (the player's car came out black).
+    if (p && p->state.load() == 0 && !(cur.logW == 1280 && cur.logH == 720)) while (p->state.load(std::memory_order_acquire) == 0) SDL_Delay(1);
     if (!p || p->bad()) { if (p && p->state.load() == 0) ++skippedDraws; return; }
     if (p->vs != lastVs) { ctx->VSSetShader(p->vs, nullptr, 0); lastVs = p->vs; }
     if (p->ps != lastPs) { ctx->PSSetShader(p->ps, nullptr, 0); lastPs = p->ps; }

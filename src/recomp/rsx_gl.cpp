@@ -921,7 +921,10 @@ static void do_draw() {
     for (int i = 0; i < 16; ++i) texDims |= texDimsOf(i) << (2 * i);
     Program* p = get_program(R[0x1ea0 >> 2] & 511, fpEa, texDims, R[0x1d60 >> 2]);
     if (!p) return;
-    if (p->pending && !finish_program(*p, false)) { ++g_skippedDraws; return; }
+// Only draws into the full-screen image may be skipped while their shaders are being built (it is drawn again
+// next frame); a draw into anything else (paint layers composed once when a race loads, shadow maps, cube faces)
+// waits: skipped, it would leave that texture wrong for good (the player's car came out black).
+    if (p->pending && !finish_program(*p, !(cur.logW == 1280 && cur.logH == 720))) { ++g_skippedDraws; return; }
     if (p->bad) return;
     mark();
     glUseProgram(p->prog);

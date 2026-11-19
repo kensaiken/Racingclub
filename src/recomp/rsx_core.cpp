@@ -668,14 +668,15 @@ static void init_window() {
     initTried = true;
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) { RLOG("[rsx] SDL_Init failed: %s\n", SDL_GetError()); return; }
     const char* env = std::getenv("RENDERER");
-    const bool d3d = env ? (std::strcmp(env, "d3d11") == 0 || std::strcmp(env, "dx11") == 0) : settings().renderer == 1;
-    B = d3d ? make_d3d11_backend() : make_gl_backend();
+    int api = settings().renderer;
+    if (env) api = (std::strcmp(env, "d3d11") == 0 || std::strcmp(env, "dx11") == 0) ? 1 : (std::strcmp(env, "vulkan") == 0 || std::strcmp(env, "vk") == 0) ? 2 : 0;
+    B = api == 1 ? make_d3d11_backend() : api == 2 ? make_vulkan_backend() : make_gl_backend();
     for (int attempt = 0; attempt < 2; ++attempt) {
         win = SDL_CreateWindow("Racing Club+ (F1: opciones)", 1280, 720, B->window_flags() | SDL_WINDOW_RESIZABLE);
         if (!win) { RLOG("[rsx] window: %s\n", SDL_GetError()); return; }
         if (B->init()) break;
         if (B == make_gl_backend()) return;
-        RLOG("[rsx] Direct3D 11 not available: back to OpenGL\n");   // the window is made again (OpenGL needs its flag)
+        RLOG("[rsx] %s not available: back to OpenGL\n", B->api_name());   // the window is made again (OpenGL needs its flag)
         SDL_DestroyWindow(win); win = nullptr;
         B = make_gl_backend();
     }
@@ -728,7 +729,7 @@ static void menu_change(int dir) {
         case 10: s.streaming ^= 1; break;
         case 11: s.fxaa ^= 1; break;
         case 13: { const int n = int(g_menuCams.size()) + 1; s.camera = (s.camera + (dir ? dir : 1) + n) % n; host_camera_stop(); break; }   // the game opens it again with the new one
-        case 14: s.renderer ^= 1; break;
+        case 14: s.renderer = (s.renderer + (dir ? dir : 1) + 3) % 3; break;
         case 15: if (dir >= 0) { settings_save(); host_restart(); } break;
         case 16: if (dir >= 0) { settings_save(); const std::string g = std::string(B->api_name()) + " / " + B->gpu_name(); host_report(g.c_str()); } break;
         case 17: if (dir >= 0) { settings_save(); SDL_Event q{}; q.type = SDL_EVENT_QUIT; SDL_PushEvent(&q); } break;   // same as closing the window   // the options marked * are read once at start
@@ -774,7 +775,17 @@ static void menu_overlay(int ww, int wh, Overlay& o) {
             if (s.camera > 0 && s.camera <= int(g_menuCams.size())) { name.clear(); for (unsigned char ch : g_menuCams[size_t(s.camera - 1)]) name += wchar_t(ch); }
             std::swprintf(l[13], 96, L"Cámara (EyeToy)\t‹ %ls ›", name.c_str());
         }
-        std::swprintf(l[14], 96, L"Gráficos (API) *\t‹ %ls ›", s.renderer ? L"DirectX 11" : L"OpenGL");
+        std::swprintf(l[14], 96, L"Gráficos (API) *\t‹ %ls ›", s.renderer == 1 ? L"DirectX 11" : s.renderer == 2 ? L"Vulkan" : L"OpenGL");
+        {   // the one running now, when the option says another (it applies at the next start)
+            const char* now = B ? B->api_name() : "";
+            const char* opt = s.renderer == 1 ? "DirectX 11" : s.renderer == 2 ? "Vulkan" : "OpenGL";
+            if (B && std::strcmp(now, opt) != 0) {
+                wchar_t extra[48]; std::swprintf(extra, 48, L"  (en uso: %hs)", now);
+                std::wstring line = l[14]; const size_t k = line.rfind(L" \x203a");
+                if (k != std::wstring::npos) line.insert(k, extra);
+                std::swprintf(l[14], 96, L"%ls", line.c_str());
+            }
+        }
         std::swprintf(l[15], 96, L"Aplicar cambios\t‹ Reiniciar el juego ›");
         std::swprintf(l[16], 96, L"Informe de problemas\t‹ Crear y abrir GitHub ›");
         std::swprintf(l[17], 96, L"Salir del juego\t‹ Salir ›");
