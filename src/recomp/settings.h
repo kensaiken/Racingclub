@@ -18,6 +18,9 @@ struct Settings {
     int showFps = 1;      // frame rate in the window title
     int buttons = 0;      // button icons in the menus: 0 the controller connected, 1 PlayStation, 2 Xbox, 3 Nintendo
     int renderer = 0;     // graphics API: 0 OpenGL, 1 Direct3D 11, 2 Vulkan (read at start; RENDERER=gl|d3d11|vulkan overrides)
+    int online = 1;       // online play (direct connection, src/recomp/netplay.cpp); NETPLAY=0|1 overrides
+    char onlineName[20] = "";   // player name online (empty: the Windows user name)
+    char onlineIp[64] = "";     // address of the friend who hosts (empty: only the local network)
 };
 Settings& settings();     // loaded from gtiport.ini on first use
 void settings_save();

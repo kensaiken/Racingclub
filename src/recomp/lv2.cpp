@@ -27,6 +27,7 @@
 #include <thread>
 #include <vector>
 
+namespace gti::recomp::netplay { struct Callback { uint32_t opd; int nargs; uint64_t a[8]; }; bool enabled(); bool hle(PPU& c, const char* module, const std::string& n); void set_errno_addr(uint32_t a); std::vector<Callback> take_callbacks(); }   // netplay.cpp
 namespace gti::recomp { void glyphs_patch_read(const std::string& hostPath, uint64_t fileOff, uint8_t* dst, size_t n); }   // button_glyphs.cpp
 namespace gti::recomp { bool host_camera_available(int choice); bool host_camera_start(int choice); void host_camera_stop(); uint32_t host_camera_read(uint8_t* dst, uint32_t cap, int format, int w, int h, uint32_t& frame); }   // host_camera.cpp
 namespace gti::recomp { void ripprof_register_thread(const char* name); void host_sleep_us(uint64_t us); void host_thread_priority_high(); void host_thread_core(bool own); void host_timer_init(); int host_display_hz(); bool host_set_refresh(int hz); void host_restore_refresh(); bool host_wait_refresh(); }   // ripprof.cpp, host_win.cpp   // ripprof.cpp
@@ -859,11 +860,12 @@ uint32_t put_str(PPU& c, uint32_t dst, uint64_t cap, const std::string& s) {   /
 
 // Calls a guest function (OPD) from inside an HLE import on the same thread, then restores every register.
 // The callee gets a stack frame below `sp` (callers keep their scratch structs between sp and the old r1).
-uint64_t call_nested(PPU& c, uint32_t opd, uint32_t sp, uint64_t a0, uint64_t a1 = 0, uint64_t a2 = 0) {
+uint64_t call_nested(PPU& c, uint32_t opd, uint32_t sp, uint64_t a0, uint64_t a1 = 0, uint64_t a2 = 0, uint64_t a3 = 0, uint64_t a4 = 0,
+                     uint64_t a5 = 0, uint64_t a6 = 0, uint64_t a7 = 0) {
     PPU saved = c;
     c.r[1] = (sp & ~0xFu) - 0x100;
     c.r[2] = c.rd32(opd + 4);
-    c.r[3] = a0; c.r[4] = a1; c.r[5] = a2;
+    c.r[3] = a0; c.r[4] = a1; c.r[5] = a2; c.r[6] = a3; c.r[7] = a4; c.r[8] = a5; c.r[9] = a6; c.r[10] = a7;
     c.lr = 0;
     rc_call(c, c.rd32(opd));
     const uint64_t r = c.r[3];
@@ -2394,8 +2396,13 @@ bool imports(PPU& c, const char* module, const char* name) {
             for (int k = 0; k < 4; ++k)
                 if (cbs[k].first) call_nested(c, cbs[k].first, uint32_t(c.r[1]) - 0x800, ev.first, ev.second, cbs[k].second);
         }
+        if (netplay::enabled())   // online play: the game's NP callbacks (requests, room events, signaling) run here, as on the PS3
+            for (const auto& cb : netplay::take_callbacks())
+                call_nested(c, cb.opd, uint32_t(c.r[1]) - 0x800, cb.a[0], cb.a[1], cb.a[2], cb.a[3], cb.a[4], cb.a[5], cb.a[6], cb.a[7]);
         ret(c, CELL_OK); return true;
     }
+    if ((n == "_sys_net_errno_loc" || n == "sys_net_errno_loc") && netplay::enabled()) { static const uint32_t e = alloc_user(16, 16); netplay::set_errno_addr(e); ret(c, e); return true; }
+    if (n != "cellNetCtlNetStartDialogLoadAsync" && n != "cellNetCtlNetStartDialogUnloadAsync" && netplay::hle(c, module, n)) return true;   // NETPLAY: online play
     // --- network: no connection (as a console without network): the start dialog finishes with "not connected"
     if (n == "cellNetCtlNetStartDialogLoadAsync") {
         std::lock_guard<std::mutex> lk(g_sysutilMx);
@@ -2404,7 +2411,7 @@ bool imports(PPU& c, const char* module, const char* name) {
         ret(c, CELL_OK); return true;
     }
     if (n == "cellNetCtlNetStartDialogUnloadAsync") {   // (CellNetCtlNetStartDialogResult* {u32 size; s32 result})
-        if (a32(c, 0)) c.wr32(a32(c, 0) + 4, 0x80130106u);   // CELL_NET_CTL_ERROR_NET_NOT_CONNECTED
+        if (a32(c, 0)) c.wr32(a32(c, 0) + 4, netplay::enabled() ? 0u : 0x80130106u);   // connected (online play) or CELL_NET_CTL_ERROR_NET_NOT_CONNECTED
         std::lock_guard<std::mutex> lk(g_sysutilMx);
         g_sysutilEv.push_back({0x0803, 0});   // CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED
         ret(c, CELL_OK); return true;

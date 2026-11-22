@@ -174,6 +174,56 @@ void host_restart() {
     std::fflush(nullptr);
     TerminateProcess(GetCurrentProcess(), 0);
 }
+// A small text box (options menu: online name, host address). Modal, on top of the game, Windows' own controls.
+namespace {
+struct InputBox { std::wstring prompt, value; int maxLen; };
+INT_PTR CALLBACK input_box_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    InputBox* b = reinterpret_cast<InputBox*>(GetWindowLongPtrW(h, DWLP_USER));
+    switch (m) {
+        case WM_INITDIALOG:
+            SetWindowLongPtrW(h, DWLP_USER, l); b = reinterpret_cast<InputBox*>(l);
+            SetDlgItemTextW(h, 100, b->prompt.c_str());
+            SetDlgItemTextW(h, 101, b->value.c_str());
+            SendDlgItemMessageW(h, 101, EM_SETLIMITTEXT, WPARAM(b->maxLen), 0);
+            SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+            SetForegroundWindow(h);
+            SetFocus(GetDlgItem(h, 101)); SendDlgItemMessageW(h, 101, EM_SETSEL, 0, -1);
+            return FALSE;
+        case WM_COMMAND:
+            if (LOWORD(w) == IDOK) { wchar_t t[256] = {}; GetDlgItemTextW(h, 101, t, 255); b->value = t; EndDialog(h, IDOK); return TRUE; }
+            if (LOWORD(w) == IDCANCEL) { EndDialog(h, IDCANCEL); return TRUE; }
+            break;
+    }
+    return FALSE;
+}
+void tpl_word(std::vector<WORD>& t, WORD v) { t.push_back(v); }
+void tpl_str(std::vector<WORD>& t, const wchar_t* s) { for (; *s; ++s) t.push_back(WORD(*s)); t.push_back(0); }
+void tpl_item(std::vector<WORD>& t, DWORD style, short x, short y, short cx, short cy, WORD id, WORD cls, const wchar_t* text) {
+    if (t.size() & 1) t.push_back(0);   // DLGITEMTEMPLATE on a DWORD boundary
+    DLGITEMTEMPLATE it{}; it.style = style | WS_CHILD | WS_VISIBLE; it.x = x; it.y = y; it.cx = cx; it.cy = cy; it.id = id;
+    const WORD* p = reinterpret_cast<const WORD*>(&it); t.insert(t.end(), p, p + sizeof it / 2);
+    tpl_word(t, 0xFFFF); tpl_word(t, cls); tpl_str(t, text); tpl_word(t, 0);
+}
+} // namespace
+bool host_input_text(const wchar_t* title, const wchar_t* prompt, std::string& value, int maxLen) {
+    std::vector<WORD> t;
+    DLGTEMPLATE d{}; d.style = DS_MODALFRAME | DS_CENTER | DS_SETFONT | DS_SETFOREGROUND | WS_POPUP | WS_CAPTION | WS_SYSMENU; d.cdit = 4; d.cx = 240; d.cy = 74;
+    const WORD* p = reinterpret_cast<const WORD*>(&d); t.insert(t.end(), p, p + sizeof d / 2);
+    tpl_word(t, 0); tpl_word(t, 0); tpl_str(t, title);   // no menu, default class, caption
+    tpl_word(t, 10); tpl_str(t, L"Segoe UI");            // DS_SETFONT
+    tpl_item(t, SS_LEFT, 8, 7, 224, 20, 100, 0x0082, L"");
+    tpl_item(t, WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 8, 30, 224, 13, 101, 0x0081, L"");
+    tpl_item(t, BS_DEFPUSHBUTTON | WS_TABSTOP, 128, 52, 50, 15, IDOK, 0x0080, L"Aceptar");
+    tpl_item(t, BS_PUSHBUTTON | WS_TABSTOP, 182, 52, 50, 15, IDCANCEL, 0x0080, L"Cancelar");
+    InputBox b; b.prompt = prompt; b.maxLen = maxLen;
+    for (unsigned char ch : value) b.value += wchar_t(ch);
+    ShowCursor(TRUE);
+    const INT_PTR r = DialogBoxIndirectParamW(GetModuleHandleW(nullptr), reinterpret_cast<LPCDLGTEMPLATEW>(t.data()), GetForegroundWindow(), input_box_proc, LPARAM(&b));
+    if (r != IDOK) return false;
+    value.clear();
+    for (wchar_t ch : b.value) if (ch >= 32 && ch < 127) value += char(ch);   // names and addresses: ASCII
+    return true;
+}
 // "Informe de problemas" in the options menu: writes informe_problema.txt next to the executable (processor, memory,
 // graphics card, settings and the end of the log, with the Windows user name taken out of the paths), shows it in
 // Explorer and opens the project's "new issue" page, where the user can attach it.

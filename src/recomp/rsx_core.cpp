@@ -6,6 +6,7 @@
 #include "recomp/lv2.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <deque>
@@ -13,6 +14,8 @@
 #include <immintrin.h>
 
 namespace gti::recomp { void glyphs_update(); }   // button_glyphs.cpp
+namespace gti::recomp::netplay { std::string local_address(); std::string player_name(); int upnp_state(); }   // netplay.cpp
+namespace gti::recomp { bool host_input_text(const wchar_t* title, const wchar_t* prompt, std::string& value, int maxLen); }   // host_win.cpp
 namespace gti::recomp { void host_restart(); void host_report(const char* gpu); std::vector<std::string> host_camera_list(); void host_camera_stop(); bool host_toast_bitmap(const wchar_t* title, const wchar_t* name, const wchar_t* detail, uint32_t rgb, const uint8_t* png, size_t pngSize, int w, int h, uint32_t* out); }   // host_win.cpp
 namespace gti::recomp::rsx {
 
@@ -732,11 +735,13 @@ uint32_t texture_epoch() { return g_texEpoch.load(std::memory_order_relaxed); }
 // Four tabs; up/down walks every option in order (and so across the tabs), Q/E or L1/R1 jump to the previous/next
 // tab. The ids are those of menu_change.
 static bool menuOpen = std::getenv("MENUTEST") != nullptr, menuDirty = true;   // MENUTEST=1 (debug): open from the start
-enum MenuId { mScreen = 1, mScale, mHz, mRefresh, mLang, mFps, mVsync, mSound, mAniso, mStream, mFxaa, mSharpen, mCamera, mApi, mApply, mReport, mQuit, mButtons };
-static const int kMenuOrder[] = {mScreen, mScale, mHz, mRefresh, mVsync,   mApi, mFxaa, mSharpen, mAniso,   mLang, mSound, mButtons, mCamera, mStream, mFps,   mApply, mReport, mQuit};
-static const int kMenuTabStart[] = {0, 5, 9, 15, 18};
-static const wchar_t* const kMenuTabs[] = {L"Pantalla", L"Gráficos", L"Juego", L"Sistema"};
-static const int kMenuCount = int(sizeof kMenuOrder / sizeof kMenuOrder[0]), kMenuTabCount = 4;
+enum MenuId { mScreen = 1, mScale, mHz, mRefresh, mLang, mFps, mVsync, mSound, mAniso, mStream, mFxaa, mSharpen, mCamera, mApi, mApply, mReport, mQuit, mButtons,
+              mOnline, mOnName, mOnIp, mOnMine };
+static const int kMenuOrder[] = {mScreen, mScale, mHz, mRefresh, mVsync,   mApi, mFxaa, mSharpen, mAniso,   mLang, mSound, mButtons, mCamera, mStream, mFps,
+                                 mOnline, mOnName, mOnIp, mOnMine,   mApply, mReport, mQuit};
+static const int kMenuTabStart[] = {0, 5, 9, 15, 19, 22};
+static const wchar_t* const kMenuTabs[] = {L"Pantalla", L"Gráficos", L"Juego", L"Online", L"Sistema"};
+static const int kMenuCount = int(sizeof kMenuOrder / sizeof kMenuOrder[0]), kMenuTabCount = 5;
 static int menuSel = std::getenv("MENUTEST") ? std::clamp(std::atoi(std::getenv("MENUTEST")) - 1, 0, int(sizeof kMenuOrder / sizeof kMenuOrder[0]) - 1) : 0;   // index in kMenuOrder (MENUTEST=n: the n-th)
 static int menu_tab_of(int idx) { int t = 0; while (t + 1 < kMenuTabCount && idx >= kMenuTabStart[t + 1]) ++t; return t; }
 static void menu_move(int d) { menuSel = (menuSel + d + kMenuCount) % kMenuCount; menuDirty = true; }
@@ -763,6 +768,22 @@ static void menu_change(int dir) {
         case mCamera: { const int n = int(g_menuCams.size()) + 1; s.camera = (s.camera + (dir ? dir : 1) + n) % n; host_camera_stop(); break; }   // the game opens it again with the new one
         case mApi: s.renderer = (s.renderer + (dir ? dir : 1) + 3) % 3; break;
         case mButtons: s.buttons = (s.buttons + (dir ? dir : 1) + 4) % 4; break;   // the icons change at the next image (glyphs_update)
+        case mOnline: s.online ^= 1; break;
+        case mOnName: if (dir >= 0) {
+                std::string v = s.onlineName;
+                if (host_input_text(L"Racing Club+ · Online", L"Tu nombre en las partidas online (letras y números, hasta 16):", v, 16)) {
+                    std::string o; for (unsigned char ch : v) if (o.size() < 16 && (std::isalnum(ch) || ch == '-' || ch == '_')) o += char(ch);
+                    std::snprintf(s.onlineName, sizeof s.onlineName, "%s", o.c_str()); settings_save();
+                }
+            } break;
+        case mOnIp: if (dir >= 0) {
+                std::string v = s.onlineIp;
+                if (host_input_text(L"Racing Club+ · Online", L"IP (o nombre) del amigo que crea la partida. Déjalo vacío para buscar solo en tu red local:", v, 60)) {
+                    std::string o; for (char ch : v) if (ch != ' ') o += ch;
+                    std::snprintf(s.onlineIp, sizeof s.onlineIp, "%s", o.c_str()); settings_save();
+                }
+            } break;
+        case mOnMine: break;
         case mApply: if (dir >= 0) { settings_save(); host_restart(); } break;
         case mReport: if (dir >= 0) { settings_save(); const std::string g = std::string(B->api_name()) + " / " + B->gpu_name(); host_report(g.c_str()); } break;
         case mQuit: if (dir >= 0) { settings_save(); SDL_Event q{}; q.type = SDL_EVENT_QUIT; SDL_PushEvent(&q); } break;   // same as closing the window
@@ -842,6 +863,26 @@ static void menu_overlay(int ww, int wh, Overlay& o) {
                     hp = L"Para grabar o emitir: el juego va a 60 imágenes por segundo y el monitor a 120 Hz, sea cual sea la opción de imágenes por segundo."; break;
                 case mFps: r = toggle(L"Contador de FPS en el título", s.showFps);
                     hp = L"Muestra las imágenes por segundo en el título de la ventana."; break;
+                case mOnline: r = toggle(L"Juego online", s.online, true, s.online != b0.online);
+                    hp = L"Partidas online por conexión directa (sin servidores): Multijugador > Crear partida, o Unirse a la partida con la IP del amigo que la crea."; break;
+                case mOnName: {
+                    static std::wstring nm; nm.clear();
+                    const std::string n = s.onlineName[0] ? std::string(s.onlineName) : netplay::player_name();
+                    for (unsigned char ch : n) nm += wchar_t(ch);
+                    r = action(L"Tu nombre", nm.c_str()); r.restart = true; r.pending = std::strcmp(s.onlineName, b0.onlineName) != 0;
+                    hp = L"El nombre que verán los demás jugadores (letras y números, hasta 16). Se aplica al reiniciar el juego."; break; }
+                case mOnIp: {
+                    static std::wstring ip; ip.clear();
+                    for (unsigned char ch : std::string(s.onlineIp)) ip += wchar_t(ch);
+                    r = action(L"Unirse a (IP del anfitrión)", s.onlineIp[0] ? ip.c_str() : L"Solo red local");
+                    hp = L"Para unirte por internet: la IP pública de quien crea la partida. En la misma red local no hace falta: las partidas se encuentran solas."; break; }
+                case mOnMine: {
+                    static std::wstring me; me.clear();
+                    for (unsigned char ch : netplay::local_address()) me += wchar_t(ch);
+                    me += L"  ·  puerto 3658";
+                    r = action(L"Tu IP en la red local", me.c_str());
+                    { const int u = netplay::upnp_state(); r.note = u == 2 ? L"router abierto (UPnP)" : u == 3 ? L"abre el puerto a mano" : u == 1 ? L"abriendo el router…" : L""; }
+                    hp = L"Si creas la partida para jugar por internet, abre el puerto 3658 (TCP y UDP) en tu router hacia esta IP y da a tus amigos tu IP pública."; break; }
                 case mApply: r = action(L"Aplicar cambios", L"Reiniciar el juego");
                     hp = L"Guarda las opciones y reinicia el juego, para aplicar las marcadas con REINICIO."; break;
                 case mReport: r = action(L"Informe de problemas", L"Crear y abrir GitHub");
