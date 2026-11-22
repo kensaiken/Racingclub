@@ -477,6 +477,7 @@ ID3D11SamplerState* sampler_for(uint32_t base, uint32_t mips, bool surface) {
     d.ComparisonFunc = D3D11_COMPARISON_NEVER;
     if (surface) { d.MinLOD = 0; d.MaxLOD = 0; }
     else { d.MinLOD = ((ctl0 >> 19) & 0xfff) / 256.f; d.MaxLOD = mips > 1 ? ((ctl0 >> 7) & 0xfff) / 256.f : 0.f; if (d.MaxLOD < d.MinLOD) d.MaxLOD = d.MinLOD; }
+    if (!surface && mips > 1 && ((minF & 7) == 1 || (minF & 7) == 2)) { d.MinLOD = 0.f; d.MaxLOD = 0.f; }   // no mipmapping: base level only (RSX, GL)
     dev->CreateSamplerState(&d, &s);
     return s;
 }

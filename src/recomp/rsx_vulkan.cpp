@@ -74,6 +74,18 @@ struct Block { VkDeviceMemory mem; uint32_t type; uint8_t* ptr; std::map<VkDevic
 std::vector<Block> blocks;
 std::mutex allocMx;
 constexpr VkDeviceSize kBlock = VkDeviceSize(128) << 20;
+// VKALLOCCHECK=1 (debug): every block allocation is checked against the live ones (overlaps, double frees)
+std::map<std::pair<int, VkDeviceSize>, VkDeviceSize> liveAllocs;
+const bool allocCheck = std::getenv("VKALLOCCHECK") != nullptr;
+void alloc_check_add(int b, VkDeviceSize off, VkDeviceSize size) {
+    auto it = liveAllocs.lower_bound({b, off});
+    if (it != liveAllocs.end() && it->first.first == b && it->first.second < off + size) RLOG("[vkalloc] OVERLAP block %d %llu+%llu with next %llu+%llu\n", b, (unsigned long long)off, (unsigned long long)size, (unsigned long long)it->first.second, (unsigned long long)it->second);
+    if (it != liveAllocs.begin()) { auto pv = std::prev(it); if (pv->first.first == b && pv->first.second + pv->second > off) RLOG("[vkalloc] OVERLAP block %d %llu+%llu with prev %llu+%llu\n", b, (unsigned long long)off, (unsigned long long)size, (unsigned long long)pv->first.second, (unsigned long long)pv->second); }
+    liveAllocs[{b, off}] = size;
+}
+void alloc_check_free(int b, VkDeviceSize off) {
+    if (!liveAllocs.erase({b, off})) RLOG("[vkalloc] FREE of a range not allocated: block %d off %llu\n", b, (unsigned long long)off);
+}
 int mem_type(uint32_t bits, VkMemoryPropertyFlags want) {
     for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i)
         if ((bits & (1u << i)) && (memProps.memoryTypes[i].propertyFlags & want) == want) return int(i);
@@ -105,6 +117,7 @@ bool alloc_mem(const VkMemoryRequirements& r, VkMemoryPropertyFlags want, Alloc&
                 if (start > fOff) bl.freeList[fOff] = start - fOff;
                 if (start + r.size < fOff + fSize) bl.freeList[start + r.size] = fOff + fSize - (start + r.size);
                 a.mem = bl.mem; a.off = start; a.size = r.size; a.block = int(b); a.ptr = bl.ptr ? bl.ptr + start : nullptr;
+                if (allocCheck) alloc_check_add(int(b), start, r.size);
                 return true;
             }
         }
@@ -122,6 +135,7 @@ void free_mem(Alloc& a) {
     if (!a.mem) return;
     std::lock_guard<std::mutex> lk(allocMx);
     if (a.block < 0) { vkFreeMemory(dev, a.mem, nullptr); a = Alloc{}; return; }
+    if (allocCheck) alloc_check_free(a.block, a.off);
     auto& fl = blocks[size_t(a.block)].freeList;
     VkDeviceSize off = a.off, size = a.size;
     auto next = fl.lower_bound(off);
@@ -533,6 +547,10 @@ Surface* get_surface(uint32_t loc, uint32_t off, uint32_t w, uint32_t h, uint32_
     if (s.im.img && s.w == w && s.h == h && s.fmt == fmt) return &s;
     struct Parked { uint64_t key; Surface s; };
     static std::vector<Parked> parked;
+    {
+        static const long tt = std::getenv("VKTRACETGT") ? std::strtol(std::getenv("VKTRACETGT"), nullptr, 16) : -1;
+        if (tt >= 0 && long(off) == tt) RLOG("[vktrace] frame %llu surface %x %s: %ux%u fmt %u -> %ux%u fmt %u\n", (unsigned long long)frameNo, off, depth ? "depth" : "colour", s.w, s.h, s.fmt, w, h, fmt);
+    }
     if (s.im.img) parked.push_back({key, s});
     s = Surface{};
     ++surfGen;
@@ -693,6 +711,10 @@ VkSampler sampler_for(uint32_t base, uint32_t mips, bool surface) {
     if (an > 0 && minLin) { ci.anisotropyEnable = VK_TRUE; ci.maxAnisotropy = std::min(float(1u << an), props.limits.maxSamplerAnisotropy); }
     if (surface) { ci.minLod = 0; ci.maxLod = 0; }
     else { ci.minLod = ((ctl0 >> 19) & 0xfff) / 256.f; ci.maxLod = mips > 1 ? ((ctl0 >> 7) & 0xfff) / 256.f : 0.f; if (ci.maxLod < ci.minLod) ci.maxLod = ci.minLod; }
+    // minification without mipmapping (1 nearest, 2 linear) reads the base level only, as on the RSX and in GL: the
+    // car liveries are copied from a 512x512 texture with stale smaller levels into 256x256 targets (cars white,
+    // black or without decals after a race)
+    if (!surface && mips > 1 && ((minF & 7) == 1 || (minF & 7) == 2)) { ci.minLod = 0.f; ci.maxLod = 0.f; }
     const float bc[4] = {((border >> 16) & 0xff) / 255.f, ((border >> 8) & 0xff) / 255.f, (border & 0xff) / 255.f, (border >> 24) / 255.f};
     VkSamplerCustomBorderColorCreateInfoEXT cbc{VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
     if (customBorder) {
@@ -715,6 +737,8 @@ void upload_regions(VkImage img, const std::vector<VkBufferImageCopy>& regions, 
 struct Dummies { Image im2d, imCube; VkImageView v2d = VK_NULL_HANDLE, vCube = VK_NULL_HANDLE; } dummy;
 
 struct UnitBind { VkImageView view = VK_NULL_HANDLE; VkSampler smp = VK_NULL_HANDLE; VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; float tsc[4] = {1, 1, 1, 1}; };
+bool g_traceDraw = false;
+// VKTRACETGT=hex colour target (debug): describe the draws into it and their textures
 void bind_texture(int i, UnitBind& u) {
     const uint32_t base = i < 8 ? 0x1a00 + 0x20 * i : 0x1b00 + 0x20 * (i - 8);
     const uint32_t off = R[base >> 2], fmtReg = R[(base + 4) >> 2], addr = R[(base + 8) >> 2];
@@ -729,7 +753,7 @@ void bind_texture(int i, UnitBind& u) {
     u.tsc[0] = un ? 1.f / w : 1.f; u.tsc[1] = un ? 1.f / h : 1.f; u.tsc[2] = float((addr >> 28) & 7); u.tsc[3] = 1.f;
     for (int z = 0; z < 2; ++z) {   // render target?
         auto it = surfaces.find((uint64_t(loc) << 33) | (uint64_t(z) << 32) | off);
-        if (it != surfaces.end() && !cube) { u.view = it->second.smp; u.smp = sampler_for(base, 1, true); u.layout = VK_IMAGE_LAYOUT_GENERAL; return; }
+        if (it != surfaces.end() && !cube) { if (g_traceDraw) RLOG("[vktrace]   unit %d: surface %x z%d %ux%u\n", i, off, z, it->second.w, it->second.h); u.view = it->second.smp; u.smp = sampler_for(base, 1, true); u.layout = VK_IMAGE_LAYOUT_GENERAL; return; }
     }
     if (cube) {   // cube map whose faces are render targets (the environment the cars reflect)
         const uint32_t faceStride = (w * h * 4 + 127) & ~127u;
@@ -793,7 +817,16 @@ void bind_texture(int i, UnitBind& u) {
         sig = fnv(C.mem + ea + total - std::min<uint32_t>(total, 8), std::min<uint32_t>(total, 8), sig);
         tx.checked = frameNo; tx.regSig = regSig;
     }
-    if (!tx.im.img || tx.sig != sig) {
+    const bool force = false;
+    if (g_traceDraw) RLOG("[vktrace]   unit %d: texture %x fmt %08x %ux%u %s ctl0 %08x filt %08x addr %08x remap %08x ctl3 %08x\n", i, off, fmtReg, w, h, (!tx.im.img || tx.sig != sig || force) ? "UPLOAD" : "cached",
+                          R[(base + 0xc) >> 2], R[(base + 0x14) >> 2], addr, remap, ctl3);
+    if (g_traceDraw) {
+        uint64_t sum[4] = {}; const uint32_t nb = std::min<uint32_t>(total, w * h * 4) & ~3u;
+        for (uint32_t k = 0; k < nb; k += 4) for (int c = 0; c < 4; ++c) sum[c] += C.mem[ea + k + c];
+        const uint32_t np = std::max<uint32_t>(1, nb / 4);
+        RLOG("[vktrace]   unit %d: bytes avg %llu %llu %llu %llu (ea %x, %u bytes)\n", i, (unsigned long long)(sum[0] / np), (unsigned long long)(sum[1] / np), (unsigned long long)(sum[2] / np), (unsigned long long)(sum[3] / np), ea, total);
+    }
+    if (!tx.im.img || tx.sig != sig || force) {
         if (tx.im.img) {   // re-upload: the old image may still be in use by frames in flight
             Tex old; old.im = tx.im; old.views = std::move(tx.views);
             later([old]() mutable { for (auto& [k2, v] : old.views) vkDestroyImageView(dev, v, nullptr); vkDestroyImage(dev, old.im.img, nullptr); free_mem(old.im.mem); });
@@ -946,6 +979,7 @@ std::vector<uint32_t> idx;
 uint64_t skippedDraws = 0;
 // what the current command buffer has bound (reset with each frame and after fixed-function passes)
 struct Bound { VkPipeline pipe = VK_NULL_HANDLE; VkDescriptorSet set = VK_NULL_HANDLE; uint32_t offs[3] = {~0u, ~0u, ~0u}; bool dyn = false; uint32_t dynKey[28] = {}; } bound;
+uint64_t ringGen = 1;   // +1 at every begin_frame (also the flushes inside a frame): ring offsets and descriptor sets cached by the draws are valid while it stays
 VkDeviceSize vcOff = 0, dcOff = 0, fcOff = 0; uint64_t vcFrame = ~0ull, dcFrame = ~0ull, fcFrame = ~0ull;
 
 void apply_dynamic_state(uint32_t topoPrim) {
@@ -996,11 +1030,13 @@ void apply_dynamic_state(uint32_t topoPrim) {
     vkCmdSetScissor(c, 0, 1, &sc);
 }
 
+// VKDROPLOG=1 (debug): draws that are not recorded, with the reason and the colour target
+#define DROPLOG(why) do { static const bool on_ = std::getenv("VKDROPLOG") != nullptr; static int n_ = 0; if (on_ && n_++ < 400) RLOG("[vkdrop] %s: target %08x %ux%u frame %llu\n", why, R[0x210 >> 2], cur.logW, cur.logH, (unsigned long long)frameNo); } while (0)
 void do_draw() {
     if (ranges.empty() || !devOk) return;
     struct DrawTime { uint64_t t0 = SDL_GetPerformanceCounter(); ~DrawTime() { g_drawTicks += SDL_GetPerformanceCounter() - t0; ++g_drawCount; } } drawTime;
     ++drawsThisFrame;
-    if (!bind_target()) return;
+    if (!bind_target()) { DROPLOG("target"); return; }
     const uint32_t sp = R[0x8e4 >> 2];
     const uint32_t fpEa = ea_of(sp & ~3u, (sp & 3) == 2 ? 1 : 0);
     uint32_t texDims = 0;
@@ -1013,11 +1049,11 @@ void do_draw() {
     const bool mayskip = cur.logW == 1280 && cur.logH == 720;
     int ps = p->state.load(std::memory_order_acquire);
     while (ps == 0 && !mayskip) { SDL_Delay(1); ps = p->state.load(std::memory_order_acquire); }
-    if (ps != 1) { if (ps == 0) ++skippedDraws; return; }
+    if (ps != 1) { if (ps == 0) ++skippedDraws; DROPLOG(ps ? "program failed" : "program pending"); return; }
     // indices
     uint32_t vmin, vmax;
     gather_draw_indices(idx, vmin, vmax, true);
-    if (vmin > vmax || idx.empty()) return;
+    if (vmin > vmax || idx.empty()) { DROPLOG("no indices"); return; }
     const bool strip = prim == 3 || prim == 4 || prim == 6 || prim == 9;
     if (!strip && (R[0x1dac >> 2] & 1)) idx.erase(std::remove(idx.begin(), idx.end(), 0xffffffffu), idx.end());   // restart in a list: dropped
     if (idx.empty()) return;
@@ -1099,12 +1135,42 @@ void do_draw() {
         pst = pipe.state.load(std::memory_order_acquire);
     }
     while (pst == 0 && !mayskip) { SDL_Delay(1); pst = pipe.state.load(std::memory_order_acquire); }
-    if (pst != 1) { if (pst == 0) ++skippedDraws; return; }
+    if (pst != 1) { if (pst == 0) ++skippedDraws; DROPLOG(pst ? "pipeline failed" : "pipeline pending"); return; }
+    // Textures first (an upload may need to flush the frame), then room for everything this draw puts in the ring:
+    // a flush between its allocations would record the draw against the next frame's ring (garbage vertices,
+    // constants). After a race the car select uploads many textures at once and the one-shot paint layers of the
+    // cars were lost that way (cars white or black).
+    {
+        static const long tt = std::getenv("VKTRACETGT") ? std::strtol(std::getenv("VKTRACETGT"), nullptr, 16) : -1;
+        static const double tfrom = std::getenv("VKTRACEFROM") ? std::atof(std::getenv("VKTRACEFROM")) : 0;   // with VKTRACETGT=1: every draw from that second, 1 frame
+        static uint64_t tframe = 0;
+        if (tt == 1 && !tframe && SDL_GetTicks() >= tfrom * 1000) tframe = frameNo;
+        g_traceDraw = (tt >= 0 && (long(R[0x210 >> 2]) == tt || ((R[0x220 >> 2] & 0xf) > 1 && (long(R[0x218 >> 2]) == tt || long(R[0x288 >> 2]) == tt || long(R[0x28c >> 2]) == tt)))) || (tt == 1 && tframe && frameNo == tframe);
+        if (g_traceDraw) RLOG("[vktrace] frame %llu draw %llu prog %016llx tex %x verts %u blend %u mask %08x | %ux%u fmt %08x sf %08x df %08x eq %08x alpha %u/%x/%x fc0 %g %g %g %g\n", (unsigned long long)frameNo, (unsigned long long)drawsThisFrame, (unsigned long long)progKey, p->texUsed, nv, R[0x310 >> 2], R[0x324 >> 2],
+                                 cur.logW, cur.logH, R[0x208 >> 2], R[0x314 >> 2], R[0x318 >> 2], R[0x320 >> 2], R[0x304 >> 2], R[0x308 >> 2], R[0x30c >> 2],
+                                 fpConsts.size() > 3 ? fpConsts[0] : 0.f, fpConsts.size() > 3 ? fpConsts[1] : 0.f, fpConsts.size() > 3 ? fpConsts[2] : 0.f, fpConsts.size() > 3 ? fpConsts[3] : 0.f);
+    }
+    if (g_traceDraw) RLOG("[vktrace]   depth %x/%x write %x z %x stencil %x cull %x/%x scissor %08x %08x viewport %08x %08x clip %08x %08x ctl %08x shade %x\n", R[0xa74 >> 2], R[0xa6c >> 2], R[0xa70 >> 2], R[0x214 >> 2], R[0x328 >> 2], R[0x183c >> 2], R[0x1830 >> 2],
+                          R[0x8c0 >> 2], R[0x8c4 >> 2], R[0xa00 >> 2], R[0xa04 >> 2], R[0x200 >> 2], R[0x204 >> 2], R[0x1d60 >> 2], R[0x368 >> 2]);
+    if (g_traceDraw)
+        for (int a = 0; a < 16; ++a) {
+            if (!(p->vpInputs & (1u << a))) continue;
+            float t[16] = {}; convert_attr(a, vmin, std::min<uint32_t>(4, vmax - vmin + 1), t, 4);
+            RLOG("[vktrace]   attr %d fmt %08x slot %d: %g %g %g %g | %g %g %g %g | %g %g | %g %g\n", a, R[(0x1740 + 4 * a) >> 2], slot[a], t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[12], t[13]);
+        }
+    UnitBind units[16];
+    for (int i = 0; i < 16; ++i) if (p->texUsed & (1u << i)) bind_texture(i, units[i]);
+    g_traceDraw = false;
+    {
+        const VkDeviceSize ua0 = std::max<VkDeviceSize>(props.limits.minUniformBufferOffsetAlignment, 16);
+        const VkDeviceSize need = VkDeviceSize(vtxFloats) * 4 + VkDeviceSize(nConstAttr) * 16 + idx.size() * 4 + sizeof vpConst + sizeof(DrawCb) + kFcRange + 8 * ua0;
+        if (need <= kRing && F().head + need > kRing) flush_and_wait();
+    }
     // vertex data into the ring
     if (vtxFloats || nConstAttr) {
         VkDeviceSize vOff = 0;
         float* m = reinterpret_cast<float*>(ring_get(VkDeviceSize(vtxFloats) * 4 + VkDeviceSize(nConstAttr) * 16, 16, vOff));
-        if (!m) return;
+        if (!m) { DROPLOG("ring vertices"); return; }
         for (int a = 0; a < 16; ++a) {
             if (slot[a] < 0) continue;
             const uint32_t fmt = R[(0x1740 + 4 * a) >> 2];
@@ -1131,12 +1197,12 @@ void do_draw() {
     }
     VkDeviceSize iOff = 0;
     uint8_t* ip = ring_get(idx.size() * 4, 4, iOff);
-    if (!ip) return;
+    if (!ip) { DROPLOG("ring indices"); return; }
     std::memcpy(ip, idx.data(), idx.size() * 4);
     // uniforms: transform constants, draw values, fragment constants (each written again only when it changed)
     const VkDeviceSize ua = std::max<VkDeviceSize>(props.limits.minUniformBufferOffsetAlignment, 16);
-    if (vpConstDirty || vcFrame != frameNo * 4 + uint64_t(fi)) {
-        if (uint8_t* u = ring_get(sizeof vpConst, ua, vcOff)) { std::memcpy(u, vpConst, sizeof vpConst); vpConstDirty = false; vcFrame = frameNo * 4 + uint64_t(fi); }
+    if (vpConstDirty || vcFrame != ringGen) {
+        if (uint8_t* u = ring_get(sizeof vpConst, ua, vcOff)) { std::memcpy(u, vpConst, sizeof vpConst); vpConstDirty = false; vcFrame = ringGen; }
     }
     {
         static DrawCb dc, last;
@@ -1146,8 +1212,7 @@ void do_draw() {
         const uint32_t af = R[0x308 >> 2];
         dc.alpha[0] = float(R[0x304 >> 2] & 1); dc.alpha[1] = float(af >= 0x200 ? af - 0x200 : 7); dc.alpha[2] = (R[0x30c >> 2] & 0xff) / 255.f; dc.alpha[3] = 0;
         dc.wpos[0] = 1.f / float(cur.aaX); dc.wpos[1] = 1.f / float(cur.aaY); dc.wpos[2] = dc.wpos[3] = 0;
-        UnitBind units[16];
-        for (int i = 0; i < 16; ++i) { if (p->texUsed & (1u << i)) bind_texture(i, units[i]); std::memcpy(dc.tsc[i], units[i].tsc, 16); }
+        for (int i = 0; i < 16; ++i) std::memcpy(dc.tsc[i], units[i].tsc, 16);
         static const long unitLog = std::getenv("VKUNITLOG") ? std::strtol(std::getenv("VKUNITLOG"), nullptr, 16) : -1;   // (debug) texUsed mask to describe
         bool anyCube = false;
         for (int i = 0; i < 16; ++i) if ((p->texUsed & (1u << i)) && ((p->texDims >> (2 * i)) & 3) == 1) anyCube = true;
@@ -1166,15 +1231,20 @@ void do_draw() {
                 RLOG("[vkunits] frame %llu prog %016llx consts %zu blend %u %08x %08x mask %08x targets %u%s\n", (unsigned long long)frameNo, (unsigned long long)progKey, fpConsts.size() / 4, R[0x310 >> 2] & 1, R[0x314 >> 2], R[0x318 >> 2], R[0x324 >> 2], cur.nColor, s.c_str());
             }
         }
-        if (dcFrame != frameNo * 4 + uint64_t(fi) || std::memcmp(&dc, &last, sizeof dc) != 0) {
-            if (uint8_t* u = ring_get(sizeof dc, ua, dcOff)) { std::memcpy(u, &dc, sizeof dc); last = dc; dcFrame = frameNo * 4 + uint64_t(fi); }
+        if (dcFrame != ringGen || std::memcmp(&dc, &last, sizeof dc) != 0) {
+            if (uint8_t* u = ring_get(sizeof dc, ua, dcOff)) { std::memcpy(u, &dc, sizeof dc); last = dc; dcFrame = ringGen; }
         }
+        static std::vector<float> lastFc;   // what the block at fcOff holds
         if (p->nConst && !fpConsts.empty()) {
-            static std::vector<float> lastFc;
-            if (fcFrame != frameNo * 4 + uint64_t(fi) || lastFc != fpConsts) {
-                if (uint8_t* u = ring_get(kFcRange, ua, fcOff)) { std::memcpy(u, fpConsts.data(), std::min<size_t>(fpConsts.size() * 4, size_t(kFcRange))); lastFc = fpConsts; fcFrame = frameNo * 4 + uint64_t(fi); }
+            if (fcFrame != ringGen || lastFc != fpConsts) {
+                if (uint8_t* u = ring_get(kFcRange, ua, fcOff)) { std::memcpy(u, fpConsts.data(), std::min<size_t>(fpConsts.size() * 4, size_t(kFcRange))); lastFc = fpConsts; fcFrame = ringGen; }
             }
-        } else if (fcFrame != frameNo * 4 + uint64_t(fi)) { VkDeviceSize o2; if (ring_get(kFcRange, ua, o2)) { fcOff = o2; fcFrame = frameNo * 4 + uint64_t(fi); } }
+        } else if (fcFrame != ringGen) {
+            // a program without constants still needs a valid offset; the block is not filled, so it must not pass
+            // for the last constants uploaded (the next draw with those constants read garbage: the car liveries
+            // copied after a race came out white or black)
+            VkDeviceSize o2; if (ring_get(kFcRange, ua, o2)) { fcOff = o2; fcFrame = ringGen; lastFc.clear(); }
+        }
         // descriptor set: textures (the buffers are dynamic: their offsets change without a new set)
         static VkDescriptorImageInfo lastImg[16]; static VkDescriptorSet lastSet = VK_NULL_HANDLE; static uint64_t lastSetFrame = ~0ull;
         VkDescriptorImageInfo img[16];
@@ -1192,15 +1262,15 @@ void do_draw() {
             }
         }
         if (!rendering) begin_rendering();   // (texture uploads above may have ended it)
-        if (lastSetFrame != frameNo * 4 + uint64_t(fi) || std::memcmp(img, lastImg, sizeof img) != 0) {
+        if (lastSetFrame != ringGen || std::memcmp(img, lastImg, sizeof img) != 0) {
             VkDescriptorSet s = alloc_set();
-            if (!s) return;
+            if (!s) { DROPLOG("descriptor set"); return; }
             VkDescriptorBufferInfo bi[3] = {{F().ring.buf, 0, sizeof vpConst}, {F().ring.buf, 0, sizeof(DrawCb)}, {F().ring.buf, 0, kFcRange}};
             VkWriteDescriptorSet w[4]{};
             w[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s, 0, 0, 3, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, nullptr, bi, nullptr};
             w[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s, 3, 0, 16, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, img, nullptr, nullptr};
             vkUpdateDescriptorSets(dev, 2, w, 0, nullptr);
-            lastSet = s; std::memcpy(lastImg, img, sizeof img); lastSetFrame = frameNo * 4 + uint64_t(fi);
+            lastSet = s; std::memcpy(lastImg, img, sizeof img); lastSetFrame = ringGen;
         }
         const uint32_t offs[3] = {uint32_t(vcOff), uint32_t(dcOff), uint32_t(fcOff)};
         if (bound.set != lastSet || std::memcmp(bound.offs, offs, sizeof offs) != 0) {
@@ -1253,6 +1323,10 @@ void fixed_state(const VkRect2D& sc) {
 }
 
 void clear_surface(uint32_t mask) {
+    {
+        static const long tt = std::getenv("VKTRACETGT") ? std::strtol(std::getenv("VKTRACETGT"), nullptr, 16) : -1;
+        if (tt >= 0 && (long(R[0x210 >> 2]) == tt || long(R[0x218 >> 2]) == tt || long(R[0x288 >> 2]) == tt || long(R[0x28c >> 2]) == tt)) RLOG("[vktrace] frame %llu ct %x A %x B %x clear mask %x colour %08x scissor %08x %08x\n", (unsigned long long)frameNo, mask, R[0x1d90 >> 2], R[0x8c0 >> 2], R[0x8c4 >> 2]);
+    }
     if (!bind_target()) return;
     const uint32_t zfmt = (R[0x208 >> 2] >> 5) & 7;
     const uint32_t c = R[0x1d90 >> 2], zv = R[0x1d8c >> 2];
@@ -1342,6 +1416,7 @@ void begin_frame() {
     recording = true; rendering = false;
     bound = Bound{};
     targetValid = false;   // the next draw begins rendering on its target again
+    ++ringGen;
 }
 // submits what was recorded (optionally waiting / signalling the swap chain semaphores) and moves to the next frame
 void submit(VkSemaphore wait, VkSemaphore signal) {
@@ -1357,6 +1432,7 @@ void submit(VkSemaphore wait, VkSemaphore signal) {
 }
 void flush_and_wait() {
     if (!recording) return;
+    { static int n = 0; if (n++ < 50) RLOG("[vk] ring full: frame flushed (head %llu MB)\n", (unsigned long long)(F().head >> 20)); }
     const bool wasRendering = rendering;
     submit(VK_NULL_HANDLE, VK_NULL_HANDLE);
     vkDeviceWaitIdle(dev);
@@ -1418,6 +1494,37 @@ void post_pass(VkImageView target, VkFormat fmt, uint32_t tw, uint32_t th, VkSha
 }
 
 // image -> BMP through the ring (debug captures; waits for the GPU)
+// VKWATCH=hex surface,seconds (debug): from that second, the mean colour of that render target at every image when it changes
+void watch_surface() {
+    static long addr = -2; static double from = 0;
+    if (addr == -2) { addr = -1; if (const char* e = std::getenv("VKWATCH")) { addr = std::strtol(e, nullptr, 16); if (const char* c = std::strchr(e, ',')) from = std::atof(c + 1); } }
+    if (addr < 0 || SDL_GetTicks() < from * 1000) return;
+    if (const char* m = std::getenv("VKWATCHMEM")) {   // hex address in RSX local memory, 512x512x4 bytes: hash when it changes
+        const uint32_t ea = 0xc0000000u + uint32_t(std::strtoul(m, nullptr, 16));
+        const uint64_t h = fnv(C.mem + ea, 512 * 512 * 4, 1);
+        static uint64_t lastH = 0;
+        if (h != lastH) { RLOG("[vkwatch] frame %llu memory %x changed (hash %016llx)\n", (unsigned long long)frameNo, ea, (unsigned long long)h); lastH = h; }
+    }
+    auto it = surfaces.find(uint64_t(addr));
+    if (it == surfaces.end()) return;
+    const uint32_t w = it->second.w, h = it->second.h;
+    end_rendering(); barrier_all();
+    VkDeviceSize off = 0;
+    if (!ring_get(VkDeviceSize(w) * h * 4, 16, off)) return;
+    VkBufferImageCopy r{}; r.bufferOffset = off; r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; r.imageExtent = {w, h, 1};
+    vkCmdCopyImageToBuffer(cmd(), it->second.im.img, VK_IMAGE_LAYOUT_GENERAL, F().ring.buf, 1, &r);
+    Frame& f = F();
+    submit(VK_NULL_HANDLE, VK_NULL_HANDLE); vkDeviceWaitIdle(dev);
+    uint64_t sum[4] = {};
+    for (uint32_t k = 0; k < w * h; ++k) for (int c = 0; c < 4; ++c) sum[c] += f.ring.mem.ptr[off + k * 4 + c];
+    static uint64_t last[4] = {~0ull};
+    const uint64_t n = uint64_t(w) * h;
+    if (sum[0] / n != last[0] || sum[1] / n != last[1] || sum[2] / n != last[2]) {
+        RLOG("[vkwatch] frame %llu draws %llu: %llu %llu %llu %llu\n", (unsigned long long)frameNo, (unsigned long long)drawsThisFrame, (unsigned long long)(sum[0] / n), (unsigned long long)(sum[1] / n), (unsigned long long)(sum[2] / n), (unsigned long long)(sum[3] / n));
+        for (int c = 0; c < 4; ++c) last[c] = sum[c] / n;
+    }
+    begin_frame();
+}
 void save_image(VkImage img, VkImageLayout layout, uint32_t w, uint32_t h, bool bgra, const char* fn) {
     end_rendering();
     barrier_all();
@@ -1436,11 +1543,24 @@ void save_image(VkImage img, VkImageLayout layout, uint32_t w, uint32_t h, bool 
 
 void present_vk(const Display& d, int ww, int wh, const Overlay* ovl, int nOvl) {
     if (!recording) begin_frame();
+    watch_surface();
     end_rendering();
     barrier_all();
     targetValid = false;
     if (uint32_t(ww) != swapW || uint32_t(wh) != swapH || vsyncOn != swapVsync) make_swapchain(uint32_t(ww), uint32_t(wh));
     auto it = surfaces.find(uint64_t(d.offset));
+    {   // VKSURFSHOT=seconds (debug): every colour render target up to 512x512, once
+        static const double surfAt = std::getenv("VKSURFSHOT") ? std::atof(std::getenv("VKSURFSHOT")) : -1;
+        static bool surfDone = false;
+        if (surfAt >= 0 && !surfDone && SDL_GetTicks() >= surfAt * 1000) {
+            surfDone = true;
+            for (auto& sf : surfaces) {
+                if (sf.second.depth || sf.second.w > 512 || sf.second.im.fmt != VK_FORMAT_R8G8B8A8_UNORM) continue;
+                char fn[96]; std::snprintf(fn, sizeof fn, "vksurf_%x.bmp", uint32_t(sf.first));
+                save_image(sf.second.im.img, VK_IMAGE_LAYOUT_GENERAL, sf.second.w, sf.second.h, false, fn);
+            }
+        }
+    }
     static const int shotEvery = std::getenv("RSXSHOT") ? std::atoi(std::getenv("RSXSHOT")) : 0;
     if (shotEvery > 0 && frameNo % uint64_t(shotEvery) == 0 && it != surfaces.end() && it->second.im.fmt == VK_FORMAT_R8G8B8A8_UNORM) {
         RLOG("[shot] frame %llu at %.2f s\n", (unsigned long long)frameNo, SDL_GetTicks() / 1000.0);
