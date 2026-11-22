@@ -11,7 +11,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-VERSION = '2.6'
+VERSION = '2.7'
 PREFS = os.path.join(ROOT, 'instalador.json')
 LANGS = ['English', 'Français', 'Español', 'Deutsch', 'Italiano']   # same order and numbers (1-5) as the game's menu
 TITLE_ID, APP_VER = 'NPEB00060', '01.02'
@@ -51,6 +51,9 @@ T = {
  'nopkg':   ['the .pkg is missing', 'il manque le .pkg', 'falta el .pkg', 'die .pkg fehlt', 'manca il .pkg'],
  'wrong':   ['this is not the right file for this section', 'ce fichier ne va pas ici', 'este fichero no es el de este apartado',
              'diese Datei gehört nicht hierher', 'questo file non va qui'],
+ 'tab_inst': ['Install', 'Installer', 'Instalar', 'Installieren', 'Installa'],
+ 'tab_online': ['Play online', 'Jouer en ligne', 'Jugar online', 'Online spielen', 'Gioca online'],
+ 'online':  ['# Create a game (host)\n- In the game press F1 > Online: «Juego online» Sí, and your name (restart the game if you change it).\n- Same house / same network: nothing else to do, your friends will find the game by themselves.\n- Over the internet: the game tries to open port 3658 on your router by itself (F1 > Online shows «router abierto (UPnP)»). If it shows «abre el puerto a mano», open port 3658 TCP and UDP in your router towards the address shown in F1 > Online > «Tu IP en la red local».\n- Give your friends your public IP (search "what is my IP" on the internet).\n- Multiplayer > Create game: choose race type, settings and car. Wait in the Lobby until everyone is in and start the race.\n# Join a game\n- Same network: nothing to set. Over the internet: F1 > Online > «Unirse a (IP del anfitrión)» and type your friend\'s public IP.\n- Multiplayer > Join a game (or Quick game): your friend\'s game appears in the list. Choose it.\n- Choose your car and wait in the Lobby until the host starts.\n# Good to know\nThe first time, Windows asks whether Racing Club+ may use the network: press Allow. Everybody needs the same version of Racing Club+. No PSN account or server is used: the games connect to each other.', "# Créer une partie (hôte)\n- Dans le jeu, appuyez sur F1 > Online : «Juego online» Sí, et votre nom (redémarrez le jeu si vous le changez).\n- Même maison / même réseau : rien d'autre à faire, vos amis trouveront la partie tout seuls.\n- Par internet : le jeu essaie d'ouvrir lui-même le port 3658 de votre box (F1 > Online affiche «router abierto (UPnP)»). Sinon, ouvrez le port 3658 TCP et UDP dans votre box vers l'adresse affichée dans F1 > Online > «Tu IP en la red local».\n- Donnez votre IP publique à vos amis (cherchez « quelle est mon IP » sur internet).\n- Multijoueur > Créer une partie : choisissez le type, les réglages et la voiture. Attendez dans le Salon que tout le monde soit là et lancez la course.\n# Rejoindre une partie\n- Même réseau : rien à régler. Par internet : F1 > Online > «Unirse a (IP del anfitrión)» et tapez l'IP publique de votre ami.\n- Multijoueur > Rejoindre une partie (ou Partie rapide) : la partie de votre ami apparaît dans la liste. Choisissez-la.\n- Choisissez votre voiture et attendez dans le Salon que l'hôte lance la course.\n# Bon à savoir\nLa première fois, Windows demande si Racing Club+ peut utiliser le réseau : cliquez sur Autoriser. Tout le monde doit avoir la même version de Racing Club+. Aucun compte PSN ni serveur : les jeux se connectent directement.", '# Crear una partida (anfitrión)\n- En el juego pulsa F1 > Online: «Juego online» Sí, y tu nombre (reinicia el juego si lo cambias).\n- Misma casa / misma red: no hace falta nada más, tus amigos encontrarán la partida solos.\n- Por internet: el juego intenta abrir solo el puerto 3658 de tu router (F1 > Online pone «router abierto (UPnP)»). Si pone «abre el puerto a mano», abre en tu router el puerto 3658 TCP y UDP hacia la dirección que aparece en F1 > Online > «Tu IP en la red local».\n- Dales a tus amigos tu IP pública (busca «cuál es mi IP» en internet).\n- Multijugador > Crear partida: elige tipo de carrera, configuración y coche. Espera en la Sala a que entren todos y empieza la carrera.\n# Unirse a una partida\n- En la misma red no hay que configurar nada. Por internet: F1 > Online > «Unirse a (IP del anfitrión)» y escribe la IP pública de tu amigo.\n- Multijugador > Unirse a la partida (o Partida rápida): aparece la partida de tu amigo en la lista. Elígela.\n- Elige tu coche y espera en la Sala a que el anfitrión empiece.\n# Conviene saber\nLa primera vez Windows pregunta si Racing Club+ puede usar la red: pulsa Permitir. Todos necesitáis la misma versión de Racing Club+. No se usa cuenta de PSN ni ningún servidor: los juegos se conectan entre sí.', '# Spiel erstellen (Host)\n- Im Spiel F1 > Online: «Juego online» Sí und deinen Namen (nach einer Änderung das Spiel neu starten).\n- Gleiches Haus / gleiches Netzwerk: sonst nichts nötig, deine Freunde finden das Spiel von selbst.\n- Über das Internet: das Spiel versucht, Port 3658 im Router selbst zu öffnen (F1 > Online zeigt «router abierto (UPnP)»). Sonst Port 3658 TCP und UDP im Router auf die Adresse unter F1 > Online > «Tu IP en la red local» weiterleiten.\n- Gib deinen Freunden deine öffentliche IP (im Internet nach „meine IP“ suchen).\n- Mehrspieler > Spiel erstellen: Rennart, Einstellungen und Auto wählen. In der Lobby warten, bis alle da sind, und das Rennen starten.\n# Einem Spiel beitreten\n- Gleiches Netzwerk: nichts einzustellen. Über das Internet: F1 > Online > «Unirse a (IP del anfitrión)» und die öffentliche IP deines Freundes eingeben.\n- Mehrspieler > Spiel beitreten (oder Schnelles Spiel): das Spiel deines Freundes erscheint in der Liste. Auswählen.\n- Auto wählen und in der Lobby warten, bis der Host startet.\n# Gut zu wissen\nBeim ersten Mal fragt Windows, ob Racing Club+ das Netzwerk benutzen darf: Zulassen klicken. Alle brauchen dieselbe Version von Racing Club+. Kein PSN-Konto und kein Server: die Spiele verbinden sich direkt.', "# Creare una partita (host)\n- Nel gioco premi F1 > Online: «Juego online» Sí e il tuo nome (riavvia il gioco se lo cambi).\n- Stessa casa / stessa rete: nient'altro da fare, i tuoi amici troveranno la partita da soli.\n- Via internet: il gioco prova ad aprire da solo la porta 3658 del router (F1 > Online mostra «router abierto (UPnP)»). Altrimenti apri la porta 3658 TCP e UDP nel router verso l'indirizzo mostrato in F1 > Online > «Tu IP en la red local».\n- Dai ai tuoi amici il tuo IP pubblico (cerca «qual è il mio IP» su internet).\n- Multigiocatore > Crea partita: scegli tipo di gara, impostazioni e auto. Aspetta nella Sala che entrino tutti e avvia la gara.\n# Unirsi a una partita\n- Stessa rete: niente da impostare. Via internet: F1 > Online > «Unirse a (IP del anfitrión)» e scrivi l'IP pubblico del tuo amico.\n- Multigiocatore > Unisciti alla partita (o Partita rapida): la partita del tuo amico compare nella lista. Sceglila.\n- Scegli l'auto e aspetta nella Sala che l'host inizi.\n# Da sapere\nLa prima volta Windows chiede se Racing Club+ può usare la rete: premi Consenti. Serve la stessa versione di Racing Club+ per tutti. Nessun account PSN né server: i giochi si collegano direttamente."],
  'pip':     ['Preparing…', 'Préparation…', 'Preparando…', 'Vorbereitung…', 'Preparazione…'],
  'steps':   [['Extracting the game', 'Decrypting', 'Analysing the code', 'Translating the code', 'Translating sound and geometry', 'Compiling', 'Finishing'],
              ['Extraction du jeu', 'Déchiffrement', 'Analyse du code', 'Traduction du code', 'Traduction son et géométrie', 'Compilation', 'Finalisation'],
@@ -135,6 +138,7 @@ class App:
         self.sel = {k: list(p.get('sel', {}).get(k, [])) for k in ('game', 'update', 'pack')}
         self.out = p.get('out', os.path.join(ROOT, 'Racing Club+'))
         self.proc, self.q, self.step, self.ok, self.log_shown = None, queue.Queue(), 0, False, False
+        self.page = 'install'
         root.title('Racing Club+')
         root.configure(bg=WHITE)
         root.resizable(False, False)
@@ -165,6 +169,18 @@ class App:
         head.create_window(W - 16, 16, window=lang, anchor='ne')
         lang.bind('<Button-1>', self.lang_menu)
 
+        tabs = tk.Frame(r, bg=WHITE)
+        tabs.pack(fill='x', padx=26, pady=(10, 0))
+        for key, page in (('tab_inst', 'install'), ('tab_online', 'online')):
+            on = self.page == page
+            l = tk.Label(tabs, text=self.t(key), bg=WHITE, fg=INK if on else GREY, font=('Segoe UI Semibold' if on else 'Segoe UI', 11), cursor='hand2')
+            l.pack(side='left', padx=(0, 18))
+            l.bind('<Button-1>', lambda e, pg=page: self.show_page(pg))
+            if on: tk.Frame(tabs, bg=hexrgb(mix(BLUE_A, BLUE_B, 0.5)), height=3).place(in_=l, relx=0, rely=1.0, relwidth=1.0, y=1)
+        tk.Frame(r, bg=LINE, height=1).pack(fill='x', padx=26, pady=(6, 0))
+        if self.page == 'online':
+            self.build_online()
+            return
         body = tk.Frame(r, bg=WHITE)
         body.pack(fill='x', padx=26, pady=(12, 0))
         self.status = {}
@@ -197,6 +213,24 @@ class App:
                       activebackground=act, activeforeground='white').grid(row=0, column=i, sticky='ew', padx=(0 if i == 0 else 4, 0))
         self.logbox = tk.Text(r, height=8, font=('Consolas', 8), bg=SOFT, fg=INK, relief='flat', wrap='none')
         self.refresh()
+
+    def show_page(self, page):
+        if self.proc and page != 'install': pass   # the installation keeps running; its page comes back with its state
+        self.page = page; self.build()
+
+    def build_online(self):
+        box = tk.Text(self.root, height=24, width=70, bg=WHITE, fg=INK, relief='flat', wrap='word', font=('Segoe UI', 9),
+                      padx=4, pady=4, cursor='arrow', highlightthickness=0, spacing1=2, spacing3=2)
+        box.tag_configure('h', font=('Segoe UI Semibold', 11), foreground=hexrgb(BLUE_B), spacing1=10, spacing3=4)
+        box.tag_configure('step', lmargin1=4, lmargin2=22)
+        box.tag_configure('note', foreground=GREY)
+        n = 0
+        for line in self.t('online').split('\n'):
+            if line.startswith('# '): box.insert('end', line[2:] + '\n', 'h'); n = 0
+            elif line.startswith('- '): n += 1; box.insert('end', '%d.  %s\n' % (n, line[2:]), 'step')
+            elif line.strip(): box.insert('end', line + '\n', 'note')
+        box.configure(state='disabled')
+        box.pack(fill='both', padx=26, pady=(8, 14))
 
     def link(self, parent, text, cmd, color, size=8):
         l = tk.Label(parent, text=text, bg=WHITE, fg=color, font=('Segoe UI', size, 'underline'), cursor='hand2')
@@ -277,6 +311,7 @@ class App:
         return all(self.section_ok(k) for k in ('game', 'update', 'pack'))
 
     def refresh(self):
+        if self.page != 'install': return
         for key in ('game', 'update', 'pack'):
             pkg, rap, bad = self.parts(key)
             if not pkg and not rap:
@@ -357,6 +392,7 @@ class App:
         self.q.put(('end', rc))
 
     def poll(self):
+        if self.page != 'install': self.root.after(100, self.poll); return   # messages wait in the queue for the install page
         try:
             while True:
                 kind, v = self.q.get_nowait()
