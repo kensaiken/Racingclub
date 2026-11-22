@@ -37,6 +37,10 @@ Tarda varios minutos (traducir y compilar). Al terminar, la carpeta `Racing Club
 
 La carpeta `Racing Club+` resultante contiene tu copia del juego y código derivado de él: es para tu uso personal. **No la repartas.** Lo que sí se puede compartir es este instalador.
 
+## Jugar online
+
+Conexión directa entre jugadores, sin servidores ni cuenta de PSN: quien crea la partida la aloja en su juego. En la misma red local las partidas se encuentran solas; por internet, quien se une escribe la IP del anfitrión en **F1 > Online**, y el anfitrión necesita el puerto **3658 (TCP y UDP)** abierto en su router (el juego lo intenta abrir solo si el router tiene UPnP). Los pasos completos están en la pestaña **«Jugar online»** del instalador.
+
 ## En el juego
 
 - **F1** (o pulsar el panel táctil / botón PS del mando): menú de opciones.
