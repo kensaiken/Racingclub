@@ -903,19 +903,41 @@ static void toast_overlay(int ww, int wh, Overlay& o) {
     o.dx = ww - m - o.dw; o.dy = m;
 }
 
+// Several controllers at once: the real DualSense plus the virtual Xbox pad that DS4Windows, DSX or Steam create
+// for it. The one with its own type (PlayStation, then Nintendo) is used rather than a generic XInput one, so the
+// button icons follow the controller in the player's hands. gone = a controller just removed (still listed).
+static void choose_pad(SDL_JoystickID gone) {
+    auto score = [](SDL_GamepadType t) {
+        switch (t) {
+            case SDL_GAMEPAD_TYPE_PS3: case SDL_GAMEPAD_TYPE_PS4: case SDL_GAMEPAD_TYPE_PS5: return 3;
+            case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT: case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+            case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR: return 2;
+            default: return 1;
+        }
+    };
+    int n = 0; SDL_JoystickID* ids = SDL_GetGamepads(&n);
+    SDL_JoystickID best = 0; int bestScore = 0;
+    for (int k = 0; k < n; ++k) {
+        if (ids[k] == gone) continue;
+        const int sc = score(SDL_GetGamepadTypeForID(ids[k]));
+        const char* nm = SDL_GetGamepadNameForID(ids[k]);
+        RLOG("[pad] found: %s (type %d, %04x:%04x)\n", nm ? nm : "?", int(SDL_GetGamepadTypeForID(ids[k])), SDL_GetGamepadVendorForID(ids[k]), SDL_GetGamepadProductForID(ids[k]));
+        if (sc > bestScore) { best = ids[k]; bestScore = sc; }
+    }
+    SDL_free(ids);
+    if (pad && best == SDL_GetGamepadID(pad)) return;
+    if (pad && !best && gone != SDL_GetGamepadID(pad)) return;
+    if (pad) { SDL_CloseGamepad(pad); pad = nullptr; }
+    if (best) pad = SDL_OpenGamepad(best);
+    pad_opened(); menuDirty = true;
+}
 static bool padHold = false;   // the menu was closed with the controller: the game sees no buttons until they are released
 static void pump_events() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT) quitFlag = true;
-        if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad) { pad = SDL_OpenGamepad(e.gdevice.which); pad_opened(); menuDirty = true; }
-        if (e.type == SDL_EVENT_GAMEPAD_REMOVED && pad && e.gdevice.which == SDL_GetGamepadID(pad)) {   // another one connected takes over
-            SDL_CloseGamepad(pad); pad = nullptr;
-            int n = 0; SDL_JoystickID* ids = SDL_GetGamepads(&n);
-            for (int k = 0; k < n && !pad; ++k) if (ids[k] != e.gdevice.which) pad = SDL_OpenGamepad(ids[k]);
-            SDL_free(ids);
-            pad_opened(); menuDirty = true;
-        }
+        if (e.type == SDL_EVENT_GAMEPAD_ADDED) choose_pad(0);
+        if (e.type == SDL_EVENT_GAMEPAD_REMOVED && pad && e.gdevice.which == SDL_GetGamepadID(pad)) choose_pad(e.gdevice.which);   // another one connected takes over
         if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {   // the menu with the controller: touchpad click or PS button opens and closes it
             const int b = e.gbutton.button;
             if (b == SDL_GAMEPAD_BUTTON_TOUCHPAD || b == SDL_GAMEPAD_BUTTON_GUIDE || (menuOpen && b == SDL_GAMEPAD_BUTTON_EAST)) { menuOpen = !menuOpen; menuDirty = true; if (!menuOpen) { settings_save(); padHold = true; } }

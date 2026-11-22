@@ -177,7 +177,6 @@ static bool finish_program(Program& p, bool wait) {
     return true;
 }
 static std::vector<float> g_fpConsts;   // constants of the fragment program of the current draw (filled by get_program)
-static uint64_t vpGen = 1;              // bumped whenever vertex program words are uploaded
 static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, uint32_t control) {
     // vertex program words up to the end bit
     uint32_t n = 0;
@@ -1219,6 +1218,9 @@ static void do_draw() {
                  vp[0], vp[1], vp[2], vp[3], cmk[0], cmk[1], cmk[2], cmk[3], dfb, fb, glIsEnabled(GL_DEPTH_TEST), glIsEnabled(GL_STENCIL_TEST), glIsEnabled(GL_CULL_FACE), glIsEnabled(GL_BLEND), glIsEnabled(0x8C89));
             RLOG("[draw]   center pixel after draw: %u %u %u %u, GL error %x, stencil %u depthbounds %x\n", px[0], px[1], px[2], px[3], glGetError(), R[0x328 >> 2], R[0x380 >> 2]);
         }
+        for (int a = 0; a < 16; ++a) if ((p->vpInputs & (1u << a)) && !((R[(0x1740 + 4 * a) >> 2] >> 4) & 0xf))
+            RLOG("[draw]   const attr %d: %g %g %g %g\n", a, rf(0x1c00 + 16 * a), rf(0x1c04 + 16 * a), rf(0x1c08 + 16 * a), rf(0x1c0c + 16 * a));
+        if (!g_fpConsts.empty()) RLOG("[draw]   fc0 %g %g %g %g (%zu consts) vpInputs %x\n", g_fpConsts[0], g_fpConsts[1], g_fpConsts[2], g_fpConsts[3], g_fpConsts.size() / 4, p->vpInputs);
         RLOG("[draw]   scissor %08x %08x viewport %08x %08x clip %08x %08x window %08x ctl %08x\n", R[0x8c0 >> 2], R[0x8c4 >> 2], R[0xa00 >> 2], R[0xa04 >> 2], R[0x200 >> 2], R[0x204 >> 2], R[0x1d88 >> 2], R[0x1d60 >> 2]);
         for (uint32_t v = 0; v < nv && v < 6; ++v) RLOG("[draw]   v%u: %g %g %g %g | %g %g\n", v, vtx[v * 4], vtx[v * 4 + 1], vtx[v * 4 + 2], vtx[v * 4 + 3], na > 2 ? vtx[(2 * nv + v) * 4] : 0.f, na > 2 ? vtx[(2 * nv + v) * 4 + 1] : 0.f);
         RLOG("[draw]   vc467 %g %g %g %g vc4 %g %g %g %g vscale %g %g %g voff %g %g %g\n", vpConst[467 * 4], vpConst[467 * 4 + 1], vpConst[467 * 4 + 2], vpConst[467 * 4 + 3],

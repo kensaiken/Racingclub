@@ -1526,7 +1526,7 @@ void present_vk(const Display& d, int ww, int wh, const Overlay* ovl, int nOvl) 
                 VkBufferImageCopy r{}; r.bufferOffset = off; r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}; r.imageExtent = {swapW, swapH, 1};
                 vkCmdCopyImageToBuffer(cmd(), sw, VK_IMAGE_LAYOUT_GENERAL, F().ring.buf, 1, &r);
                 static VkDeviceSize pendingOff = 0; static int pendingFrame = -1; static char pendingName[64];
-                pendingOff = off; pendingFrame = fi; std::snprintf(pendingName, sizeof pendingName, "vkwin_%03d.bmp", int(at.front()));
+                pendingOff = off; pendingFrame = fi; std::snprintf(pendingName, sizeof pendingName, "vkwin_%05.1f.bmp", at.front());
                 image_barrier(sw, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
                 Frame& fr = F();
                 submit(f.acquired, swapDone[imgIndex]);
