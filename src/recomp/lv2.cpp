@@ -2867,6 +2867,10 @@ bool imports(PPU& c, const char* module, const char* name) {
         const char* mode = (fl & 0x3) == 0 ? "rb" : ((fl & 0x40) ? ((fl & 0x200) ? "w+b" : "a+b") : "r+b");
         FILE* f = std::fopen(hp.c_str(), mode);
         LOG("[fs] open %s%s\n", gp.c_str(), f ? "" : "  NOT FOUND");
+        if (const size_t k = gp.find("/sumotool/ps3/"); f && k != std::string::npos) {   // the screen the menus show now
+            const std::string rest = gp.substr(k + 14), dir = rest.substr(0, rest.find('/'));
+            if (rest == dir + "/" + dir + ".dat" && dir != "global" && dir != "popups" && dir != "numberplate") rsx::screen_loaded(dir);
+        }
         if (!f) { ret(c, LV2_ENOENT); return true; }
         std::lock_guard<std::mutex> lk(g_fsMx);
         const uint32_t fd = g_nextFd++;

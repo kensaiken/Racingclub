@@ -344,6 +344,65 @@ bool host_toast_bitmap(const wchar_t* title, const wchar_t* name, const wchar_t*
     DeleteObject(bm); DeleteDC(dc);
     return true;
 }
+// the Patreon banner: a rounded card in Patreon's red with a white mark (bar + disc) and three lines of text
+bool host_banner_bitmap(const wchar_t* line1, const wchar_t* line2, const wchar_t* line3, int w, int h, uint32_t* out) {
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h; bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP bm = dc ? CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+    if (!bm) { if (dc) DeleteDC(dc); return false; }
+    HGDIOBJ oldBm = SelectObject(dc, bm);
+    RECT all{0, 0, w, h};
+    HBRUSH edge = CreateSolidBrush(RGB(255, 255, 255)), card = CreateSolidBrush(RGB(255, 66, 77)), white = CreateSolidBrush(RGB(255, 255, 255));
+    FillRect(dc, &all, edge);
+    RECT in{3, 3, w - 3, h - 3};
+    FillRect(dc, &in, card);
+    HPEN noPen = CreatePen(PS_NULL, 0, 0);
+    HGDIOBJ oldPen = SelectObject(dc, noPen), oldBr = SelectObject(dc, white);
+    const int r = h * 22 / 100, cy = h / 2, lx = 20, bw = r * 2 / 5;   // the mark: a bar and a disc
+    Rectangle(dc, lx, cy - r - r / 3, lx + bw, cy + r + r / 3);
+    Ellipse(dc, lx + bw + 6, cy - r - r / 3, lx + bw + 6 + 2 * r, cy - r - r / 3 + 2 * r);
+    SelectObject(dc, oldBr); SelectObject(dc, oldPen);
+    SetBkMode(dc, TRANSPARENT);
+    HFONT f1 = CreateFontW(-h * 24 / 100, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    HFONT f2 = CreateFontW(-h * 17 / 100, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    HFONT f3 = CreateFontW(-h * 16 / 100, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    const int x = lx + bw + 6 + 2 * r + 18;
+    RECT t1{x, h * 8 / 100, w - 12, h * 40 / 100}, t2{x, h * 40 / 100, w - 12, h * 66 / 100}, t3{x, h * 66 / 100, w - 12, h * 92 / 100};
+    HGDIOBJ oldF = SelectObject(dc, f1);
+    SetTextColor(dc, RGB(255, 255, 255));
+    DrawTextW(dc, line1, -1, &t1, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+    SelectObject(dc, f2);
+    SetTextColor(dc, RGB(255, 236, 238));
+    DrawTextW(dc, line2, -1, &t2, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+    SelectObject(dc, f3);
+    SetTextColor(dc, RGB(255, 255, 255));
+    const std::wstring l3 = std::wstring(line3) + L"  \u2192";
+    DrawTextW(dc, l3.c_str(), -1, &t3, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS);
+    SelectObject(dc, oldF);
+    GdiFlush();
+    memcpy(out, bits, size_t(w) * h * 4);
+    {   // opaque card with rounded corners (premultiplied alpha)
+        const float rad = float(h) * 0.14f;
+        for (int y = 0; y < h; ++y)
+            for (int xx = 0; xx < w; ++xx) {
+                uint32_t& p = out[size_t(y) * w + xx];
+                const float cx = xx + 0.5f < rad ? rad : xx + 0.5f > w - rad ? w - rad : xx + 0.5f;
+                const float cy2 = y + 0.5f < rad ? rad : y + 0.5f > h - rad ? h - rad : y + 0.5f;
+                const float d = std::sqrt((xx + 0.5f - cx) * (xx + 0.5f - cx) + (y + 0.5f - cy2) * (y + 0.5f - cy2));
+                const float a = std::clamp(rad - d + 0.5f, 0.f, 1.f);
+                if (a >= 1.f) { p |= 0xff000000u; continue; }
+                const auto sc = [a](uint32_t c) { return uint32_t(float(c) * a + 0.5f); };
+                p = (sc(255) << 24) | (sc((p >> 16) & 255) << 16) | (sc((p >> 8) & 255) << 8) | sc(p & 255);
+            }
+    }
+    SelectObject(dc, oldBm);
+    DeleteObject(f1); DeleteObject(f2); DeleteObject(f3); DeleteObject(edge); DeleteObject(card); DeleteObject(white); DeleteObject(noPen);
+    DeleteObject(bm); DeleteDC(dc);
+    return true;
+}
 // ------------------------------------------------------------------ options panel (F1)
 namespace {
 void gdip_start() {
@@ -628,6 +687,7 @@ bool host_button_glyph(int, int, int, int, uint8_t*) { return false; }
 void host_restart() {}
 void host_report(const char*) {}
 bool host_toast_bitmap(const wchar_t*, const wchar_t*, const wchar_t*, uint32_t, const uint8_t*, size_t, int, int, uint32_t*) { return false; }
+bool host_banner_bitmap(const wchar_t*, const wchar_t*, const wchar_t*, int, int, uint32_t*) { return false; }
 void host_sleep_us(uint64_t us) { std::this_thread::sleep_for(std::chrono::microseconds(us)); }
 void host_thread_priority_high() {}
 void host_thread_core(bool) {}

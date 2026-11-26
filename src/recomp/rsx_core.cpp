@@ -16,7 +16,7 @@
 namespace gti::recomp { void glyphs_update(); }   // button_glyphs.cpp
 namespace gti::recomp::netplay { std::string local_address(); std::string player_name(); int upnp_state(); }   // netplay.cpp
 namespace gti::recomp { bool host_input_text(const wchar_t* title, const wchar_t* prompt, std::string& value, int maxLen); }   // host_win.cpp
-namespace gti::recomp { void host_restart(); void host_report(const char* gpu); std::vector<std::string> host_camera_list(); void host_camera_stop(); bool host_toast_bitmap(const wchar_t* title, const wchar_t* name, const wchar_t* detail, uint32_t rgb, const uint8_t* png, size_t pngSize, int w, int h, uint32_t* out); }   // host_win.cpp
+namespace gti::recomp { void host_restart(); void host_report(const char* gpu); std::vector<std::string> host_camera_list(); void host_camera_stop(); bool host_toast_bitmap(const wchar_t* title, const wchar_t* name, const wchar_t* detail, uint32_t rgb, const uint8_t* png, size_t pngSize, int w, int h, uint32_t* out); bool host_banner_bitmap(const wchar_t* line1, const wchar_t* line2, const wchar_t* line3, int w, int h, uint32_t* out); }   // host_win.cpp
 namespace gti::recomp::rsx {
 
 std::mutex g_logMx;
@@ -944,6 +944,39 @@ static void toast_overlay(int ww, int wh, Overlay& o) {
     o.dx = ww - m - o.dw; o.dy = m;
 }
 
+// ------------------------------------------------------------------ Patreon banner (main menu, top right)
+// Shown while the last menu screen the game loaded is main_menu (its sub-menus live in the same file; the title,
+// car select, options, races... load their own screen). A click opens the Patreon page in the browser.
+static std::atomic<bool> g_onMainMenu{false};
+void screen_loaded(const std::string& screen) { g_onMainMenu = screen == "main_menu"; }
+static const char* const kPatreonUrl = "https://www.patreon.com/ilesraider/membership";
+static int g_bannerRect[4] = {};          // window pixels: x, y, w, h (w 0 = not shown)
+static void banner_overlay(int ww, int wh, Overlay& o) {
+    static std::vector<uint32_t> px;
+    static int haveLang = -1;
+    const int W = 560, H = 120;
+    o.changed = false;
+    const int lang = std::clamp(settings().language, 0, 5);
+    if (haveLang != lang) {
+        static const wchar_t* const l1[6] = {L"Support Racing Club+ on Patreon", L"Support Racing Club+ on Patreon", L"Soutenez Racing Club+ sur Patreon", L"Apoya Racing Club+ en Patreon", L"Unterst\u00fctze Racing Club+ auf Patreon", L"Sostieni Racing Club+ su Patreon"};
+        static const wchar_t* const l2[6] = {L"Help pay for a server for online play", L"Help pay for a server for online play", L"Aidez \u00e0 payer un serveur pour le jeu en ligne", L"Ayuda a pagar un servidor para jugar online", L"Hilf, einen Server f\u00fcr das Online-Spiel zu bezahlen", L"Aiuta a pagare un server per il gioco online"};
+        static const wchar_t* const l3[6] = {L"Click here", L"Click here", L"Cliquez ici", L"Haz clic aqu\u00ed", L"Hier klicken", L"Clicca qui"};
+        px.resize(size_t(W) * H);
+        if (!host_banner_bitmap(l1[lang], l2[lang], l3[lang], W, H, px.data())) { o.px = nullptr; return; }
+        haveLang = lang; o.changed = true;
+    }
+    o.px = px.data(); o.w = W; o.h = H;
+    o.dw = std::max(280, ww * 23 / 100); o.dh = o.dw * H / W;
+    const int m = std::max(8, wh / 40);
+    o.dx = ww - m - o.dw; o.dy = m;
+}
+static bool in_banner(float x, float y) {   // window coordinates of a mouse event
+    if (!g_bannerRect[2]) return false;
+    const float s = SDL_GetWindowPixelDensity(win);
+    x *= s; y *= s;
+    return x >= g_bannerRect[0] && y >= g_bannerRect[1] && x < g_bannerRect[0] + g_bannerRect[2] && y < g_bannerRect[1] + g_bannerRect[3];
+}
+
 // Several controllers at once: the real DualSense plus the virtual Xbox pad that DS4Windows, DSX or Steam create
 // for it. The one with its own type (PlayStation, then Nintendo) is used rather than a generic XInput one, so the
 // button icons follow the controller in the player's hands. gone = a controller just removed (still listed).
@@ -988,6 +1021,16 @@ static void pump_events() {
             else if (menuOpen && b == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER) menu_tab(1);
             else if (menuOpen && b == SDL_GAMEPAD_BUTTON_DPAD_LEFT) menu_change(-1);
             else if (menuOpen && (b == SDL_GAMEPAD_BUTTON_DPAD_RIGHT || b == SDL_GAMEPAD_BUTTON_SOUTH)) menu_change(1);
+        }
+        if (e.type == SDL_EVENT_MOUSE_MOTION) {   // a hand over the banner
+            static SDL_Cursor* hand = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
+            static bool over = false;
+            const bool now = in_banner(e.motion.x, e.motion.y);
+            if (now != over) { over = now; SDL_SetCursor(now ? hand : SDL_GetDefaultCursor()); }
+        }
+        if (e.type == SDL_EVENT_MOUSE_BUTTON_DOWN && e.button.button == SDL_BUTTON_LEFT && in_banner(e.button.x, e.button.y)) {
+            RLOG("[patreon] banner clicked\n");
+            SDL_OpenURL(kPatreonUrl);
         }
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
             const SDL_Scancode sc = e.key.scancode;
@@ -1096,6 +1139,19 @@ void flip(uint32_t id) {
     glyphs_update();
     Overlay ovl[2];
     toast_overlay(ww, wh, ovl[0]);
+    {   // slot 0: a notification first, else the Patreon banner on the main menu
+        static int slot0 = 0;   // what slot 0 showed last: 0 nothing, 1 notification, 2 banner
+        g_bannerRect[2] = 0;
+        if (ovl[0].px) { if (slot0 != 1) ovl[0].changed = true; slot0 = 1; }
+        else if (g_onMainMenu && !menuOpen) {
+            banner_overlay(ww, wh, ovl[0]);
+            if (ovl[0].px) {
+                if (slot0 != 2) ovl[0].changed = true;
+                slot0 = 2;
+                g_bannerRect[0] = ovl[0].dx; g_bannerRect[1] = ovl[0].dy; g_bannerRect[2] = ovl[0].dw; g_bannerRect[3] = ovl[0].dh;
+            }
+        } else slot0 = 0;
+    }
     if (menuOpen) menu_overlay(ww, wh, ovl[1]);
     B->present(displays[id & 7], ww, wh, ovl, 2);
     pump_events();
