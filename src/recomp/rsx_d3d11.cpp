@@ -1356,8 +1356,30 @@ bool init_d3d() {
     if (std::getenv("D3DDEBUG")) flags |= D3D11_CREATE_DEVICE_DEBUG;
     const D3D_FEATURE_LEVEL levels[2] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
     D3D_FEATURE_LEVEL got{};
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels, 2, D3D11_SDK_VERSION, &dev, &got, &ctx);
-    if (hr == E_INVALIDARG) hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels + 1, 1, D3D11_SDK_VERSION, &dev, &got, &ctx);
+    // GPU=text (test): the graphics card whose name contains that text (e.g. GPU=AMD for the processor's own graphics)
+    IDXGIAdapter1* pick = nullptr;
+    if (const char* want = std::getenv("GPU")) {
+        using CreateF = HRESULT(WINAPI*)(REFIID, void**);
+        HMODULE dx = LoadLibraryA("dxgi.dll");
+        auto create = dx ? reinterpret_cast<CreateF>(reinterpret_cast<void*>(GetProcAddress(dx, "CreateDXGIFactory1"))) : nullptr;
+        IDXGIFactory1* f1 = nullptr;
+        if (create && SUCCEEDED(create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&f1)))) {
+            IDXGIAdapter1* a = nullptr;
+            for (UINT i = 0; !pick && f1->EnumAdapters1(i, &a) == S_OK; ++i) {
+                DXGI_ADAPTER_DESC1 d{}; a->GetDesc1(&d);
+                char n[128]; WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, n, sizeof n, nullptr, nullptr);
+                std::string ln(n), lw(want);
+                for (auto& ch : ln) ch = char(std::tolower(uint8_t(ch)));
+                for (auto& ch : lw) ch = char(std::tolower(uint8_t(ch)));
+                if (ln.find(lw) != std::string::npos) pick = a; else a->Release();
+            }
+            f1->Release();
+        }
+        RLOG("[d3d] GPU=%s: %s\n", want, pick ? "found" : "not found, using the default one");
+    }
+    const D3D_DRIVER_TYPE dtype = pick ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE;
+    HRESULT hr = D3D11CreateDevice(pick, dtype, nullptr, flags, levels, 2, D3D11_SDK_VERSION, &dev, &got, &ctx);
+    if (hr == E_INVALIDARG) hr = D3D11CreateDevice(pick, dtype, nullptr, flags, levels + 1, 1, D3D11_SDK_VERSION, &dev, &got, &ctx);
     if (FAILED(hr) && (flags & D3D11_CREATE_DEVICE_DEBUG)) {   // the debug layer is an optional Windows component ("Graphics Tools")
         RLOG("[d3d] debug layer not installed: running without it\n");
         flags &= ~UINT(D3D11_CREATE_DEVICE_DEBUG);

@@ -1776,7 +1776,13 @@ bool init_vk() {
         for (uint32_t q = 0; q < nq; ++q) {
             VkBool32 present = VK_FALSE; vkGetPhysicalDeviceSurfaceSupportKHR(devs[i], q, surface, &present);
             if ((qf[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) && present) {
-                const int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 0;
+                int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 1 : 0;
+                if (const char* want = std::getenv("GPU")) {   // GPU=text (test): the device whose name contains it
+                    std::string n(p.deviceName), w(want);
+                    for (auto& ch : n) ch = char(std::tolower(uint8_t(ch)));
+                    for (auto& ch : w) ch = char(std::tolower(uint8_t(ch)));
+                    if (n.find(w) != std::string::npos) score = 10;
+                }
                 if (score > bestScore) { bestScore = score; best = int(i); queueFamily = q; }
                 break;
             }

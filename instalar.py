@@ -51,6 +51,84 @@ def sfo(path):
     return out
 
 
+def compile_game(a, tc, elf):
+    """Steps 3-6: the game's code translated to C++ and compiled with this version's runtime. Returns the build folder."""
+    py, re_dir = sys.executable, os.path.dirname(elf)
+    step(3, 'Analizando el codigo del juego')
+    run([py, os.path.join('tools', 'prepare_re.py'), elf, re_dir])
+    run([py, os.path.join('tools', 'jumptables.py')], quiet=True)
+
+    step(4, 'Traduciendo el codigo del juego a C++ (unos minutos)')
+    full = os.path.join(ROOT, 'src', 'recomp', 'full')
+    os.makedirs(full, exist_ok=True)
+    run([py, os.path.join('tools', 'ppc2cpp.py'), os.path.join('src', 'recomp', 'full', 'game.cpp'), '10000-bb3000'], env=dict(os.environ, SPLIT='48'), quiet=True)
+
+    step(5, 'Traduciendo los programas de sonido y geometria')
+    specs = list(SPU_SPECS)
+    run([py, os.path.join('tools', 'spu2cpp.py'), elf, os.path.join('src', 'recomp', 'spu_gen')] + specs, quiet=True)
+
+    step(6, 'Compilando (varios minutos; usa %d hilos)' % a.jobs)
+    env = dict(os.environ)
+    env['PATH'] = os.path.join(tc, 'bin') + os.pathsep + env.get('PATH', '')
+    build = os.path.join(ROOT, 'build-inst')
+    cmake = os.path.join(tc, 'bin', 'cmake.exe')   # full path: Windows looks the program up in our own PATH, not env's
+    if not os.path.exists(cmake): fail('falta cmake.exe en ' + os.path.join(tc, 'bin'))
+    tool = lambda n: os.path.join(tc, 'bin', n).replace('\\', '/')
+    run([cmake, '-S', ROOT, '-B', build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_C_COMPILER=' + tool('clang.exe'), '-DCMAKE_CXX_COMPILER=' + tool('clang++.exe'), '-DCMAKE_MAKE_PROGRAM=' + tool('ninja.exe'),
+         '-DCMAKE_PREFIX_PATH=' + os.path.join(tc, 'deps').replace('\\', '/')], env=env, quiet=True)
+    run([cmake, '--build', build, '--target', 'recomp_boot', '-j', str(a.jobs)], env=env)
+
+    return build
+
+
+def find_toolchain(a):
+    tc = a.toolchain or os.path.join(ROOT, 'toolchain')
+    if not os.path.isdir(os.path.join(tc, 'bin')): tc = os.path.join(os.path.expanduser('~'), '.local', 'share', 'retcomm', 'toolchains', 'cmake-clang-v1', 'latest')
+    if not os.path.exists(os.path.join(tc, 'bin', 'clang++.exe')): fail('no encuentro el compilador (carpeta toolchain/ o --toolchain). Mira LEEME_INSTALADOR.md')
+    try:
+        sys.path[:] = [p for p in sys.path if os.path.abspath(p or '.') != os.path.join(ROOT, 'tools')]
+        import capstone
+    except ImportError:
+        fail('falta el modulo capstone de Python:  python -m pip install capstone==5.0.7')
+    return tc
+
+
+def clean_intermediate():
+    # the decrypted executable and the translated code stay out of the installer's folder, so it can be shared;
+    # never in a development checkout (.git), where re/ also holds analysis files that cannot be regenerated
+    if not os.path.exists(os.path.join(ROOT, '.git')):
+        for d in ('re', os.path.join('src', 'recomp', 'full'), os.path.join('src', 'recomp', 'spu_gen'), 'build-inst', 'paquetes'):
+            shutil.rmtree(os.path.join(ROOT, d), ignore_errors=True)
+
+
+def update(a, t0):
+    """An installed game rebuilt with this version: the decrypted executable the first install left in
+    <folder>/juego/EBOOT.elf is used again, the game data and gtiport.ini (options, language) stay as they are."""
+    out = os.path.abspath(a.actualizar)
+    step(1, 'Comprobando el juego instalado en ' + out)
+    src = os.path.join(out, 'juego', 'EBOOT.elf')
+    if not os.path.exists(src): fail('en %s no hay un juego instalado (falta juego\\EBOOT.elf). Instalalo primero.' % out)
+    if hashlib.sha1(open(src, 'rb').read()).hexdigest() != ELF_SHA1: fail('el juego de %s no es el de %s %s' % (out, TITLE_ID, APP_VER))
+    print('  juego correcto')
+    tc = find_toolchain(a)
+    step(2, 'Preparando el ejecutable del juego')
+    re_dir = os.path.join(ROOT, 're')
+    os.makedirs(re_dir, exist_ok=True)
+    elf = os.path.join(re_dir, 'EBOOT.elf')
+    if os.path.abspath(src) != os.path.abspath(elf): shutil.copyfile(src, elf)
+    build = compile_game(a, tc, elf)
+    step(7, 'Cambiando el ejecutable del juego')
+    exe = os.path.join(out, 'Racing Club+.exe')
+    for k in range(30):   # the game may still be closing
+        try:
+            shutil.copyfile(os.path.join(build, 'recomp_boot.exe'), exe); break
+        except PermissionError:
+            if k == 29: fail('no se puede cambiar %s: cierra el juego y vuelve a intentarlo' % exe)
+            time.sleep(1)
+    if not a.keep: clean_intermediate()
+    print('\nActualizado en %d min. Para jugar: "%s"' % ((time.time() - t0) / 60, exe))
+
+
 def main():
     ap = argparse.ArgumentParser(description='Racing Club+ para PC a partir de tu copia del juego (NPEB00060, 1.02)')
     ap.add_argument('--pkg', nargs='*', default=[], help='paquetes .pkg en orden: juego, actualizacion 1.02, pack de coches (opcional)')
@@ -61,9 +139,11 @@ def main():
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
     ap.add_argument('--no-copy', action='store_true', help='no copiar los datos del juego a la salida')
     ap.add_argument('--keep', action='store_true', help='conservar los ficheros intermedios (re/, codigo traducido, build-inst/) para recompilar mas rapido')
+    ap.add_argument('--actualizar', metavar='CARPETA', help='actualizar un juego ya instalado en CARPETA: recompila con esta version sin pedir otra vez los paquetes')
     ap.add_argument('--idioma', type=int, choices=range(1, 6), help='idioma del juego: 1 English, 2 Francais, 3 Espanol, 4 Deutsch, 5 Italiano')
     a = ap.parse_args()
     t0 = time.time()
+    if a.actualizar: return update(a, t0)
 
     step(1, 'Comprobando el juego (hace falta la version europea %s con la actualizacion %s)' % (TITLE_ID, APP_VER))
     if a.pkg:   # base game, update 1.02 on top, car pack: extracted here (the update replaces files of the game)
@@ -98,14 +178,7 @@ def main():
         fail('el EBOOT.BIN no es el de %s con la actualizacion %s. Si has extraido los .pkg, extrae tambien la actualizacion encima del juego.' % (TITLE_ID, APP_VER))
     print('  ejecutable del juego: version %s correcta' % APP_VER)
     if not os.path.isdir(os.path.join(usrdir, 'data', 'cars', 'pack_modern_1')): print('  aviso: no veo el pack de coches (DLC); el juego funciona sin el')
-    tc = a.toolchain or os.path.join(ROOT, 'toolchain')
-    if not os.path.isdir(os.path.join(tc, 'bin')): tc = os.path.join(os.path.expanduser('~'), '.local', 'share', 'retcomm', 'toolchains', 'cmake-clang-v1', 'latest')
-    if not os.path.exists(os.path.join(tc, 'bin', 'clang++.exe')): fail('no encuentro el compilador (carpeta toolchain/ o --toolchain). Mira LEEME_INSTALADOR.md')
-    try:
-        sys.path[:] = [p for p in sys.path if os.path.abspath(p or '.') != os.path.join(ROOT, 'tools')]
-        import capstone
-    except ImportError:
-        fail('falta el modulo capstone de Python:  python -m pip install capstone==5.0.7')
+    tc = find_toolchain(a)
 
     step(2, 'Descifrando el ejecutable del juego')
     re_dir = os.path.join(ROOT, 're')
@@ -134,30 +207,7 @@ def main():
         fail('el ejecutable descifrado no es el de %s %s; esta version no esta soportada' % (TITLE_ID, APP_VER))
     print('  ejecutable correcto')
 
-    py = sys.executable
-    step(3, 'Analizando el codigo del juego')
-    run([py, os.path.join('tools', 'prepare_re.py'), elf, re_dir])
-    run([py, os.path.join('tools', 'jumptables.py')], quiet=True)
-
-    step(4, 'Traduciendo el codigo del juego a C++ (unos minutos)')
-    full = os.path.join(ROOT, 'src', 'recomp', 'full')
-    os.makedirs(full, exist_ok=True)
-    run([py, os.path.join('tools', 'ppc2cpp.py'), os.path.join('src', 'recomp', 'full', 'game.cpp'), '10000-bb3000'], env=dict(os.environ, SPLIT='48'), quiet=True)
-
-    step(5, 'Traduciendo los programas de sonido y geometria')
-    specs = list(SPU_SPECS)
-    run([py, os.path.join('tools', 'spu2cpp.py'), os.path.join('re', 'EBOOT.elf'), os.path.join('src', 'recomp', 'spu_gen')] + specs, quiet=True)
-
-    step(6, 'Compilando (varios minutos; usa %d hilos)' % a.jobs)
-    env = dict(os.environ)
-    env['PATH'] = os.path.join(tc, 'bin') + os.pathsep + env.get('PATH', '')
-    build = os.path.join(ROOT, 'build-inst')
-    cmake = os.path.join(tc, 'bin', 'cmake.exe')   # full path: Windows looks the program up in our own PATH, not env's
-    if not os.path.exists(cmake): fail('falta cmake.exe en ' + os.path.join(tc, 'bin'))
-    tool = lambda n: os.path.join(tc, 'bin', n).replace('\\', '/')
-    run([cmake, '-S', ROOT, '-B', build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_C_COMPILER=' + tool('clang.exe'), '-DCMAKE_CXX_COMPILER=' + tool('clang++.exe'), '-DCMAKE_MAKE_PROGRAM=' + tool('ninja.exe'),
-         '-DCMAKE_PREFIX_PATH=' + os.path.join(tc, 'deps').replace('\\', '/')], env=env, quiet=True)
-    run([cmake, '--build', build, '--target', 'recomp_boot', '-j', str(a.jobs)], env=env)
+    build = compile_game(a, tc, elf)
 
     step(7, 'Preparando la carpeta del juego')
     out = os.path.abspath(a.out)
@@ -169,11 +219,7 @@ def main():
         shutil.copytree(usrdir, os.path.join(out, 'juego', 'USRDIR'), dirs_exist_ok=True, ignore=shutil.ignore_patterns('EBOOT.BIN'))
         if os.path.isdir(os.path.join(game, 'TROPDIR')):   # the trophy list (names, descriptions, icons)
             shutil.copytree(os.path.join(game, 'TROPDIR'), os.path.join(out, 'juego', 'TROPDIR'), dirs_exist_ok=True)
-    # the decrypted executable and the translated code stay out of the installer's folder, so it can be shared;
-    # never in a development checkout (.git), where re/ also holds analysis files that cannot be regenerated
-    if not a.keep and not os.path.exists(os.path.join(ROOT, '.git')):
-        for d in ('re', os.path.join('src', 'recomp', 'full'), os.path.join('src', 'recomp', 'spu_gen'), 'build-inst', 'paquetes'):
-            shutil.rmtree(os.path.join(ROOT, d), ignore_errors=True)
+    if not a.keep: clean_intermediate()
     if a.idioma:   # the game's language, in the settings file the game reads next to its executable
         ini = os.path.join(out, 'gtiport.ini')
         lines = [l for l in (open(ini, encoding='utf-8').read().splitlines() if os.path.exists(ini) else []) if not l.startswith('idioma=')]

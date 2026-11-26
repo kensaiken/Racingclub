@@ -43,7 +43,13 @@ inline float f32(uint32_t bits) { float f; std::memcpy(&f, &bits, 4); return f; 
 inline float rf(uint32_t m) { return f32(R[m >> 2]); }
 inline uint32_t ea_of(uint32_t offset, uint32_t location /*0 local, 1 main*/) { return (location ? C.ioAddr : C.localAddr) + offset; }
 float half2f(uint16_t h);
-uint64_t fnv(const void* p, size_t n, uint64_t h = 1469598103934665603ull);   // keys used inside this process only
+// keys used inside this process only (inline: called many times per draw with a few bytes)
+inline uint64_t fnv(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
+    const uint8_t* b = static_cast<const uint8_t*>(p);
+    for (; n >= 8; n -= 8, b += 8) { uint64_t w; std::memcpy(&w, b, 8); h = (h ^ w) * 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
 
 // work counters (counters(), [slowdraw]); the back ends add to them
 extern uint64_t g_texUploads, g_texUploadBytes, g_streamBuilds, g_streamVerts, g_progBuilds;

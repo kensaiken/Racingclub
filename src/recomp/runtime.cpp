@@ -45,8 +45,23 @@ double rc_logic_acc(PPU& c, double dtClamped, double acc) {
     // PHYSHZ=0: the world keeps 1/60 s steps and the logic ticks with them (images between steps repeat, loose objects flicker).
     static const bool physHz = !(std::getenv("PHYSHZ") && std::getenv("PHYSHZ")[0] == '0');
     if (physHz && g_physCalls != lastCalls && g_worldEa) {
+        // One world step per image, of the real time that image took: 1/rate while the game keeps the rate, 2/rate
+        // when an image comes late (never longer than the console's 1/60). Before, the step was always 1/rate, so
+        // whenever the images per second dropped (144 setting, 85-130 fps in races) the cars and physics went slower
+        // than the logic, the clock and the sound: the game felt sped up against its own cars. WORLDFIX=0: old.
+        static const bool fixed = std::getenv("WORLDFIX") && std::getenv("WORLDFIX")[0] == '0';
+        static double wacc = 0;
+        const double base = double(g_frameStep) / 60.0;
+        int k = 1;
+        if (!fixed) {
+            const int kmax = std::max(1, int(1.0 / (60.0 * base) + 1e-6));   // 144 and 120: 2, 72: 1
+            wacc += dt > 0 && dt < 0.1f ? double(dt) : 0.0;
+            k = std::clamp(int(wacc / base + 0.3), 1, kmax);   // +0.3: an image a bit early still counts as one
+            wacc -= k * base;
+            if (wacc > 2 * kmax * base || wacc < -2 * base) wacc = 0;   // a load or a pause: nothing to catch up
+        }
         lastCalls = g_physCalls;
-        if (world_step_ours(c.rdf32(g_worldEa + 156))) { g_worldStepSet = g_frameStep / 60.0f; c.wrf32(g_worldEa + 156, g_worldStepSet); }
+        if (world_step_ours(c.rdf32(g_worldEa + 156))) { g_worldStepSet = float(k * base); c.wrf32(g_worldEa + 156, g_worldStepSet); }
     }
     if (!physHz && g_physCalls != lastCalls && g_worldEa) {
         lastCalls = g_physCalls;

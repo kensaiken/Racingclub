@@ -43,6 +43,7 @@ inline uint32_t a32(PPU& c, int i) { return uint32_t(c.r[3 + i]); }
 std::recursive_mutex g_mx;
 std::vector<Callback> g_pending;
 std::atomic<bool> g_enabledFlag{false};
+std::atomic<bool> g_inRoomFlag{false};   // in a room (online game): the image rate is held at 60 (lv2.cpp wanted_hz)
 
 #define NLOG(...) std::fprintf(stderr, __VA_ARGS__)
 
@@ -549,7 +550,7 @@ void leave_room_local(bool destroyed, uint8_t cause) {   // (g_mx held)
     for (auto& [mid, s] : g_sig) if (s.up) signaling_event(id, mid, 0x5101);
     g_sig.clear();
     if (destroyed) { Blob b = room_update(cause, 0); room_event(id, cause == 2 ? 0x1103 : 0x1104, 0, &b); }
-    g_room.reset(); g_me = 0;
+    g_room.reset(); g_me = 0; g_inRoomFlag = false;
     if (g_toHost != INVALID_SOCKET) { closesocket(g_toHost); g_toHost = INVALID_SOCKET; }
 }
 
@@ -841,7 +842,7 @@ void do_join(uint32_t reqId, uint64_t roomId, std::vector<Attr> memberBin, uint8
         to = 0; ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&to), sizeof to);
         std::lock_guard<std::recursive_mutex> lk(g_mx);
         for (auto& m : rm.members) if (m.id == rm.owner) { m.ip = host.first; m.udpPort = host.second; m.endpoint = true; m.direct = true; }   // the host as we reach it
-        g_room = std::make_shared<Room>(rm); g_me = me; g_host = false; g_toHost = s; g_sig.clear();
+        g_room = std::make_shared<Room>(rm); g_inRoomFlag = true; g_me = me; g_host = false; g_toHost = s; g_sig.clear();
         start_signaling();
         Blob b; const uint32_t o = b.alloc(8, 8); b.ptr(o, b.room_internal(*g_room, g_me));   // SceNpMatching2JoinRoomResponse
         NLOG("[net] joined room %016llx as member %u\n", (unsigned long long)roomId, me);
@@ -851,6 +852,8 @@ void do_join(uint32_t reqId, uint64_t roomId, std::vector<Attr> memberBin, uint8
 }
 
 } // namespace
+
+bool in_room() { return g_inRoomFlag; }
 
 // ------------------------------------------------------------------ entry points (lv2.cpp)
 std::string local_address() {   // for the menu: what a friend on the same network types
@@ -984,7 +987,7 @@ bool hle(PPU& c, const char* module, const std::string& n) {
         Member me; me.id = 1; me.name = g_name; me.team = c.mem[req + 100]; me.flags = 0x80000000u; me.joinDate = uint64_t(std::time(nullptr)) * 1000000ull;
         me.bin = read_bin_attrs(c, c.rd32(req + 92), c.rd32(req + 96)); me.ip = my_lan_ip(); me.udpPort = g_port; me.endpoint = true;
         rm->members.push_back(me); rm->owner = 1; rm->nextMember = 1;
-        g_room = rm; g_me = 1; g_host = true; g_sig.clear();
+        g_room = rm; g_inRoomFlag = true; g_me = 1; g_host = true; g_sig.clear();
         Blob b; const uint32_t o = b.alloc(8, 8); b.ptr(o, b.room_internal(*g_room, g_me));   // SceNpMatching2CreateJoinRoomResponse
         NLOG("[net] room created: up to %u players, flags %08x\n", rm->maxSlot, rm->flags);
         for (auto* v : {&rm->binInternal, &rm->searchInt, &rm->searchBin, &rm->binExternal})

@@ -111,6 +111,8 @@ void host_timer_init() {
         return begin && begin(1) == 0;
     }();
     (void)done;
+    // AFFINITY=hex mask (test): the game only gets those hardware threads, e.g. ff = a 4 core / 8 thread processor
+    if (const char* m = std::getenv("AFFINITY")) SetProcessAffinityMask(GetCurrentProcess(), DWORD_PTR(std::strtoull(m, nullptr, 16)));
     if (std::getenv("TIMERTEST")) {   // debug: how long short sleeps really take
         LARGE_INTEGER f, t0, t1; QueryPerformanceFrequency(&f);
         for (int us : {50, 500, 1000}) {

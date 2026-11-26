@@ -13,6 +13,7 @@
 #include <map>
 #include <immintrin.h>
 
+namespace gti::recomp::netplay { bool in_room(); }
 namespace gti::recomp { void glyphs_update(); }   // button_glyphs.cpp
 namespace gti::recomp::netplay { std::string local_address(); std::string player_name(); int upnp_state(); }   // netplay.cpp
 namespace gti::recomp { bool host_input_text(const wchar_t* title, const wchar_t* prompt, std::string& value, int maxLen); }   // host_win.cpp
@@ -59,12 +60,6 @@ float half2f(uint16_t h) {
     } else if (e == 31) u = sgn | 0x7f800000u | (m << 13);
     else u = sgn | ((e + 112) << 23) | (m << 13);
     float f; std::memcpy(&f, &u, 4); return f;
-}
-uint64_t fnv(const void* p, size_t n, uint64_t h) {
-    const uint8_t* b = static_cast<const uint8_t*>(p);
-    for (; n >= 8; n -= 8, b += 8) { uint64_t w; std::memcpy(&w, b, 8); h = (h ^ w) * 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
-    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
-    return h;
 }
 
 // ------------------------------------------------------------------ vertex program -> GLSL
@@ -836,8 +831,8 @@ static void menu_overlay(int ww, int wh, Overlay& o) {
                     hp = L"Ventana sin bordes ocupa todo el monitor y se puede capturar con OBS. Pantalla completa es el modo exclusivo. F11 o Alt+Intro alternan con la ventana."; break;
                 case mScale: r = choice(L"Resolución interna", res[std::clamp(s.scale, 1, 3) - 1]);
                     hp = L"Resolución a la que se dibuja el juego antes de ajustarlo a la ventana. Más alta se ve más nítida y pide más a la tarjeta gráfica."; break;
-                case mHz: r = choice(L"Imágenes por segundo", s.gameHz == 60 ? L"60 (original)" : s.gameHz == 72 ? L"72 (ideal en 144 Hz)" : s.gameHz == 120 ? L"120 (experimental)" : L"144 (experimental)");
-                    hp = L"Velocidad a la que corre el juego. 60 es la de la consola; 72 encaja con monitores de 144 Hz. 120 y 144 son experimentales."; break;
+                case mHz: r = choice(L"Imágenes por segundo", netplay::in_room() ? L"60 (partida online)" : s.gameHz == 60 ? L"60 (original)" : s.gameHz == 72 ? L"72 (ideal en 144 Hz)" : s.gameHz == 120 ? L"120 (experimental)" : L"144 (experimental)");
+                    hp = L"Velocidad a la que corre el juego. 60 es la de la consola; 72 encaja con monitores de 144 Hz. 120 y 144 son experimentales. En una partida online todos juegan a 60."; break;
                 case mRefresh: r = toggle(L"Adaptar la pantalla al juego", s.refresh);
                     hp = L"Cambia la frecuencia del monitor mientras juegas (por ejemplo de 144 a 120 Hz) para que cada imagen dure lo mismo y el movimiento sea suave."; break;
                 case mVsync: r = toggle(L"V-Sync", s.vsync);
@@ -890,7 +885,7 @@ static void menu_overlay(int ww, int wh, Overlay& o) {
                 case mReport: r = action(L"Informe de problemas", L"Crear y abrir GitHub");
                     hp = L"Crea informe_problema.txt (equipo, opciones y registro, sin tu nombre de usuario) y abre la página para adjuntarlo."; break;
                 case mPatreon: r = action(L"Apoyar en Patreon", L"Abrir Patreon");
-                    hp = L"Abre la página de Racing Club+ en Patreon en tu navegador. Tu apoyo ayuda a pagar un servidor para jugar online."; break;
+                    hp = L"Abre la página de Racing Club+ en Patreon en tu navegador. Tu apoyo se destina al mantenimiento del servidor online."; break;
                 case mQuit: r = action(L"Salir del juego", L"Salir");
                     hp = L"Guarda las opciones y cierra el juego."; break;
             }
@@ -962,7 +957,7 @@ static void banner_overlay(int ww, int wh, Overlay& o) {
     const int lang = std::clamp(settings().language, 0, 5);
     if (haveLang != lang) {
         static const wchar_t* const l1[6] = {L"Support Racing Club+ on Patreon", L"Support Racing Club+ on Patreon", L"Soutenez Racing Club+ sur Patreon", L"Apoya Racing Club+ en Patreon", L"Unterst\u00fctze Racing Club+ auf Patreon", L"Sostieni Racing Club+ su Patreon"};
-        static const wchar_t* const l2[6] = {L"Help pay for a server for online play", L"Help pay for a server for online play", L"Aidez \u00e0 payer un serveur pour le jeu en ligne", L"Ayuda a pagar un servidor para jugar online", L"Hilf, einen Server f\u00fcr das Online-Spiel zu bezahlen", L"Aiuta a pagare un server per il gioco online"};
+        static const wchar_t* const l2[6] = {L"For the upkeep of the online server", L"For the upkeep of the online server", L"Pour l'entretien du serveur en ligne", L"Para el mantenimiento del servidor online", L"F\u00fcr die Wartung des Online-Servers", L"Per la manutenzione del server online"};
         static const wchar_t* const l3[6] = {L"Click here", L"Click here", L"Cliquez ici", L"Haz clic aqu\u00ed", L"Hier klicken", L"Clicca qui"};
         px.resize(size_t(W) * H);
         if (!host_banner_bitmap(l1[lang], l2[lang], l3[lang], W, H, px.data())) { o.px = nullptr; return; }

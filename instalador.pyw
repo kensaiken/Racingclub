@@ -11,7 +11,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-VERSION = '2.8'
+VERSION = '2.9'
 PREFS = os.path.join(ROOT, 'instalador.json')
 LANGS = ['English', 'Français', 'Español', 'Deutsch', 'Italiano']   # same order and numbers (1-5) as the game's menu
 TITLE_ID, APP_VER = 'NPEB00060', '01.02'
@@ -41,6 +41,9 @@ T = {
  'where':   ['Install to', 'Installer dans', 'Instalar en', 'Installieren nach', 'Installa in'],
  'change':  ['change', 'modifier', 'cambiar', 'ändern', 'cambia'],
  'details': ['details', 'détails', 'detalles', 'Details', 'dettagli'],
+ 'patreon_note': ['Patreon support goes to the upkeep of the online server.', "Le soutien sur Patreon sert à l'entretien du serveur en ligne.",
+                  'El apoyo en Patreon se destina al mantenimiento del servidor online.', 'Die Unterstützung auf Patreon geht in die Wartung des Online-Servers.',
+                  'Il sostegno su Patreon va alla manutenzione del server online.'],
  'patreon': ['Support on Patreon', 'Soutenir sur Patreon', 'Apoyar en Patreon', 'Auf Patreon unterstützen', 'Sostieni su Patreon'],
  'twitch':  ['Twitch channel', 'Chaîne Twitch', 'Canal de Twitch', 'Twitch-Kanal', 'Canale Twitch'],
  'github':  ['GitHub repository', 'Dépôt GitHub', 'Repositorio GitHub', 'GitHub-Repository', 'Repository GitHub'],
@@ -67,8 +70,43 @@ T = {
              'Die Installation ist fehlgeschlagen: siehe Details.', 'Installazione non riuscita: vedi i dettagli.'],
  'busy':    ['The installation is still running. Stop it and close?', 'L\'installation est en cours. L\'arrêter et fermer ?',
              'La instalación sigue en marcha. ¿Detenerla y cerrar?', 'Die Installation läuft noch. Abbrechen und schließen?',
-             'L\'installazione è in corso. Interromperla e chiudere?'],
+             'L\'installazione è in corso. Interromperla e chiudere?'], 'upd_btn': ['↓ Download and install v%s', '↓ Télécharger et installer la v%s', '↓ Descargar e instalar v%s', '↓ v%s herunterladen und installieren', '↓ Scarica e installa la v%s'],
+ 'upd_check': ['⟳ Check for updates', '⟳ Rechercher des mises à jour', '⟳ Buscar actualizaciones', '⟳ Nach Updates suchen', '⟳ Cerca aggiornamenti'],
+ 'upd_checking': ['Checking…', 'Recherche…', 'Buscando…', 'Suche…', 'Ricerca…'],
+ 'upd_latest': ['✓ Up to date (v%s)', '✓ À jour (v%s)', '✓ Ya tienes la última (v%s)', '✓ Aktuell (v%s)', '✓ Aggiornato (v%s)'],
+ 'upd_noconn': ['No connection: try again', 'Pas de connexion : réessayer', 'Sin conexión: reintentar', 'Keine Verbindung: erneut', 'Nessuna connessione: riprova'],
+ 'upd_new': ['New version: v%s', 'Nouvelle version : v%s', 'Nueva versión: v%s', 'Neue Version: v%s', 'Nuova versione: v%s'],
+ 'upd_ask': ['Version %s is available. Download it and rebuild the installed game now? (a few minutes; your options and game data are kept)',
+             'La version %s est disponible. La télécharger et recompiler le jeu installé maintenant ? (quelques minutes ; vos options et données sont conservées)',
+             'Está disponible la versión %s. ¿Descargarla y recompilar ahora el juego instalado? (unos minutos; se conservan tus opciones y los datos del juego)',
+             'Version %s ist verfügbar. Jetzt herunterladen und das installierte Spiel neu kompilieren? (einige Minuten; Optionen und Spieldaten bleiben erhalten)',
+             'La versione %s è disponibile. Scaricarla e ricompilare ora il gioco installato? (alcuni minuti; opzioni e dati del gioco restano)'],
+ 'upd_dl':  ['Downloading the update… %d %%', 'Téléchargement de la mise à jour… %d %%', 'Descargando la actualización… %d %%', 'Update wird heruntergeladen… %d %%', 'Download dell\'aggiornamento… %d %%'],
+ 'upd_done': ['Updated to v%s!', 'Mis à jour en v%s !', '¡Actualizado a la v%s!', 'Auf v%s aktualisiert!', 'Aggiornato alla v%s!'],
+ 'upd_fail': ['The update failed: see the details.', 'La mise à jour a échoué : voir les détails.', 'La actualización ha fallado: mira los detalles.',
+              'Das Update ist fehlgeschlagen: siehe Details.', 'L\'aggiornamento non è riuscito: vedi i dettagli.'],
+ 'upd_files': ['Files updated to v%s. Install the game to use them.', 'Fichiers mis à jour en v%s. Installez le jeu pour les utiliser.',
+               'Ficheros actualizados a la v%s. Instala el juego para usarlos.', 'Dateien auf v%s aktualisiert. Installiere das Spiel, um sie zu nutzen.',
+               'File aggiornati alla v%s. Installa il gioco per usarli.'],
 }
+
+# Updates: the newest release of the project on GitHub. Its asset RacingClubPlus-Update-v<x>.zip holds this folder
+# without toolchain/ (made by tools/make_update_zip.py); the installed game is then rebuilt with instalar.py --actualizar.
+RELEASES = 'https://api.github.com/repos/kensaiken/Racingclub/releases/latest'
+def vtuple(v): return tuple(int(x) for x in re.findall(r'\d+', v)[:3])
+def check_update():
+    import urllib.request
+    req = urllib.request.Request(RELEASES, headers={'User-Agent': 'RacingClubPlus-Installer', 'Accept': 'application/vnd.github+json'})
+    import urllib.error
+    try: r = json.load(urllib.request.urlopen(req, timeout=10))
+    except urllib.error.HTTPError as e:
+        if e.code == 404: return None   # the project has no published release yet (pre-releases do not count): up to date
+        raise
+    tag = r.get('tag_name', '').lstrip('vV')
+    if not tag or vtuple(tag) <= vtuple(VERSION): return None
+    for a in r.get('assets', []):
+        if re.match(r'RacingClubPlus-Update-.*\.zip$', a.get('name', ''), re.I): return tag, a['browser_download_url']
+    return None
 
 WHITE, INK, GREY, LINE, SOFT = '#FFFFFF', '#14213D', '#6B7280', '#E2E8F0', '#F1F6FF'
 BLUE_A, BLUE_B = (30, 144, 255), (0, 62, 190)          # gradient: bright sky blue -> deep blue (the game's colours)
@@ -84,6 +122,80 @@ def gradient(canvas, x0, y0, x1, y1, a=BLUE_A, b=BLUE_B):
     n = x1 - x0
     for i in range(max(n, 1)):
         canvas.create_line(x0 + i, y0, x0 + i, y1, fill=hexrgb(mix(a, b, i / max(n - 1, 1))))
+
+
+# ------------------------------------------------------------ buttons: antialiased rounded images drawn here (no PIL)
+def rgb(h): h = h.lstrip('#'); return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+def lighter(c, t=0.15): return mix(c, (255, 255, 255), t)
+
+
+def _cov(px, py, w, h, r):
+    """how much of the pixel centred at (px, py) the rounded rectangle 0..w x 0..h (corner radius r) covers"""
+    qx = abs(px - w / 2) - (w / 2 - r); qy = abs(py - h / 2) - (h / 2 - r)
+    if qx <= -1 and qy <= -1: return 1.0
+    d = (max(qx, 0) ** 2 + max(qy, 0) ** 2) ** 0.5 + min(max(qx, qy), 0) - r
+    return min(1.0, max(0.0, 0.5 - d))
+
+
+_IMG = {}
+def round_image(w, h, r, fill, fill2=None, edge=None, lip=None, bg=(255, 255, 255), keep=True):
+    """PhotoImage of a rounded rectangle on a known background (a colour, ('grad', x) for the header's blue gradient
+    seen from x, or ('img', photo, x, y) for a PhotoImage seen from x, y): filled with fill, or a left-to-right gradient fill -> fill2; edge: 1 px border; lip: a darker copy
+    3 px lower, the image then 3 px taller (a key that can be pressed)"""
+    key = (w, h, r, fill, fill2, edge, lip, bg)
+    if keep and key in _IMG: return _IMG[key]
+    hh = h + (3 if lip else 0)
+    rows = []
+    for y in range(hh):
+        row = []
+        for x in range(w):
+            c = (mix(BLUE_A, BLUE_B, (bg[1] + x) / (W - 1)) if bg[0] == 'grad' else
+                 tuple(bg[1].get(bg[2] + x, bg[3] + y))[:3] if bg[0] == 'img' else bg)
+            if lip: c = mix(c, lip, _cov(x + 0.5, y - 2.5, w, h, r))
+            a = _cov(x + 0.5, y + 0.5, w, h, r)
+            if a > 0:
+                f = mix(fill, fill2, x / max(w - 1, 1)) if fill2 else fill
+                if edge: f = mix(edge, f, _cov(x - 0.5, y - 0.5, w - 2, h - 2, max(r - 1, 0)))
+                c = mix(c, f, a)
+            row.append('#%02x%02x%02x' % c)
+        rows.append('{' + ' '.join(row) + '}')
+    img = tk.PhotoImage(width=w, height=hh)
+    img.put(' '.join(rows))
+    if keep: _IMG[key] = img
+    return img
+
+
+def pill(cv, x, y, text, cmd, anchor='nw', font=('Segoe UI Semibold', 9), fg='white', fill=BLUE_B, fill2=None, edge=None,
+         lip=None, bg=(255, 255, 255), w=None, h=28, r=None, padx=16, shadow=None):
+    """a button drawn on canvas cv: rounded image + text, lighter under the mouse; returns its (width, height)"""
+    from tkinter import font as tkfont
+    w = w or tkfont.Font(font=font).measure(text) + 2 * padx
+    r = h // 2 if r is None else r
+    x0 = x - w if 'e' in anchor else x - w // 2 if anchor in ('n', 's', 'center') else x
+    y0 = y - h - (3 if lip else 0) if 's' in anchor else y
+    bgv = ('grad', x0) if bg == 'grad' else ('img', bg[1], x0 - bg[2], y0 - bg[3]) if bg[0] == 'img' else bg   # ('img', photo, its x, its y)
+    norm = round_image(w, h, r, fill, fill2, edge, lip, bgv)
+    hov = round_image(w, h, r, lighter(fill), lighter(fill2) if fill2 else None, edge and lighter(edge, 0.3), lip, bgv)
+    tag = 'pill%d' % next(_PILLS)
+    it = cv.create_image(x0, y0, image=norm, anchor='nw', tags=tag)
+    if shadow: cv.create_text(x0 + w // 2 + 1, y0 + h // 2 + 2, text=text, fill=shadow, font=font, tags=tag)
+    cv.create_text(x0 + w // 2, y0 + h // 2, text=text, fill=fg, font=font, tags=tag)
+    cv.tag_bind(tag, '<Enter>', lambda e: (cv.itemconfigure(it, image=hov), cv.configure(cursor='hand2')))
+    cv.tag_bind(tag, '<Leave>', lambda e: (cv.itemconfigure(it, image=norm), cv.configure(cursor='')))
+    cv.tag_bind(tag, '<Button-1>', lambda e: cmd())
+    return w, h + (3 if lip else 0)
+_PILLS = iter(range(1, 1 << 30))
+
+
+def pill_widget(parent, text, cmd, bg=WHITE, **kw):
+    """pill() in its own small canvas, for frames"""
+    from tkinter import font as tkfont
+    f = kw.get('font', ('Segoe UI Semibold', 9))
+    w = kw.pop('w', None) or tkfont.Font(font=f).measure(text) + 2 * kw.get('padx', 16)
+    h = kw.get('h', 28) + (3 if kw.get('lip') else 0)
+    cv = tk.Canvas(parent, width=w, height=h, highlightthickness=0, bd=0, bg=bg)
+    pill(cv, 0, 0, text, cmd, w=w, bg=rgb(bg), **kw)
+    return cv
 
 
 def windows_lang():
@@ -139,12 +251,21 @@ class App:
         self.out = p.get('out', os.path.join(ROOT, 'Racing Club+'))
         self.proc, self.q, self.step, self.ok, self.log_shown = None, queue.Queue(), 0, False, False
         self.page = 'install'
+        self.update_info, self.updating, self.upd_state = None, False, 'checking'
+        threading.Thread(target=self.look_for_update, daemon=True).start()
         root.title('Racing Club+')
         root.configure(bg=WHITE)
         root.resizable(False, False)
         ico = os.path.join(ROOT, 'assets', 'racing_club.ico')
         if os.path.exists(ico):
-            try: root.iconbitmap(ico)
+            try: root.iconbitmap(default=ico)   # default: also the big icon (taskbar, Alt+Tab) and any dialog
+            except tk.TclError: pass
+        png = os.path.join(ROOT, 'assets', 'racing_club_icon.png')
+        if os.path.exists(png):
+            try:
+                self.icon = tk.PhotoImage(file=png)
+                self.icon = self.icon.subsample(max(1, self.icon.width() // 256))
+                root.iconphoto(True, self.icon)
             except tk.TclError: pass
         self.build()
         root.protocol('WM_DELETE_WINDOW', self.close)
@@ -156,21 +277,36 @@ class App:
     def build(self):
         for w in self.root.winfo_children(): w.destroy()
         r = self.root
-        head = tk.Canvas(r, width=W, height=120, highlightthickness=0, bd=0)
+        # header: blue bar (logo, name, language, updates) over the photo of the cars (assets/racing_club_cars.png)
+        cars = os.path.join(ROOT, 'assets', 'racing_club_cars.png')
+        self.cars = tk.PhotoImage(file=cars) if os.path.exists(cars) else None
+        bar = 100
+        head = tk.Canvas(r, width=W, height=bar + (self.cars.height() if self.cars else 0), highlightthickness=0, bd=0, bg=WHITE)
         head.pack()
-        gradient(head, 0, 0, W, 120)
+        gradient(head, 0, 0, W, bar)
+        if self.cars: head.create_image(0, bar, image=self.cars, anchor='nw')
         logo = os.path.join(ROOT, 'assets', 'racing_club_logo.png')
         if os.path.exists(logo):
             self.logo = tk.PhotoImage(file=logo)
-            head.create_image(22, 60, image=self.logo, anchor='w')
-        head.create_text(142, 48, text='Racing Club+', anchor='w', fill='white', font=('Arial Black', 26))
-        head.create_text(145, 84, text='%s  ·  v%s' % (self.t('sub'), VERSION), anchor='w', fill='#DCEBFF', font=('Segoe UI', 11))
-        lang = tk.Label(head, text='🌐 ' + LANGS[self.li] + ' ▾', bg=hexrgb(BLUE_B), fg='white', font=('Segoe UI', 10), cursor='hand2')
-        head.create_window(W - 16, 16, window=lang, anchor='ne')
-        lang.bind('<Button-1>', self.lang_menu)
+            head.create_image(16, 8, image=self.logo, anchor='nw')
+        head.create_text(134 + 2, 42 + 3, text='Racing Club+', anchor='w', fill='#002A80', font=('Arial Black', 27))
+        head.create_text(134, 42, text='Racing Club+', anchor='w', fill='white', font=('Arial Black', 27))
+        head.create_text(137, 78, text='%s  ·  v%s' % (self.t('sub'), VERSION), anchor='w', fill='#DCEBFF', font=('Segoe UI', 11))
+        dark, edge = (0, 48, 150), (96, 156, 245)
+        pill(head, W - 14, 10, '🌐  ' + LANGS[self.li] + '  ▾', lambda: self.lang_menu(None), anchor='ne', font=('Segoe UI', 9),
+             fill=dark, edge=edge, bg='grad', h=24, padx=12)
+        if not self.updating:   # "check for updates" (its result in its text) and, when there is one, "download and install"
+            st = self.upd_state
+            txt = {'checking': self.t('upd_checking'), 'latest': self.t('upd_latest') % VERSION, 'error': self.t('upd_noconn'),
+                   'found': self.t('upd_new') % (self.update_info or ('?',))[0]}.get(st, self.t('upd_check'))
+            pill(head, W - 14, bar - 10, txt, self.check_now, anchor='se', font=('Segoe UI', 9), fill=dark, edge=edge, bg='grad', h=24, padx=12)
+            if self.update_info:   # bottom right of the photo, where it fades to white
+                pill(head, W - 14, int(head['height']) - 4, self.t('upd_btn') % self.update_info[0], self.start_update, anchor='se',
+                     font=('Segoe UI Semibold', 10), fg=INK, fill=(255, 210, 50), fill2=(255, 160, 20), lip=(190, 105, 0),
+                     bg=('img', self.cars, 0, bar) if self.cars else 'grad', h=28, padx=16)
 
         tabs = tk.Frame(r, bg=WHITE)
-        tabs.pack(fill='x', padx=26, pady=(10, 0))
+        tabs.pack(fill='x', padx=26, pady=(4, 0))
         for key, page in (('tab_inst', 'install'), ('tab_online', 'online')):
             on = self.page == page
             l = tk.Label(tabs, text=self.t(key), bg=WHITE, fg=INK if on else GREY, font=('Segoe UI Semibold' if on else 'Segoe UI', 11), cursor='hand2')
@@ -182,16 +318,19 @@ class App:
             self.build_online()
             return
         body = tk.Frame(r, bg=WHITE)
-        body.pack(fill='x', padx=26, pady=(12, 0))
+        body.pack(fill='x', padx=26, pady=(6, 0))
         self.status = {}
         for n, key, files in (('1', 'game', True), ('2', 'update', True), ('3', 'pack', True)):
             self.section(body, n, key, files)
         tk.Label(body, text=self.t('note'), bg=WHITE, fg=GREY, font=('Segoe UI', 8), justify='left', wraplength=W - 56).pack(anchor='w', pady=(10, 0))
 
-        self.btn = tk.Canvas(r, width=W - 52, height=52, highlightthickness=0, bd=0, bg=WHITE, cursor='hand2')
+        self.btn = tk.Canvas(r, width=W - 52, height=57, highlightthickness=0, bd=0, bg=WHITE, cursor='hand2')
         self.btn.pack(pady=(12, 0))
         self.btn.bind('<Button-1>', lambda e: self.play() if self.ok else self.start())
-        self.prog = tk.Canvas(r, width=W - 52, height=6, highlightthickness=0, bd=0, bg=SOFT)
+        self.btn.bind('<Enter>', lambda e: self.paint_button(True))
+        self.btn.bind('<Leave>', lambda e: self.paint_button(False))
+        self.btn_state = ('', False)
+        self.prog = tk.Canvas(r, width=W - 52, height=8, highlightthickness=0, bd=0, bg=WHITE)
         self.prog.pack(pady=(10, 0))
         self.msg = tk.Label(r, text='', bg=WHITE, fg=GREY, font=('Segoe UI', 9), wraplength=W - 52, justify='center')
         self.msg.pack(pady=(6, 0))
@@ -201,6 +340,7 @@ class App:
         self.where_lbl.pack(side='left')
         self.link(foot, self.t('change'), self.pick_out, hexrgb(BLUE_B)).pack(side='left', padx=(6, 0))
         self.link(foot, self.t('details'), self.toggle_log, GREY).pack(side='right')
+        tk.Label(r, text='❤  ' + self.t('patreon_note'), bg=WHITE, fg=GREY, font=('Segoe UI', 8)).pack(anchor='w', padx=26, pady=(0, 3))
         social = tk.Frame(r, bg=WHITE)
         social.pack(fill='x', padx=26, pady=(0, 12))
         for i, (key, url, bg, act) in enumerate((
@@ -208,9 +348,8 @@ class App:
                 ('twitch', 'https://www.twitch.tv/ilesraider', '#9146FF', '#7A35E0'),
                 ('github', 'https://github.com/kensaiken/Racingclub', '#24292F', '#3A4048'))):
             social.columnconfigure(i, weight=1, uniform='s')
-            tk.Button(social, text=self.t(key), command=lambda u=url: os.startfile(u), font=('Segoe UI Semibold', 9),
-                      relief='flat', bd=0, cursor='hand2', pady=6, bg=bg, fg='white',
-                      activebackground=act, activeforeground='white').grid(row=0, column=i, sticky='ew', padx=(0 if i == 0 else 4, 0))
+            pill_widget(social, self.t(key), lambda u=url: os.startfile(u), font=('Segoe UI Semibold', 9), fill=rgb(bg),
+                        lip=mix(rgb(act), (0, 0, 0), 0.25), w=(W - 52 - 12) // 3, h=30, r=10).grid(row=0, column=i, padx=(0 if i == 0 else 6, 0))
         self.logbox = tk.Text(r, height=8, font=('Consolas', 8), bg=SOFT, fg=INK, relief='flat', wrap='none')
         self.refresh()
 
@@ -238,11 +377,11 @@ class App:
         return l
 
     def section(self, parent, num, key, files):
-        box = tk.Frame(parent, bg=WHITE); box.pack(fill='x', pady=(8, 0))
+        box = tk.Frame(parent, bg=WHITE); box.pack(fill='x', pady=(6, 0))
         top = tk.Frame(box, bg=WHITE); top.pack(fill='x')
-        c = tk.Canvas(top, width=22, height=22, highlightthickness=0, bd=0, bg=WHITE)
-        c.create_oval(1, 1, 21, 21, fill=hexrgb(mix(BLUE_A, BLUE_B, 0.5)), outline='')
-        c.create_text(11, 11, text=num, fill='white', font=('Segoe UI Semibold', 9))
+        c = tk.Canvas(top, width=24, height=24, highlightthickness=0, bd=0, bg=WHITE)
+        c.create_image(0, 0, image=round_image(24, 24, 12, BLUE_A, BLUE_B), anchor='nw')
+        c.create_text(12, 12, text=num, fill='white', font=('Segoe UI Semibold', 9))
         c.pack(side='left')
         names = {'game': 's_game', 'update': 's_upd', 'pack': 's_pack'}
         hints = {'game': 'h_game', 'update': 'h_upd', 'pack': 'h_pack'}
@@ -250,30 +389,41 @@ class App:
         tk.Label(box, text=self.t(hints[key]), bg=WHITE, fg=GREY, font=('Segoe UI', 9), anchor='w').pack(fill='x', padx=(30, 0))
         row = tk.Frame(box, bg=WHITE); row.pack(fill='x', padx=(30, 0), pady=(3, 0))
         label = self.t('pick1')
-        tk.Button(row, text=label, command=lambda: self.pick(key), font=('Segoe UI', 9), relief='flat', bd=0, cursor='hand2', padx=12, pady=4,
-                  bg=SOFT, fg=INK, activebackground=LINE, activeforeground=INK).pack(side='left')
+        pill_widget(row, '📂  ' + label, lambda: self.pick(key), font=('Segoe UI', 9), fg=INK, fill=rgb(SOFT), edge=(176, 200, 240),
+                    h=28, padx=14).pack(side='left')
         st = tk.Label(row, text='', bg=WHITE, font=('Segoe UI', 9), anchor='w', justify='left')
         st.pack(side='left', padx=(10, 0))
         self.status[key] = st
 
     def draw_button(self, text, enabled):
+        self.btn_state = (text, enabled)
+        self.paint_button(False)
+
+    def paint_button(self, hover):   # the big button: blue gradient key (lighter under the mouse), grey when it cannot be used
+        text, enabled = self.btn_state
         c = self.btn; c.delete('all')
-        w, h = int(c['width']), int(c['height'])
-        if enabled: gradient(c, 0, 0, w, h)
-        else: c.create_rectangle(0, 0, w, h, fill=LINE, outline='')
-        c.create_text(w // 2, h // 2, text=text, fill='white' if enabled else GREY, font=('Arial Black', 15))
+        w, h = int(c['width']), 54
+        if enabled: img = round_image(w, h, 14, lighter(BLUE_A) if hover else BLUE_A, lighter(BLUE_B) if hover else BLUE_B, lip=(0, 36, 120))
+        else: img = round_image(w, h, 14, rgb(LINE), lip=(206, 214, 226))
+        c.create_image(0, 0, image=img, anchor='nw')
+        if enabled: c.create_text(w // 2 + 2, h // 2 + 2, text=text, fill='#002A80', font=('Arial Black', 16))
+        c.create_text(w // 2, h // 2, text=text, fill='white' if enabled else GREY, font=('Arial Black', 16))
         c.configure(cursor='hand2' if enabled else 'arrow')
 
     def set_progress(self, frac, text, color=GREY):
         c = self.prog; c.delete('all')
         w, h = int(c['width']), int(c['height'])
-        if frac > 0: gradient(c, 0, 0, max(2, int(w * min(frac, 1))), h)
+        c.create_image(0, 0, image=round_image(w, h, h // 2, rgb(SOFT)), anchor='nw')
+        if frac > 0:
+            fw = max(h, int(w * min(frac, 1)))
+            self.prog_img = round_image(fw, h, h // 2, BLUE_A, BLUE_B, bg=rgb(SOFT), keep=False)
+            c.create_image(0, 0, image=self.prog_img, anchor='nw')
         self.msg.config(text=text, fg=color)
 
     def lang_menu(self, e):
         m = tk.Menu(self.root, tearoff=0)
         for i, n in enumerate(LANGS): m.add_command(label=n, command=lambda i=i: self.set_lang(i))
-        m.tk_popup(e.x_root, e.y_root)
+        m.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
 
     def set_lang(self, i):
         self.li = i; self.save(); self.build()
@@ -361,7 +511,7 @@ class App:
         if self.log_shown: self.logbox.see('end')
 
     def start(self):
-        if self.proc or not self.ready(): return
+        if self.proc or self.updating or not self.ready(): return
         self.save(); self.ok = False; self.step = 0
         self.logbox.delete('1.0', 'end')
         try:
@@ -372,7 +522,65 @@ class App:
         self.draw_button(self.t('install'), False)
         threading.Thread(target=self.worker, daemon=True).start()
 
-    def worker(self):
+    # ------------------------------------------------------------ updates
+    def look_for_update(self):
+        try: info = check_update(); self.q.put(('upd', ('found', info) if info else ('latest', None)))
+        except Exception: self.q.put(('upd', ('error', None)))   # no connection, GitHub not reachable
+
+    def upd_reset(self):   # "up to date" shown for a while, then the button reads "check for updates" again
+        if self.upd_state == 'latest' and not self.updating and not self.proc: self.upd_state = None; self.build()
+
+    def check_now(self):
+        if self.upd_state == 'checking' or self.updating or self.proc: return
+        self.upd_state = 'checking'; self.build()
+        threading.Thread(target=self.look_for_update, daemon=True).start()
+
+    def start_update(self):
+        if self.proc or self.updating or not self.update_info: return
+        if not messagebox.askyesno('Racing Club+', self.t('upd_ask') % self.update_info[0]): return
+        self.updating = True; self.ok = False; self.step = 0
+        self.page = 'install'; self.build()
+        self.logbox.delete('1.0', 'end')
+        self.draw_button(self.t('install'), False)
+        threading.Thread(target=self.update_worker, daemon=True).start()
+
+    def update_worker(self):
+        import urllib.request, zipfile
+        tag, url = self.update_info
+        zpath = os.path.join(ROOT, 'actualizacion.zip')
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'RacingClubPlus-Installer'})
+            with urllib.request.urlopen(req, timeout=30) as r, open(zpath, 'wb') as f:
+                total, got = int(r.headers.get('Content-Length') or 0), 0
+                while True:
+                    b = r.read(1 << 16)
+                    if not b: break
+                    f.write(b); got += len(b)
+                    if total: self.q.put(('msg', self.t('upd_dl') % (100 * got // total)))
+            with zipfile.ZipFile(zpath) as z:
+                names = [n for n in z.namelist() if not n.endswith('/')]
+                top = names[0].split('/')[0] + '/' if names else ''
+                if not (top + 'instalar.py') in names: top = ''   # files in a top folder ("Racing Club+ Installer/") or not
+                for n in names:
+                    if not n.startswith(top): continue
+                    rel = n[len(top):]
+                    if not rel or rel.startswith(('toolchain/', 'paquetes/')) or '..' in rel.split('/') or rel.startswith('/') or ':' in rel: continue
+                    dst = os.path.join(ROOT, *rel.split('/'))
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    tmp = dst + '.nuevo'
+                    with z.open(n) as a, open(tmp, 'wb') as b: b.write(a.read())
+                    try: os.replace(tmp, dst)
+                    except PermissionError:   # a file in use (the launcher exe itself): left as it is
+                        self.q.put(('log', 'en uso, no cambiado: ' + rel)); os.remove(tmp)
+            os.remove(zpath)
+            self.q.put(('log', 'ficheros de la v%s copiados' % tag))
+        except Exception as e:
+            self.q.put(('log', 'error en la actualizacion: %s' % e)); self.q.put(('end', 1)); return
+        if not os.path.exists(os.path.join(self.out, 'juego', 'EBOOT.elf')):   # nothing installed yet: the new files are enough
+            self.q.put(('end', 'files')); return
+        self.worker(['--actualizar', self.out])
+
+    def worker(self, args=None):
         py = sys.executable
         if os.path.basename(py).lower() == 'pythonw.exe':
             alt = os.path.join(os.path.dirname(py), 'python.exe')
@@ -382,9 +590,11 @@ class App:
             self.q.put(('msg', self.t('pip')))
             r = subprocess.run([py, '-m', 'pip', 'install', 'capstone==5.0.7'], creationflags=flags, capture_output=True, text=True)
             self.q.put(('log', r.stdout + r.stderr))
-        (g, gr, _), (u, _, _), (p, _, _) = self.parts('game'), self.parts('update'), self.parts('pack')
-        cmd = [py, '-u', os.path.join(ROOT, 'instalar.py'), '--out', self.out, '--idioma', str(self.li + 1),
-               '--pkg'] + [x for x in (g, u, p) if x] + ['--rap', gr]
+        if args: cmd = [py, '-u', os.path.join(ROOT, 'instalar.py')] + args
+        else:
+            (g, gr, _), (u, _, _), (p, _, _) = self.parts('game'), self.parts('update'), self.parts('pack')
+            cmd = [py, '-u', os.path.join(ROOT, 'instalar.py'), '--out', self.out, '--idioma', str(self.li + 1),
+                   '--pkg'] + [x for x in (g, u, p) if x] + ['--rap', gr]
         self.proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=flags, text=True, encoding='utf-8', errors='replace')
         for line in self.proc.stdout: self.q.put(('line', line.rstrip()))
         rc = self.proc.wait()
@@ -396,6 +606,12 @@ class App:
         try:
             while True:
                 kind, v = self.q.get_nowait()
+                if kind == 'upd':   # result of a check for updates
+                    self.upd_state, info = v
+                    if info or self.upd_state == 'latest': self.update_info = info
+                    if not self.updating and not self.proc: self.build()
+                    if self.upd_state == 'latest': self.root.after(5000, self.upd_reset)
+                    continue
                 if kind == 'msg': self.set_progress(0.01, v)
                 elif kind == 'log': self.log(v)
                 elif kind == 'line': self.on_line(v)
@@ -417,6 +633,20 @@ class App:
             self.set_progress((5 + k / n) / 7, '6/7 · %s… %d %%' % (steps[5], 100 * k // n))
 
     def finish(self, rc):
+        if self.updating:
+            tag = self.update_info[0]
+            self.updating = False
+            if rc == 0 or rc == 'files':
+                self.update_info, self.upd_state = None, None
+                self.build()
+                self.ok = rc == 0 and os.path.exists(self.exe())
+                self.set_progress(1, self.t('upd_done' if rc == 0 else 'upd_files') % tag, OK)
+                self.draw_button(self.t('play') if self.ok else self.t('install'), self.ok or self.ready())
+            else:
+                self.set_progress(max(self.step - 1, 0) / 7, self.t('upd_fail'), ERR)
+                self.draw_button(self.t('install'), self.ready())
+                if not self.log_shown: self.toggle_log()
+            return
         if rc == 0:
             self.ok = True
             self.shortcut()
@@ -451,6 +681,9 @@ class App:
 
 if __name__ == '__main__':
     try: ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception: pass
+    # its own taskbar identity: otherwise Windows groups the window with pythonw.exe and shows Tk's feather there
+    try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('RacingClubPlus.Installer')
     except Exception: pass
     root = tk.Tk()
     if os.environ.get('INSTALADOR_TOP'): root.attributes('-topmost', True)   # tests started from a background process

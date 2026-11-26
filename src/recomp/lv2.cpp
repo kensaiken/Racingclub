@@ -27,6 +27,7 @@
 #include <thread>
 #include <vector>
 
+namespace gti::recomp::netplay { bool in_room(); }
 namespace gti::recomp::netplay { struct Callback { uint32_t opd; int nargs; uint64_t a[8]; }; bool enabled(); bool hle(PPU& c, const char* module, const std::string& n); void set_errno_addr(uint32_t a); std::vector<Callback> take_callbacks(); }   // netplay.cpp
 namespace gti::recomp { void glyphs_patch_read(const std::string& hostPath, uint64_t fileOff, uint8_t* dst, size_t n); }   // button_glyphs.cpp
 namespace gti::recomp { bool host_camera_available(int choice); bool host_camera_start(int choice); void host_camera_stop(); uint32_t host_camera_read(uint8_t* dst, uint32_t cap, int format, int w, int h, uint32_t& frame); }   // host_camera.cpp
@@ -596,7 +597,8 @@ void fifo_thread() {
 // GAMEHZ=n: rate of the emulated vblank (experiment: the console has 60)
 // streaming mode: 60 per second like the video (OBS, Twitch), so every game image is exactly one video frame
 // Both follow the options menu while the game runs (vblank_thread checks them every vblank).
-static int wanted_hz() { return settings().streaming && !std::getenv("GAMEHZ") ? 60 : settings().gameHz; }
+// online game (in a room): 60 for everyone, as on the console, so no player runs differently from the others
+static int wanted_hz() { return (settings().streaming || gti::recomp::netplay::in_room()) && !std::getenv("GAMEHZ") ? 60 : settings().gameHz; }
 static bool wanted_refresh() { return settings().refresh || settings().streaming; }
 int g_gameHz = wanted_hz();
 // The game was written for 60 images per second: parts of its logic advance a fixed step per image. Patched code
@@ -673,9 +675,18 @@ void vblank_thread() {
             }
             next = std::chrono::steady_clock::now();
         }
-        if (!perVblank) {   // sleep most of the interval, yield through the last 2 ms (Windows sleeps are coarse)
+        if (!perVblank) {   // sleep most of the interval, yield through the end of it
+            // A high resolution timer (host_sleep_us) wakes within ~0.1-0.5 ms, so only the last VBLANKSPIN us (300) are
+            // yielded through. Before, a plain sleep (1 ms or more on Windows) left 2 ms of yielding in every image:
+            // a quarter of a core at 120 images per second. VBLANKSPIN=2000 with VBLANKSLEEP=0: the old way.
+            static const int64_t spinUs = std::getenv("VBLANKSPIN") ? std::atoll(std::getenv("VBLANKSPIN")) : 300;
+            static const bool precise = !(std::getenv("VBLANKSLEEP") && std::getenv("VBLANKSLEEP")[0] == '0');
             next += std::chrono::microseconds(1000000 / g_gameHz);
-            std::this_thread::sleep_until(next - std::chrono::microseconds(2000));
+            const auto wakeAt = next - std::chrono::microseconds(spinUs);
+            if (precise) {
+                const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(wakeAt - std::chrono::steady_clock::now()).count();
+                if (us > 0) host_sleep_us(uint64_t(us));
+            } else std::this_thread::sleep_until(wakeAt);
             while (std::chrono::steady_clock::now() < next) std::this_thread::yield();
         }
         if (g_missLog) {   // a stretch without flips while the vblanks go on: what every thread is blocked in, once per stretch
@@ -979,8 +990,10 @@ constexpr uint32_t EVENTFLAG_JOB = 0xbad880;   // job binary that sets a SPURS e
 // Default by processor size: the game keeps ~6 other host threads busy (main, render, FIFO, job manager, sound,
 // streams), so the workers get what is left: 8 with 16 hardware threads, 6 with 12, 3 at least. More workers than
 // free hardware threads only add wake-up and contention costs (measured: each extra worker adds CPU use).
+// 4 at most: in a race at 120 fps the jobs keep ~1.9 host cores busy; 4 workers kept 120 fps with 18% less CPU of the
+// whole process than 8 (with the batched hand-over: 680% -> 555% of one core), 3 already lost a few images.
 const int g_workers = std::getenv("SPUS") ? std::max(1, std::atoi(std::getenv("SPUS")))
-                                          : std::clamp(int(std::thread::hardware_concurrency()) - 6, 3, 8);   // host threads running jobs. The game only describes Edge output buffers for SPUs 0-2; run_job creates those of workers 3-5 (more than 6 have none and would drop their geometry)
+                                          : (std::thread::hardware_concurrency() <= 4 ? 2 : std::clamp(int(std::thread::hardware_concurrency()) - 6, 3, 4));   // 2 cores / 4 threads: 2 workers kept more images (AFFINITY=f test)   // host threads running jobs. The game only describes Edge output buffers for SPUs 0-2; run_job creates those of workers 3-5 (more than 6 have none and would drop their geometry)
 
 uint32_t list = 0;
 std::thread th;
@@ -1534,6 +1547,12 @@ std::mutex qmx;
 std::condition_variable qcv, idlecv;
 std::deque<JobDesc> queue;
 int busy = 0;
+// Wakeups cost more than most jobs (~140k jobs/s in a race): jobs the manager reads one after the other are handed
+// over together (flush_jobs) and only sleeping workers are woken; the manager is woken only when all went idle.
+// JOBBATCH=0: one job at a time, every worker / manager notified each time (old).
+int sleepers = 0, idleWaiters = 0;
+const bool g_jobBatch = !(std::getenv("JOBBATCH") && std::getenv("JOBBATCH")[0] == '0');
+std::vector<JobDesc> g_batch;   // manager thread only
 // Edge geometry writes its output into one ring per SPU and waits for the RSX (through a label) when the ring is
 // full. The game only hands a frame to the RSX once all its jobs are done, so a frame that needs more than a whole
 // ring can never finish: the job waits for the RSX and the RSX has nothing to run. The console never gets there;
@@ -1568,13 +1587,27 @@ void worker(int idx) {
         JobDesc jd;
         {
             std::unique_lock<std::mutex> lk(qmx);
-            qcv.wait(lk, [] { return !queue.empty(); });
+            if (queue.empty()) { ++sleepers; qcv.wait(lk, [] { return !queue.empty(); }); --sleepers; }
             jd = std::move(queue.front()); queue.pop_front(); ++busy;
         }
         run_job(jd);
-        { std::lock_guard<std::mutex> lk(qmx); --busy; }
-        idlecv.notify_all();
+        bool wake;
+        { std::lock_guard<std::mutex> lk(qmx); --busy; wake = !g_jobBatch || (busy == 0 && queue.empty() && idleWaiters > 0); }
+        if (wake) idlecv.notify_all();
     }
+}
+void flush_jobs() {
+    if (g_batch.empty()) return;
+    const int n = int(g_batch.size());
+    int sl;
+    {
+        std::lock_guard<std::mutex> lk(qmx);
+        for (auto& j : g_batch) queue.push_back(std::move(j));
+        sl = sleepers;
+    }
+    g_batch.clear();
+    if (sl <= 0) return;
+    if (n >= sl) qcv.notify_all(); else for (int k = 0; k < n; ++k) qcv.notify_one();
 }
 void submit(uint32_t jea) {
     JobDesc jd;
@@ -1592,6 +1625,7 @@ void submit(uint32_t jea) {
         for (uint32_t k = 0; k < sizeCacheDma / 8 && k < 4; ++k) { const uint32_t sz = jd32(jd, 0x30 + sizeDma + 8 * k) & 0x7fff; std::memcpy(jd.in.data() + pos, G->mem + jd32(jd, 0x34 + sizeDma + 8 * k), sz); pos += sz; }
     }
     if (g_workers == 1) { run_job(jd); return; }
+    if (g_jobBatch) { g_batch.push_back(std::move(jd)); static const int batchN = std::getenv("JOBBATCHN") ? std::atoi(std::getenv("JOBBATCHN")) : 2 * g_workers; if (int(g_batch.size()) >= batchN) flush_jobs(); return; }
     { std::lock_guard<std::mutex> lk(qmx); queue.push_back(std::move(jd)); }
     qcv.notify_one();
 }
@@ -1602,9 +1636,12 @@ const bool g_mgrStat = std::getenv("MGRSTAT") != nullptr;
 void wait_idle(int why = 0) {
     if (g_workers == 1) return;
     const uint64_t t0 = g_mgrStat ? now_us() : 0;
+    flush_jobs();
     {
         std::unique_lock<std::mutex> lk(qmx);
+        ++idleWaiters;
         idlecv.wait(lk, [] { return queue.empty() && busy == 0; });
+        --idleWaiters;
     }
     if (g_mgrStat) { ++g_wiN[why]; g_wiUs[why] += now_us() - t0; }
 }
@@ -1645,6 +1682,7 @@ void manager() {
         if (w == 0) {   // a zero may be a slot the game is rewriting right now: give it a moment before skipping it
                         // (skipping a NEXT being written left the manager on a stale END for good, ~1 run in 2 at 144 Hz)
             bool changed = false;
+            flush_jobs();
             for (const uint64_t t0 = now_us(); now_us() - t0 < 2000;) { if (rd64m(pc) != 0) { changed = true; break; } std::this_thread::yield(); }
             if (changed) continue;
             pc += 8; continue;
@@ -1653,6 +1691,7 @@ void manager() {
             if ((rd32m(ea + 4) & ~0xFu) == EVENTFLAG_JOB) { wait_idle(4); pendingEf.push_back(ea); pc += 8; continue; }
             flushEf(); submit(ea); ++g_mgrJobs; pc += 8; continue;
         }
+        flush_jobs();   // any other command: the jobs read so far go to the workers now
         switch (op) {
             case 1: pc = ea; continue;                                  // RESET_PC
             case 2: case 5: g_mgrWhat = 3; wait_idle(op == 2 ? 0 : 1); pc += 8; continue;             // SYNC / LWSYNC / labels / FLUSH
@@ -1662,6 +1701,7 @@ void manager() {
                 flushEf();
                 const uint32_t n = rd32m(ea), sz = rd32m(ea + 4), lst = uint32_t(rd64m(ea + 8));
                 for (uint32_t k = 0; k < n; ++k) submit(lst + k * sz);
+                flush_jobs();
                 pc += 8; continue;
             }
             default: break;
@@ -1736,6 +1776,7 @@ thread_local WaitSlot* t_waitSlot = nullptr;
 // block, and whose output that thread copies into the cellAudio port ring. Here every such task gets its own SPU
 // (interpreter) on a host thread, and a host thread plays the ring through SDL and advances its read index.
 namespace snd {
+std::atomic<uint64_t> g_sndSys[4];   // SPURS task syscalls of the sound task (statistics)
 struct Task {
     Spu spu;
     std::mutex m; std::condition_variable cv;
@@ -2123,7 +2164,7 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
         if (tg != 0xA70) { LOG("[snd] task %u branched to LS 0x%x (r3 %08x lr %05x): not handled; LS 2ee50 = %08x %08x %08x %08x\n", t->id, tg, nr, lr, sp.lsw(0x2ee50), sp.lsw(0x2ee54), sp.lsw(0x2ee58), sp.lsw(0x2ee5c)); return false; }
         switch (nr) {
             case 0: LOG("[snd] task %u exited\n", t->id); return false;     // exit
-            case 1: std::this_thread::yield(); sp.r[3].sw(0, 0); break;         // yield
+            case 1: ++g_sndSys[1]; std::this_thread::yield(); sp.r[3].sw(0, 0); break;         // yield
             case 2: {                                                           // wait signal
                 const uint64_t t0 = now_us();
                 if (g_wake) { const uint64_t busy = t0 - g_wake; g_busySum += busy; if (busy > g_busyMax) g_busyMax = busy; ++g_waits; }
@@ -2143,7 +2184,7 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
                 sp.r[3].sw(0, 0);
                 break;
             }
-            case 3: sp.r[3].sw(0, 0); break;                                    // poll: nothing else wants this SPU
+            case 3: ++g_sndSys[3]; sp.r[3].sw(0, 0); break;                                    // poll: nothing else wants this SPU
             default: LOG("[snd] task %u: SPURS task syscall %u not handled\n", t->id, nr); return false;
         }
         sp.pc = lr & 0x3fffc;
@@ -2256,6 +2297,7 @@ void port_thread() {
         gcm::wr(g_readIdx + 4, (idx + 1) % g_blocks);
         if (++blocksOut % 1875 == 0) {
             LOG("[snd] 10 s of audio played, peak level %.3f, %llu signals\n", peak, (unsigned long long)g_signals.load()); peak = 0;
+            LOG("[snd]   task syscalls in 10 s: yield %llu, poll %llu\n", (unsigned long long)g_sndSys[1].exchange(0), (unsigned long long)g_sndSys[3].exchange(0));
             LOG("[snd]   %llu codec calls, main %s, module %s%c", (unsigned long long)g_passes.load(), !g_tasks.empty() && g_tasks[0]->spu.compiled ? "recompiled" : "interpreted", !g_tasks.empty() && g_tasks[0]->spu.compiled2 ? "recompiled" : "interpreted", 10);
             if (std::getenv("SNDDUMP") && blocksOut == 1875 && !g_tasks.empty()) if (FILE* f = std::fopen("snd_ls.bin", "wb")) { std::fwrite(g_tasks[0]->spu.ls, 1, Spu::LS_SIZE, f); std::fclose(f); }
             { const uint64_t w = g_waits.exchange(0), bs = g_busySum.exchange(0), bm = g_busyMax.exchange(0); LOG("[snd]   codec calls: %.2f ms after the signal on average, %.2f ms at most, %llu over 8 ms%c", w ? bs / 1000.0 / w : 0.0, bm / 1000.0, (unsigned long long)g_slow.exchange(0), 10); LOG("[snd]   blocks waited for: %llu, played as holes: %llu, %d frames queued%c", (unsigned long long)g_waited.exchange(0), (unsigned long long)g_holes.exchange(0), audio_out_queued(), 10); }
