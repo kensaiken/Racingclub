@@ -105,6 +105,7 @@ struct Attr { uint16_t id; uint32_t num = 0; std::vector<uint8_t> data; };   // 
 struct Member {
     uint16_t id = 0; std::string name; uint8_t team = 0, nat = 2; uint32_t flags = 0; uint64_t joinDate = 0;
     uint32_t ip = 0; uint16_t udpPort = 0; bool endpoint = false;   // UDP endpoint as the host sees it
+    bool direct = false;   // (local, not sent) ip/udpPort is where this member's packets really reach us from
     std::vector<Attr> bin;                                          // room member binary internal attributes
 };
 struct Room {
@@ -368,9 +369,10 @@ void on_ctl(uint32_t ip, uint16_t port, const std::vector<uint8_t>& pkt) {
         // the peer's address is the one its packets really come from (local network interface, NAT mapping):
         // the game checks the source of its packets against what SignalingGetConnectionStatus said
         for (auto& m : g_room->members)
-            if (m.id == mid && (m.ip != ip || m.udpPort != port || !m.endpoint)) {
-                m.ip = ip; m.udpPort = port; m.endpoint = true;
-                if (g_host) member_endpoint_changed();
+            if (m.id == mid) {
+                const bool changed = m.ip != ip || m.udpPort != port || !m.endpoint;
+                m.ip = ip; m.udpPort = port; m.endpoint = true; m.direct = true;
+                if (changed && g_host) member_endpoint_changed();
             }
         auto& s = g_sig[mid]; s.lastRx = now_ms();
         if (!s.up) { s.up = true; signaling_event(g_room->id, mid, 0x5102); }
@@ -505,7 +507,7 @@ bool sockets(PPU& c, const std::string& n) {
         const uint32_t k = std::min<uint32_t>(len, uint32_t(d.data.size()));
         std::memcpy(c.mem + buf, d.data.data(), k);
         uint16_t mid = 0;
-        if (from) { if (from_member(d.ip, d.port, mid)) write_addr(c, from, virt_ip(mid), 3658, d.vport); else write_addr(c, from, d.ip, d.port, d.vport); }
+        if (from) { if (from_member(d.ip, d.port, mid)) write_addr(c, from, virt_ip(mid), 3658, d.vport); else { static int f = 0; if (f++ < 5) NLOG("[net] game packet from an unknown address %u.%u.%u.%u:%u (not a member endpoint)\n", d.ip >> 24, (d.ip >> 16) & 255, (d.ip >> 8) & 255, d.ip & 255, d.port); write_addr(c, from, d.ip, d.port, d.vport); } }
         if (fromLen) c.wr32(fromLen, 16);
         ret(c, k); return true;
     }
@@ -629,6 +631,12 @@ void client_loop(SOCKET s) {   // member: messages from the host
             Room rm = get_room(r); if (r.bad) continue;
             const bool attrsChanged = rm.binInternal.size() != g_room->binInternal.size() || rm.flags != g_room->flags ||
                 !std::equal(rm.binInternal.begin(), rm.binInternal.end(), g_room->binInternal.begin(), [](const Attr& a, const Attr& b) { return a.id == b.id && a.data == b.data; });
+            // the host's copy has the addresses the HOST sees (its own entry = its LAN address, unreachable over
+            // the internet); an address we already reach a member at stays: overwriting it sent our race packets
+            // to the host's LAN IP and made its packets look foreign (static ghost cars online)
+            for (auto& m : rm.members)
+                for (const auto& o : g_room->members)
+                    if (o.id == m.id && o.direct) { m.ip = o.ip; m.udpPort = o.udpPort; m.endpoint = true; m.direct = true; }
             *g_room = rm;
             start_signaling();
             if (attrsChanged) { Blob b = room_internal_update(*g_room); room_event(g_room->id, 0x1106, 0, &b); }
@@ -680,6 +688,7 @@ void sig_thread() {
 }
 
 uint32_t my_lan_ip() {
+    if (const char* f = std::getenv("NETFAKELAN")) { in_addr a{}; if (inet_pton(AF_INET, f, &a) == 1) return ntohl(a.s_addr); }   // tests: an unreachable LAN address
     char host[256]; if (gethostname(host, sizeof host) != 0) return 0x7f000001;
     addrinfo hints{}, *res = nullptr; hints.ai_family = AF_INET;
     if (getaddrinfo(host, nullptr, &hints, &res) != 0 || !res) return 0x7f000001;
@@ -831,7 +840,7 @@ void do_join(uint32_t reqId, uint64_t roomId, std::vector<Attr> memberBin, uint8
         if (r.bad) { closesocket(s); complete(reqId, E_NO_SUCH_ROOM, nullptr); return; }
         to = 0; ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&to), sizeof to);
         std::lock_guard<std::recursive_mutex> lk(g_mx);
-        for (auto& m : rm.members) if (m.id == rm.owner) { m.ip = host.first; m.udpPort = host.second; m.endpoint = true; }   // the host as we reach it
+        for (auto& m : rm.members) if (m.id == rm.owner) { m.ip = host.first; m.udpPort = host.second; m.endpoint = true; m.direct = true; }   // the host as we reach it
         g_room = std::make_shared<Room>(rm); g_me = me; g_host = false; g_toHost = s; g_sig.clear();
         start_signaling();
         Blob b; const uint32_t o = b.alloc(8, 8); b.ptr(o, b.room_internal(*g_room, g_me));   // SceNpMatching2JoinRoomResponse
