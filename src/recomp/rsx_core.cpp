@@ -736,10 +736,11 @@ uint32_t texture_epoch() { return g_texEpoch.load(std::memory_order_relaxed); }
 // tab. The ids are those of menu_change.
 static bool menuOpen = std::getenv("MENUTEST") != nullptr, menuDirty = true;   // MENUTEST=1 (debug): open from the start
 enum MenuId { mScreen = 1, mScale, mHz, mRefresh, mLang, mFps, mVsync, mSound, mAniso, mStream, mFxaa, mSharpen, mCamera, mApi, mApply, mReport, mQuit, mButtons,
-              mOnline, mOnName, mOnIp, mOnMine };
+              mOnline, mOnName, mOnIp, mOnMine, mPatreon };
 static const int kMenuOrder[] = {mScreen, mScale, mHz, mRefresh, mVsync,   mApi, mFxaa, mSharpen, mAniso,   mLang, mSound, mButtons, mCamera, mStream, mFps,
-                                 mOnline, mOnName, mOnIp, mOnMine,   mApply, mReport, mQuit};
-static const int kMenuTabStart[] = {0, 5, 9, 15, 19, 22};
+                                 mOnline, mOnName, mOnIp, mOnMine,   mApply, mReport, mPatreon, mQuit};
+static const int kMenuTabStart[] = {0, 5, 9, 15, 19, 23};
+static const char* const kPatreonUrl = "https://www.patreon.com/ilesraider/membership";   // F1 > Sistema and the main menu banner
 static const wchar_t* const kMenuTabs[] = {L"Pantalla", L"Gráficos", L"Juego", L"Online", L"Sistema"};
 static const int kMenuCount = int(sizeof kMenuOrder / sizeof kMenuOrder[0]), kMenuTabCount = 5;
 static int menuSel = std::getenv("MENUTEST") ? std::clamp(std::atoi(std::getenv("MENUTEST")) - 1, 0, int(sizeof kMenuOrder / sizeof kMenuOrder[0]) - 1) : 0;   // index in kMenuOrder (MENUTEST=n: the n-th)
@@ -786,6 +787,7 @@ static void menu_change(int dir) {
         case mOnMine: break;
         case mApply: if (dir >= 0) { settings_save(); host_restart(); } break;
         case mReport: if (dir >= 0) { settings_save(); const std::string g = std::string(B->api_name()) + " / " + B->gpu_name(); host_report(g.c_str()); } break;
+        case mPatreon: if (dir >= 0) { RLOG("[patreon] opened from F1\n"); SDL_OpenURL(kPatreonUrl); } break;
         case mQuit: if (dir >= 0) { settings_save(); SDL_Event q{}; q.type = SDL_EVENT_QUIT; SDL_PushEvent(&q); } break;   // same as closing the window
     }
     menuDirty = true;
@@ -887,6 +889,8 @@ static void menu_overlay(int ww, int wh, Overlay& o) {
                     hp = L"Guarda las opciones y reinicia el juego, para aplicar las marcadas con REINICIO."; break;
                 case mReport: r = action(L"Informe de problemas", L"Crear y abrir GitHub");
                     hp = L"Crea informe_problema.txt (equipo, opciones y registro, sin tu nombre de usuario) y abre la página para adjuntarlo."; break;
+                case mPatreon: r = action(L"Apoyar en Patreon", L"Abrir Patreon");
+                    hp = L"Abre la página de Racing Club+ en Patreon en tu navegador. Tu apoyo ayuda a pagar un servidor para jugar online."; break;
                 case mQuit: r = action(L"Salir del juego", L"Salir");
                     hp = L"Guarda las opciones y cierra el juego."; break;
             }
@@ -949,7 +953,6 @@ static void toast_overlay(int ww, int wh, Overlay& o) {
 // car select, options, races... load their own screen). A click opens the Patreon page in the browser.
 static std::atomic<bool> g_onMainMenu{false};
 void screen_loaded(const std::string& screen) { g_onMainMenu = screen == "main_menu"; }
-static const char* const kPatreonUrl = "https://www.patreon.com/ilesraider/membership";
 static int g_bannerRect[4] = {};          // window pixels: x, y, w, h (w 0 = not shown)
 static void banner_overlay(int ww, int wh, Overlay& o) {
     static std::vector<uint32_t> px;
