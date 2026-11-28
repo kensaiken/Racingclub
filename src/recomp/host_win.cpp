@@ -111,6 +111,43 @@ void host_timer_init() {
         return begin && begin(1) == 0;
     }();
     (void)done;
+    // Intel hybrid processors (12th gen and later: P cores + E cores): Windows put the sound mixer thread on the
+    // E cores, about half as fast; it then mixed its 10.7 ms of sound in more than 10.7 ms and the audio stuttered
+    // (report from an i9 14900KS: mixer passes 5 -> 11 ms, the sound queue drained from 60 to 5 ms). The game
+    // uses 2-3 cores, so all its threads go on the fastest cores (a preference, not a hard affinity).
+    // PCORES=0: off. Skipped when AFFINITY is set.
+    static const bool pc = [] {
+        if (std::getenv("AFFINITY") || (std::getenv("PCORES") && std::getenv("PCORES")[0] == '0')) return false;
+        HMODULE k = GetModuleHandleW(L"kernel32.dll");
+        using GetInfo = BOOL(WINAPI*)(PSYSTEM_CPU_SET_INFORMATION, ULONG, PULONG, HANDLE, ULONG);
+        using SetDef = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
+        auto get = reinterpret_cast<GetInfo>(reinterpret_cast<void*>(GetProcAddress(k, "GetSystemCpuSetInformation")));
+        auto set = reinterpret_cast<SetDef>(reinterpret_cast<void*>(GetProcAddress(k, "SetProcessDefaultCpuSets")));
+        if (!get || !set) return false;
+        ULONG len = 0;
+        get(nullptr, 0, &len, GetCurrentProcess(), 0);
+        if (!len) return false;
+        std::vector<uint8_t> buf(len);
+        if (!get(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data()), len, &len, GetCurrentProcess(), 0)) return false;
+        int lo = 255, hi = -1;
+        std::vector<std::pair<ULONG, int>> sets;
+        for (ULONG o = 0; o + sizeof(DWORD) * 2 <= len;) {
+            auto* e = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buf.data() + o);
+            if (!e->Size) break;
+            if (e->Type == CpuSetInformation) {
+                const int c = e->CpuSet.EfficiencyClass;
+                sets.emplace_back(e->CpuSet.Id, c); lo = std::min(lo, c); hi = std::max(hi, c);
+            }
+            o += e->Size;
+        }
+        if (hi <= lo) return false;   // every core the same: nothing to choose
+        std::vector<ULONG> ids;
+        for (auto& [id, c] : sets) if (c == hi) ids.push_back(id);
+        const bool ok = set(GetCurrentProcess(), ids.data(), ULONG(ids.size())) != 0;
+        std::fprintf(stderr, "[cpu] hybrid processor: %zu of %zu logical CPUs are performance cores, game threads %s%c", ids.size(), sets.size(), ok ? "kept on them" : "NOT moved (call failed)", 10);
+        return ok;
+    }();
+    (void)pc;
     // AFFINITY=hex mask (test): the game only gets those hardware threads, e.g. ff = a 4 core / 8 thread processor
     if (const char* m = std::getenv("AFFINITY")) SetProcessAffinityMask(GetCurrentProcess(), DWORD_PTR(std::strtoull(m, nullptr, 16)));
     if (std::getenv("TIMERTEST")) {   // debug: how long short sleeps really take

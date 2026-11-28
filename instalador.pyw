@@ -11,7 +11,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-VERSION = '2.9'
+VERSION = '2.9.1'
 PREFS = os.path.join(ROOT, 'instalador.json')
 LANGS = ['English', 'Français', 'Español', 'Deutsch', 'Italiano']   # same order and numbers (1-5) as the game's menu
 TITLE_ID, APP_VER = 'NPEB00060', '01.02'
